@@ -1,0 +1,279 @@
+name: Build
+
+on:
+  push:
+    branches: ["*"]
+    tags: ["*"]
+  pull_request:
+
+env:
+  SYMGEN_VERSION: v1.2.4
+  DUSKLIGHT_VERSION: v2.0.3
+
+jobs:
+  build:
+    name: Build ${{matrix.platform}}
+    runs-on: ${{matrix.runner}}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-15
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES=arm64
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES=x86_64
+          # Mobile builds are paused; uncomment these entries to restore them.
+          # - platform: ios-arm64
+          #   runner: macos-latest
+          #   cmake_args: >-
+          #     -DCMAKE_SYSTEM_NAME=iOS
+          #     -DCMAKE_OSX_ARCHITECTURES=arm64
+          #     -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+          - platform: windows-amd64
+            runner: windows-latest
+            msvc_arch: amd64
+          - platform: windows-arm64
+            runner: windows-latest
+            msvc_arch: amd64_arm64
+          # - platform: android-aarch64
+          #   runner: ubuntu-latest
+          #   android_ndk: "29.0.14206865"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache Dusklight sources
+        uses: actions/cache@v6
+        with:
+          path: dusklight
+          key: dusklight-${{runner.os}}-${{env.DUSKLIGHT_VERSION}}
+
+      - name: Enable Visual Studio environment
+        if: matrix.msvc_arch
+        uses: step-security/msvc-dev-cmd@v1
+        with:
+          arch: ${{matrix.msvc_arch}}
+
+      - name: Install ninja
+        if: matrix.msvc_arch
+        run: choco install ninja
+
+      - name: Install Android NDK
+        if: matrix.android_ndk
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ndk;${{matrix.android_ndk}}
+
+      - name: Download official macOS game executable for SDK linking
+        # Published macOS SDK stubs lack LC_UUID; ModSDK supports DUSK_GAME_EXE.
+        if: matrix.platform == 'macos-arm64' || matrix.platform == 'macos-x86_64'
+        shell: bash
+        env:
+          DUSKLIGHT_TAG: ${{env.DUSKLIGHT_VERSION}}
+          PLATFORM: ${{matrix.platform}}
+        run: |
+          arch="${PLATFORM#macos-}"
+          archive="$RUNNER_TEMP/Dusklight-${DUSKLIGHT_TAG}-macos-${arch}.zip"
+          game_exe="$RUNNER_TEMP/Dusklight-${arch}"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/TwilitRealm/dusklight/releases/download/${DUSKLIGHT_TAG}/Dusklight-${DUSKLIGHT_TAG}-macos-${arch}.zip"
+          unzip -p "$archive" Dusklight.app/Contents/MacOS/Dusklight > "$game_exe"
+          test -s "$game_exe"
+          test "$(lipo -archs "$game_exe")" = "$arch"
+          otool -l "$game_exe" | awk '/cmd LC_UUID/ { found=1 } END { exit !found }'
+          echo "DUSK_GAME_EXE=$game_exe" >> "$GITHUB_ENV"
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          args=(-G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+                -DDUSKLIGHT_VERSION=${{env.DUSKLIGHT_VERSION}}
+                ${{matrix.cmake_args}})
+          if [[ "${{matrix.platform}}" == macos-* ]]; then
+            args+=(-DDUSK_GAME_EXE="$DUSK_GAME_EXE")
+          fi
+          if [[ -n "${{matrix.android_ndk}}" ]]; then
+            args+=(-DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/${{matrix.android_ndk}}/build/cmake/android.toolchain.cmake"
+                   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28)
+          fi
+          cmake -B build "${args[@]}"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Check packaged macOS library dependencies
+        if: matrix.platform == 'macos-arm64' || matrix.platform == 'macos-x86_64'
+        shell: bash
+        run: |
+          packages=(build/mods/*.dusk)
+          test -f "${packages[0]}"
+          module_entry=$(unzip -Z1 "${packages[0]}" | grep -E '^lib/macos-[^/]+/mod\.so$')
+          test -n "$module_entry"
+          unzip -p "${packages[0]}" "$module_entry" > "$RUNNER_TEMP/dusklight-online-mod.so"
+          otool -L "$RUNNER_TEMP/dusklight-online-mod.so"
+          unexpected=$(otool -L "$RUNNER_TEMP/dusklight-online-mod.so" |
+            awk 'NR > 1 { print $1 }' |
+            grep -Ev '^(/usr/lib/|/System/Library/|@)' || true)
+          if [[ -n "$unexpected" ]]; then
+            echo "Packaged mod depends on non-system macOS libraries:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mod-${{matrix.platform}}
+          path: build/mods/*.dusk
+          if-no-files-found: error
+
+  relay:
+    name: Build relay ${{matrix.platform}}
+    runs-on: ${{matrix.runner}}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            build_launcher: OFF
+          - platform: windows-amd64
+            runner: windows-latest
+            build_launcher: ON
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable Visual Studio environment
+        if: runner.os == 'Windows'
+        uses: step-security/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Configure relay
+        shell: bash
+        run: >-
+          cmake -S tools/multiplayer_relay -B build/relay-release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DDUSKLIGHT_RELAY_BUILD_LAUNCHER=${{matrix.build_launcher}}
+
+      - name: Build relay
+        run: cmake --build build/relay-release --parallel
+
+      - name: Test relay
+        run: ctest --test-dir build/relay-release --output-on-failure
+
+      - name: Package relay
+        run: cpack --config build/relay-release/CPackConfig.cmake
+
+      - name: Upload relay artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: relay-${{matrix.platform}}
+          path: build/relay-release/package/*.zip
+          if-no-files-found: error
+
+  combine:
+    name: Combine bundles
+    needs: [build, relay]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download platform bundles
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mod-*
+          path: dist
+
+      - name: Install symgen
+        run: |
+          curl -fsSL -o symgen \
+            "https://github.com/encounter/symgen/releases/download/${SYMGEN_VERSION}/symgen-linux-x86_64"
+          chmod +x symgen
+
+      - name: Merge bundles
+        run: |
+          name=$(basename dist/mod-linux-x86_64/*.dusk)
+          python3 tools/merge_mod.py -o "combined/$name" --symgen ./symgen \
+            dist/*/*.dusk
+
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: mod-combined
+          path: combined/*.dusk
+          if-no-files-found: error
+
+      - name: Download relay bundles
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/download-artifact@v8
+        with:
+          pattern: relay-*
+          path: relay
+          merge-multiple: true
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{github.token}}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" combined/*.dusk relay/*.zip
+          --verify-tag --generate-notes
+
+  relay-container:
+    name: Publish relay container
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: relay
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download Linux relay
+        uses: actions/download-artifact@v8
+        with:
+          name: relay-linux-x86_64
+          path: relay-artifact
+
+      - name: Prepare container context
+        shell: bash
+        run: |
+          mkdir -p relay-unpacked
+          unzip relay-artifact/*.zip -d relay-unpacked
+          relay_path=$(find relay-unpacked -type f -name dusklight_online_relay -print -quit)
+          test -n "$relay_path"
+          install -m 0755 "$relay_path" tools/multiplayer_relay/container/dusklight_online_relay
+
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and publish relay image
+        shell: bash
+        run: |
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/$owner/dusklight-online-relay"
+          version="${GITHUB_REF_NAME#v}"
+          docker build \
+            --build-arg "RELAY_VERSION=$version" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$version" \
+            --tag "$image:$GITHUB_REF_NAME" \
+            --tag "$image:latest" \
+            tools/multiplayer_relay/container
+          docker push "$image:$GITHUB_REF_NAME"
+          docker push "$image:latest"

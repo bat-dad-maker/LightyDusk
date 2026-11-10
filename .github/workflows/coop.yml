@@ -1,0 +1,161 @@
+name: Dusklight Co-op
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  coop-tests:
+    name: Co-op unit tests and Linux mod build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ninja-build
+
+      - name: Co-op rules test with sanitizers (GCC and Clang)
+        run: |
+          curl -sL https://github.com/nlohmann/json/releases/download/v3.12.0/json.hpp --create-dirs -o /tmp/inc/nlohmann/json.hpp
+          for cxx in g++ clang++; do
+            $cxx -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
+              -fno-sanitize-recover=all -Imods/dusklight_online/include -I/tmp/inc \
+              mods/dusklight_online/tests/coop_rules_test.cpp -o coop_rules_test_$cxx
+            ./coop_rules_test_$cxx
+          done
+
+      - name: Configure online mod (standalone, with tests)
+        run: >
+          cmake -S mods/dusklight_online -B build-mod -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DDUSKLIGHT_DIR=${{ github.workspace }}
+          -DDUSKLIGHT_ONLINE_BUILD_TESTS=ON
+
+      - name: Build online mod and every test
+        run: cmake --build build-mod
+
+      - name: Run every online test
+        working-directory: build-mod
+        run: ctest --output-on-failure --timeout 300
+
+  build-android:
+    name: Build Android APK (arm64)
+    runs-on: ubuntu-latest
+    needs: coop-tests
+    env:
+      ANDROID_NDK_VERSION: "29.0.14206865"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install ninja-build
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.1.0" "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Install Rust Android target
+        run: |
+          rustup toolchain install stable
+          rustup target add aarch64-linux-android
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Configure CMake
+        run: cmake --preset x-android-ci-arm64
+
+      - name: Build native library
+        run: cmake --build --preset x-android-ci-arm64 --target dusklight
+
+      - name: Build bundled mods (includes Co-op Online)
+        run: cmake --build --preset x-android-ci-arm64 --target dusklight_mods
+
+      - name: Check Co-op Online is bundled
+        run: |
+          ls -la build/android-arm64/bundled_mods/
+          test -f build/android-arm64/bundled_mods/dusklight_online.dusk
+          unzip -l build/android-arm64/bundled_mods/dusklight_online.dusk | tee bundled.txt
+          grep -q "lib/android-arm64" bundled.txt || grep -q "\.so" bundled.txt
+          unzip -p build/android-arm64/bundled_mods/dusklight_online.dusk mod.json | grep -q dusklight_coop
+
+      - name: Build APK
+        working-directory: platforms/android
+        run: ./gradlew :app:assembleRelease --rerun-tasks
+
+      - name: Sign APK
+        env:
+          SIGNING_KEY_PK8_B64: ${{ secrets.SIGNING_KEY_PK8_B64 }}
+          SIGNING_CERT_B64: ${{ secrets.SIGNING_CERT_B64 }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.1.0"
+          UNSIGNED=platforms/android/app/build/outputs/apk/release/app-arm64-v8a-release-unsigned.apk
+          echo "$SIGNING_KEY_PK8_B64" | base64 -d > "$RUNNER_TEMP/key.pk8"
+          echo "$SIGNING_CERT_B64" | base64 -d > "$RUNNER_TEMP/cert.pem"
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          mkdir -p upload
+          "$BT/apksigner" sign --key "$RUNNER_TEMP/key.pk8" --cert "$RUNNER_TEMP/cert.pem" \
+            --out upload/DusklightCoop-${APP_VERSION}-android-arm64.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose upload/DusklightCoop-${APP_VERSION}-android-arm64.apk
+          rm -f "$RUNNER_TEMP/key.pk8"
+
+      - name: Check APK contents
+        run: |
+          APK=$(ls upload/*.apk)
+          unzip -l "$APK" | tee apk.txt
+          grep -q "assets/mods/dusklight_online.dusk" apk.txt
+          grep -q "lib/arm64-v8a/" apk.txt
+          "$ANDROID_HOME/build-tools/36.1.0/aapt2" dump badging "$APK" | head -5 | tee badging.txt
+          grep -q "io.github.batdadmaker.dusklightcoop" badging.txt
+          ls -la upload
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: DusklightCoop-${{ env.APP_VERSION }}-android-arm64
+          path: upload/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*.apk
+          name: Dusklight Co-op ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md

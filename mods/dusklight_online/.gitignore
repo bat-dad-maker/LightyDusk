@@ -1,0 +1,11 @@
+/build*/
+/cmake-build-*/
+/.vs/
+/out/
+/dusklight/
+.idea/
+.DS_Store
+/tools/multiplayer_relay/dockge/
+/tools/multiplayer_relay.7z
+/tools/dusklight-online-relay-dockge-*.zip
+/tools/multiplayer_relay/container/dusklight_online_relay

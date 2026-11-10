@@ -1,0 +1,67 @@
+{
+  "id": "io.github.batdadmaker.dusklight_coop",
+  "name": "Dusklight Co-op Online",
+  "version": "0.4.0-coop",
+  "author": "mdra5000, Dusklight Co-op contributors",
+  "description": "Built-in online co-op for Dusklight: Room ID + password rooms, shared enemy HP, double-HP two-player bosses and boss doors that need both players.",
+  "icon": "res/icon.png",
+  "banner": "res/banner.png",
+  "abi": 1,
+  "imports": [
+    {
+      "service_id": "dev.twilitrealm.dusklight.config",
+      "major": 1,
+      "min_minor": 0,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.hook",
+      "major": 1,
+      "min_minor": 1,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.item",
+      "major": 2,
+      "min_minor": 0,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.log",
+      "major": 1,
+      "min_minor": 0,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.resource",
+      "major": 1,
+      "min_minor": 0,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.save",
+      "major": 1,
+      "min_minor": 0,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.texture",
+      "major": 1,
+      "min_minor": 0,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.ui",
+      "major": 2,
+      "min_minor": 3,
+      "optional": false
+    },
+    {
+      "service_id": "dev.twilitrealm.dusklight.websocket",
+      "major": 1,
+      "min_minor": 0,
+      "optional": false
+    }
+  ],
+  "exports": []
+}
