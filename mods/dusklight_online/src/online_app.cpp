@@ -1723,7 +1723,7 @@ void OnlineApp::join_direct() {
 
 void OnlineApp::host_relay() {
     relayHostIntent_ = false;
-    if (!bool_value(config_.relayManualHost)) {
+    if (true) {  // Dusklight Co-op: always use the room service.
         net::CloudRoomConfig cloud;
         cloud.name = string_value(config_.playerName);
         cloud.room = string_value(config_.relayRoom);
@@ -1785,7 +1785,7 @@ void OnlineApp::host_relay() {
 
 void OnlineApp::join_relay() {
     relayHostIntent_ = false;
-    if (!bool_value(config_.relayManualHost)) {
+    if (true) {  // Dusklight Co-op: always use the room service.
         net::CloudRoomConfig cloud;
         cloud.name = string_value(config_.playerName);
         cloud.room = string_value(config_.relayRoom);
@@ -2213,16 +2213,11 @@ ModResult OnlineApp::build_lobby_tab(ModContext*, UiWindowHandle, UiElementHandl
     svc_ui->pane_add_section(mod_ctx, left,
                              app.connectionRole_ == ConnectionRole::Host ? "Host lobby" :
                                                                          "Join lobby");
-    UiGroupDesc direct = UI_GROUP_DESC_INIT;
-    direct.label = "Direct";
-    direct.build = app.connectionRole_ == ConnectionRole::Host ?
-                       &OnlineApp::build_host_direct_settings :
-                       &OnlineApp::build_join_direct_settings;
-    direct.user_data = &app;
-    svc_ui->pane_add_group(mod_ctx, left, right, &direct, nullptr);
-
+    // Dusklight Co-op: phones sit behind NAT, so the raw-UDP Direct mode
+    // ("UDP connection open failed") is not offered. Rooms use the room
+    // service by Room name + Room code only.
     UiGroupDesc relay = UI_GROUP_DESC_INIT;
-    relay.label = "NAT/Relay";
+    relay.label = "Online room";
     relay.build = app.connectionRole_ == ConnectionRole::Host ?
                       &OnlineApp::build_host_relay_settings :
                       &OnlineApp::build_join_relay_settings;
@@ -2230,7 +2225,7 @@ ModResult OnlineApp::build_lobby_tab(ModContext*, UiWindowHandle, UiElementHandl
     svc_ui->pane_add_group(mod_ctx, left, right, &relay, nullptr);
 
     svc_ui->pane_add_section(mod_ctx, right, "Connection settings");
-    svc_ui->pane_add_text(mod_ctx, right, "Select Direct or NAT/Relay to configure it.", nullptr);
+    svc_ui->pane_add_text(mod_ctx, right, "Select Online room, enter the Room name and Room code, then press Create room or Join room.", nullptr);
     return MOD_OK;
 }
 
@@ -2268,7 +2263,7 @@ ModResult OnlineApp::build_host_relay_settings(ModContext*, UiElementHandle pane
     auto& app = *static_cast<OnlineApp*>(data);
     app.manualHostControls_ = {};
     svc_ui->elem_set_class(mod_ctx, pane, "online-form-pane", true);
-    svc_ui->pane_add_section(mod_ctx, pane, "NAT/Relay settings");
+    svc_ui->pane_add_section(mod_ctx, pane, "Online room");
     add_button(pane, "Create room", &OnlineApp::host_relay_pressed, &app,
                &OnlineApp::session_active, nullptr, "online-primary-action", nullptr,
                "<p>Use Cloudflare for room discovery and direct NAT traversal. Manual host uses your own relay.</p>");
@@ -2281,10 +2276,6 @@ ModResult OnlineApp::build_host_relay_settings(ModContext*, UiElementHandle pane
                     "<p>Pick a Room name. Your buddy types this exact Room name to find your game.</p>");
     add_form_string(pane, "Room code", app.config_.lobbyCode, 128, "online-half-field",
                     "<p>Required: 6-128 characters. Share it with your buddy; do not reuse an account password.</p>");
-    add_bound_control(pane, UI_CONTROL_TOGGLE, "Manual host",
-                      app.config_.relayManualHost, 0, 0, 1, 0, nullptr, nullptr,
-                      "online-wide-control", nullptr,
-                      "<p>Off: Cloudflare room discovery, direct connections only. On: your own relay with a TP1 code.</p>");
     app.manualHostControls_[0] = add_bound_control(
         pane, UI_CONTROL_TOGGLE, "Use relay on this PC", app.config_.relayLocal,
         0, 0, 1, 0, nullptr, nullptr, "online-wide-control", nullptr,
@@ -2297,7 +2288,7 @@ ModResult OnlineApp::build_host_relay_settings(ModContext*, UiElementHandle pane
         pane, "Copy", &OnlineApp::copy_relay_code_pressed, &app, nullptr, nullptr,
         "online-copy-action", nullptr,
         "<p>Copy the manual relay code to the clipboard.</p>");
-    const bool manual = app.bool_value(app.config_.relayManualHost);
+    const bool manual = false;  // Manual relay hosting is disabled in Dusklight Co-op.
     for (auto handle : app.manualHostControls_)
         if (handle) svc_ui->elem_set_class(mod_ctx, handle, "online-manual-only-hidden", !manual);
     return MOD_OK;
@@ -2330,7 +2321,7 @@ ModResult OnlineApp::build_join_relay_settings(ModContext*, UiElementHandle pane
     auto& app = *static_cast<OnlineApp*>(data);
     app.manualHostControls_ = {};
     svc_ui->elem_set_class(mod_ctx, pane, "online-form-pane", true);
-    svc_ui->pane_add_section(mod_ctx, pane, "NAT/Relay settings");
+    svc_ui->pane_add_section(mod_ctx, pane, "Online room");
     add_button(pane, "Join room", &OnlineApp::join_relay_pressed, &app,
                &OnlineApp::session_active, nullptr, "online-primary-action", nullptr,
                "<p>Use Cloudflare for room discovery and direct NAT traversal. Manual host uses the host's relay.</p>");
@@ -2343,10 +2334,6 @@ ModResult OnlineApp::build_join_relay_settings(ModContext*, UiElementHandle pane
                     "<p>The exact Room name your buddy created.</p>");
     add_form_string(pane, "Room code", app.config_.lobbyCode, 128, "online-half-field",
                     "<p>The 6-128 character room code your buddy set.</p>");
-    add_bound_control(pane, UI_CONTROL_TOGGLE, "Manual host",
-                      app.config_.relayManualHost, 0, 0, 1, 0, nullptr, nullptr,
-                      "online-wide-control", nullptr,
-                      "<p>Off: Cloudflare room discovery, direct connections only. On: connect through the host's own relay.</p>");
     app.manualHostControls_[0] = add_bound_control(
         pane, UI_CONTROL_TOGGLE, "Use relay on this PC", app.config_.relayLocal,
         0, 0, 1, 0, nullptr, nullptr, "online-wide-control", nullptr,
@@ -2359,7 +2346,7 @@ ModResult OnlineApp::build_join_relay_settings(ModContext*, UiElementHandle pane
         pane, "Paste", &OnlineApp::paste_relay_code_pressed, &app, nullptr, nullptr,
         "online-copy-action", nullptr,
         "<p>Paste the manual relay code from the clipboard.</p>");
-    const bool manual = app.bool_value(app.config_.relayManualHost);
+    const bool manual = false;  // Manual relay hosting is disabled in Dusklight Co-op.
     for (auto handle : app.manualHostControls_)
         if (handle) svc_ui->elem_set_class(mod_ctx, handle, "online-manual-only-hidden", !manual);
     return MOD_OK;
@@ -2863,7 +2850,7 @@ ModResult OnlineApp::update_window(ModContext*, void* data, ModError*) {
 
 ModResult OnlineApp::update_lobby_window(ModContext*, void* data, ModError*) {
     auto& app = *static_cast<OnlineApp*>(data);
-    const bool manual = app.bool_value(app.config_.relayManualHost);
+    const bool manual = false;  // Manual relay hosting is disabled in Dusklight Co-op.
     for (auto& handle : app.manualHostControls_) {
         if (handle && svc_ui->elem_set_class(mod_ctx, handle,
             "online-manual-only-hidden", !manual) != MOD_OK) handle = 0;
