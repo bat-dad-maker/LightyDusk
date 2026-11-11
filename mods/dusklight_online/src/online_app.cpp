@@ -223,14 +223,14 @@ std::string friendly_status_text(std::string text) {
 
 std::string friendly_error_sentence(std::string_view error) {
     if (error.empty()) return {};
-    if (error == "lobby_not_found") return "No room with that Room ID exists.";
-    if (error == "lobby_exists") return "A room with that Room ID already exists. Pick another Room ID.";
-    if (error == "bad_lobby_code") return "The room password is incorrect.";
+    if (error == "lobby_not_found") return "No room with that Room name exists.";
+    if (error == "lobby_exists") return "A room with that Room name already exists. Pick another Room name.";
+    if (error == "bad_lobby_code") return "The room code is incorrect.";
     if (error == "lobby_full") return "The room is full.";
     if (error == "room_recovering") return "A lobby connection is recovering. Please try again shortly.";
     if (error == "protocol_version") return "The relay protocol is incompatible.";
     if (error == "invalid_lobby_code_proof") return "Lobby code verification failed.";
-    if (error == "lobby_too_long") return "The Room ID is too long.";
+    if (error == "lobby_too_long") return "The Room name is too long.";
     if (error == "username_too_long") return "The player name is too long.";
     if (error == "remote closed") return "The connection was closed.";
     std::string sentence = friendly_status_text(std::string(error));
@@ -1232,7 +1232,7 @@ ModResult OnlineApp::register_ui(ModError* error) {
         return mods::set_error(error, MOD_ERROR, "failed to register Online UI panel");
     }
     UiMenuTabDesc menu = UI_MENU_TAB_DESC_INIT;
-    menu.label = "Co-op Online";
+    menu.label = "Multiplayer";
     menu.on_selected = &OnlineApp::menu_selected;
     menu.user_data = this;
     if (svc_ui->register_menu_tab(mod_ctx, &menu, &menuTab_) != MOD_OK) {
@@ -1897,7 +1897,7 @@ ModResult OnlineApp::build_panel(ModContext*, UiElementHandle panel, void* data,
     const std::string status = app.status_text();
     svc_ui->pane_add_rml(mod_ctx, panel, status.c_str(), &app.panelStatus_);
     app.panelRenderedStatus_ = status;
-    add_button(panel, "Open Online", &OnlineApp::open_pressed, &app);
+    add_button(panel, "Open Multiplayer", &OnlineApp::open_pressed, &app);
     return MOD_OK;
 }
 
@@ -1929,12 +1929,24 @@ ModResult OnlineApp::build_session_tab(ModContext*, UiWindowHandle, UiElementHan
     svc_ui->elem_set_class(mod_ctx, left, "online-session-pane", true);
 
     svc_ui->pane_add_section(mod_ctx, left, "PLAY");
-    add_button(left, "Host lobby", &OnlineApp::host_lobby_pressed, &app);
-    add_button(left, "Join lobby", &OnlineApp::join_lobby_pressed, &app);
+    add_button(left, "Create room", &OnlineApp::host_lobby_pressed, &app, nullptr, nullptr, nullptr, nullptr,
+               "<p>Start a room. Pick a Room name and Room code, then give both to your partner.</p>");
+    add_button(left, "Join room", &OnlineApp::join_lobby_pressed, &app, nullptr, nullptr, nullptr, nullptr,
+               "<p>Join your partner's room with their Room name and Room code.</p>");
     add_button(left, "Stop hosting", &OnlineApp::stop_hosting_pressed, &app,
                &OnlineApp::host_inactive, nullptr, "online-danger-action");
     add_button(left, "Disconnect", &OnlineApp::disconnect_pressed, &app,
                &OnlineApp::joiner_inactive, nullptr, "online-danger-action");
+
+    svc_ui->pane_add_section(mod_ctx, left, "Co-op");
+    add_bound_control(
+        left, UI_CONTROL_TOGGLE, "Shared HP", app.config_.sharedHp,
+        0, 0, 1, 0, nullptr, nullptr, nullptr, nullptr,
+        "<p>On: enemies share one health pool between you and your partner. Bosses get double health with two players. The room host's setting is used for everyone.</p>");
+    add_bound_control(
+        left, UI_CONTROL_TOGGLE, "Boss doors need both players", app.config_.bossDoorTogether,
+        0, 0, 1, 0, nullptr, nullptr, nullptr, nullptr,
+        "<p>On: a boss door only opens when your partner is at it too. The room host's setting is used for everyone.</p>");
 
     svc_ui->pane_add_section(mod_ctx, left, "Session");
     add_button(left, "Session options", &OnlineApp::settings_pressed, &app);
@@ -2265,9 +2277,9 @@ ModResult OnlineApp::build_host_relay_settings(ModContext*, UiElementHandle pane
                "<p>Close the current NAT/Relay lobby and disconnect every guest.</p>");
     add_form_string(pane, "Player name", app.config_.playerName, 32, nullptr,
                     "<p>The name other players will see for you.</p>");
-    add_form_string(pane, "Room ID", app.config_.relayRoom, 64, "online-half-field",
-                    "<p>Pick a Room ID. Your buddy types this exact Room ID to find your game.</p>");
-    add_form_string(pane, "Room password", app.config_.lobbyCode, 128, "online-half-field",
+    add_form_string(pane, "Room name", app.config_.relayRoom, 64, "online-half-field",
+                    "<p>Pick a Room name. Your buddy types this exact Room name to find your game.</p>");
+    add_form_string(pane, "Room code", app.config_.lobbyCode, 128, "online-half-field",
                     "<p>Required: 6-128 characters. Share it with your buddy; do not reuse an account password.</p>");
     add_bound_control(pane, UI_CONTROL_TOGGLE, "Manual host",
                       app.config_.relayManualHost, 0, 0, 1, 0, nullptr, nullptr,
@@ -2327,10 +2339,10 @@ ModResult OnlineApp::build_join_relay_settings(ModContext*, UiElementHandle pane
                "<p>Leave the current NAT/Relay lobby.</p>");
     add_form_string(pane, "Player name", app.config_.playerName, 32, nullptr,
                     "<p>The name other players will see for you.</p>");
-    add_form_string(pane, "Room ID", app.config_.relayRoom, 64, "online-half-field",
-                    "<p>The exact Room ID your buddy created.</p>");
-    add_form_string(pane, "Room password", app.config_.lobbyCode, 128, "online-half-field",
-                    "<p>The 6-128 character room password your buddy set.</p>");
+    add_form_string(pane, "Room name", app.config_.relayRoom, 64, "online-half-field",
+                    "<p>The exact Room name your buddy created.</p>");
+    add_form_string(pane, "Room code", app.config_.lobbyCode, 128, "online-half-field",
+                    "<p>The 6-128 character room code your buddy set.</p>");
     add_bound_control(pane, UI_CONTROL_TOGGLE, "Manual host",
                       app.config_.relayManualHost, 0, 0, 1, 0, nullptr, nullptr,
                       "online-wide-control", nullptr,

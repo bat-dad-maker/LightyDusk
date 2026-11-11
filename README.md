@@ -2,7 +2,7 @@
 
 **Dusklight Co-op** is a fork of [Dusklight](https://github.com/TwilitRealm/dusklight), the reverse-engineered
 PC/Android port of *The Legend of Zelda: Twilight Princess*, with online two-player co-op **built in**.
-No separate mod to install: create a room, give your buddy the Room ID and password, and play the story together.
+No separate mod to install: create a room, give your buddy the Room name and code, and play the story together.
 
 Keywords: Zelda Twilight Princess co-op, Twilight Princess multiplayer, Twilight Princess online, Dusklight multiplayer,
 Dusklight co-op, Dusk TP port, Zelda co-op Android APK, two player Zelda, online co-op Zelda, GameCube decomp port.
@@ -12,9 +12,9 @@ Dusklight co-op, Dusk TP port, Zelda co-op Android APK, two player Zelda, online
 
 ## Features
 
-- **Rooms with a Room ID and password.** Open the **Co-op Online** tab in the menu, choose *Create room*, type a
-  Room ID and a password (6–128 characters), and share them. Your buddy picks *Join room* and enters the same
-  Room ID and password. No port forwarding needed.
+- **Rooms with a Room name and code.** Open the **Multiplayer** tab in the menu, choose *Create room*, type a
+  Room name and a code (6–128 characters), and share them. Your buddy picks *Join room* and enters the same
+  Room name and code. No port forwarding needed.
 - **Shared enemy HP (on/off).** When either player damages an enemy, the same enemy in the other player's game loses
   the same HP, so you wear enemies down together. The killing blow always plays the game's normal defeat animation
   and drops.
@@ -55,6 +55,6 @@ release. Local builds work exactly like upstream Dusklight; see [docs](docs/).
 - [Dusklight](https://github.com/TwilitRealm/dusklight) by the Twilit Realm team (CC0-1.0).
 - [MFB Multiplayer / Dusklight Online](https://github.com/matthewdavidrichardanderson/dusklight-online-mod) by
   mdra5000 (CC0-1.0), bundled in `mods/dusklight_online`.
-- Co-op additions: shared enemy HP, two-player boss health, boss-door gate, Room ID/password UI.
+- Co-op additions: shared enemy HP, two-player boss health, boss-door gate, Room name/code UI.
 
 This project is not affiliated with or endorsed by Nintendo or the Twilit Realm team.
