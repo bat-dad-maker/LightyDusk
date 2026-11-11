@@ -127,10 +127,15 @@ jobs:
         run: |
           BT="$ANDROID_HOME/build-tools/36.1.0"
           UNSIGNED=platforms/android/app/build/outputs/apk/release/app-arm64-v8a-release-unsigned.apk
-          echo "$SIGNING_KEY_PK8_B64" | base64 -d > "$RUNNER_TEMP/key.pk8"
-          echo "$SIGNING_CERT_B64" | base64 -d > "$RUNNER_TEMP/cert.pem"
           "$BT/zipalign" -p -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
           mkdir -p upload
+          if [ -z "$SIGNING_KEY_PK8_B64" ] || [ -z "$SIGNING_CERT_B64" ]; then
+            echo "::warning::No signing secrets set; uploading aligned unsigned APK"
+            cp "$RUNNER_TEMP/aligned.apk" upload/DusklightCoop-${APP_VERSION}-android-arm64-unsigned.apk
+            exit 0
+          fi
+          echo "$SIGNING_KEY_PK8_B64" | base64 -d > "$RUNNER_TEMP/key.pk8"
+          echo "$SIGNING_CERT_B64" | base64 -d > "$RUNNER_TEMP/cert.pem"
           "$BT/apksigner" sign --key "$RUNNER_TEMP/key.pk8" --cert "$RUNNER_TEMP/cert.pem" \
             --out upload/DusklightCoop-${APP_VERSION}-android-arm64.apk "$RUNNER_TEMP/aligned.apk"
           "$BT/apksigner" verify --verbose upload/DusklightCoop-${APP_VERSION}-android-arm64.apk
