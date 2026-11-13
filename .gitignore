@@ -1,0 +1,17 @@
+build/
+build_ninja/
+*.dusk
+
+imports.txt
+
+.vs/
+.vscode/
+__pycache__/
+*.pyc
+build_release/
+release/
+
+node_modules/
+.wrangler/
+
+/dusklight/

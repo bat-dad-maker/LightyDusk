@@ -1,0 +1,2658 @@
+
+
+#include "mod.hpp"
+#include "models.hpp"
+#include "net/messages.hpp"
+
+#include "mods/service.hpp"
+#include "mods/svc/config.h"
+#include "mods/svc/hook.hpp"
+#include "mods/svc/item.h"
+#include "mods/svc/log.hpp"
+#include "print.hpp"
+#include "mods/svc/ui.h"
+
+#include "Z2AudioLib/Z2AudioMgr.h"
+#include "Z2AudioLib/Z2LinkMgr.h"
+#include "Z2AudioLib/Z2SeMgr.h"
+#include "m_Do/m_Do_controller_pad.h"
+#include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_horse.h"
+#include "d/d_com_inf_game.h"
+#include "d/d_kankyo.h"
+#include "d/d_meter2_info.h"
+#include "d/d_item.h"
+#include "m_Do/m_Do_main.h"
+#include "d/d_item_data.h"
+#include "d/actor/d_a_itembase.h"
+#include "f_op/f_op_actor_mng.h"
+
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <string>
+
+bool s_devLogging = false;
+
+const int kStateLoadNewItems = 12;
+uint32_t s_stateItemBits[8] = {};
+bool s_haveStateItemBits = false;
+
+uint16_t s_hostSession = 0;
+bool s_haveHostSession = false;
+namespace {
+void send_session_settings();
+}
+
+namespace {
+
+CoopFeatureVars s_vars;
+
+CoopPeer s_peers[kCoopMaxPlayers];
+
+CoopPeer& peer_slot(uint8_t id) {
+    static CoopPeer dummy;
+    return id < kCoopMaxPlayers ? s_peers[id] : dummy;
+}
+
+CoopPeer& first_peer() {
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (s_peers[i].present) return s_peers[i];
+    }
+    static CoopPeer none;
+    none = CoopPeer{};
+    return none;
+}
+
+bool s_peerAnnounced[kCoopMaxPlayers] = {};
+
+uint16_t s_lastRoster = 0;
+
+std::string sender_name(uint8_t from) {
+    if (from < kCoopMaxPlayers && s_peers[from].present && !s_peers[from].name.empty()) {
+        return s_peers[from].name;
+    }
+    return "Another player";
+}
+uint32_t s_presenceTicks = 0;
+uint32_t s_timeTicks = 0;
+
+ConfigVarHandle register_var(
+    const char* name, ConfigVarType type, bool defBool, int64_t defInt, const char* defString) {
+    ConfigVarDesc desc = CONFIG_VAR_DESC_INIT;
+    desc.name = name;
+    desc.type = type;
+    desc.default_bool = defBool;
+    desc.default_int = defInt;
+    desc.default_string = defString;
+    ConfigVarHandle handle = 0;
+    if (svc_config->register_var(mod_ctx, &desc, &handle) != MOD_OK) {
+        coop_log::warn("coop_mod: failed to register config var '{}'", name);
+    }
+    return handle;
+}
+
+std::string sanitize_name(const std::string& raw) {
+    std::string out;
+    for (char c : raw) {
+        if (c >= 0x20 && c < 0x7F) out.push_back(c);
+        if (out.size() >= static_cast<size_t>(kCoopNameMax - 1)) break;
+    }
+    while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out.empty() ? std::string("Player") : out;
+}
+
+void copy_name(char* dst, const std::string& name) {
+    std::memset(dst, 0, kCoopNameMax);
+    std::strncpy(dst, name.c_str(), kCoopNameMax - 1);
+}
+
+std::string s_knownName[kCoopMaxPlayers];
+bool s_nameGapLogged[kCoopMaxPlayers] = {};
+
+void remember_name(uint8_t from, const std::string& name) {
+    if (from >= kCoopMaxPlayers || name.empty()) return;
+    s_knownName[from] = name;
+    s_nameGapLogged[from] = false;
+}
+
+std::string wire_name(const char* buf) {
+    const void* end = std::memchr(buf, '\0', kCoopNameMax);
+    const size_t len = (end != nullptr) ? static_cast<size_t>(static_cast<const char*>(end) - buf)
+                                        : static_cast<size_t>(kCoopNameMax);
+    return sanitize_name(std::string(buf, len));
+}
+
+std::string rml_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        default: out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+void toast(const std::string& title, const std::string& body, uint32_t durationMs = 0,
+    NotifyKind kind = kNotifyOther) {
+    coop_notify(kind, title, body, durationMs);
+}
+
+void toast_kind(NotifyKind kind, const std::string& title, const std::string& body,
+    uint32_t durationMs = 0) {
+    coop_notify(kind, title, body, durationMs);
+}
+
+bool in_gameplay() {
+    return daAlink_getAlinkActorClass() != nullptr;
+}
+
+}
+
+void coop_toast(const char* title, const char* body) {
+    if (title == nullptr) return;
+    toast(title, body != nullptr ? body : "");
+}
+
+namespace {
+
+bool is_skybook(uint8_t item) {
+    return item == dItemNo_ANCIENT_DOCUMENT_e || item == dItemNo_AIR_LETTER_e ||
+           item == dItemNo_ANCIENT_DOCUMENT2_e;
+}
+
+bool item_is_relayed(uint8_t item) {
+    if (is_skybook(item) && rando_active()) return false;
+    if (item >= dItemNo_SWORD_e && item <= dItemNo_WEAR_ZORA_e) return true;
+    if (item >= dItemNo_WALLET_LV1_e && item <= dItemNo_WALLET_LV3_e) return true;
+    if (item >= dItemNo_ZORAS_JEWEL_e && item <= dItemNo_COPY_ROD_2_e) return true;
+    if (item >= dItemNo_ARROW_LV1_e && item <= dItemNo_ARROW_LV3_e) return true;
+    if (item >= dItemNo_BEE_ROD_e && item <= dItemNo_JEWEL_WORM_ROD_e) return true;
+    if (item >= dItemNo_LETTER_e && item <= dItemNo_HORSE_FLUTE_e) return true;
+    if (item >= dItemNo_MIRROR_PIECE_2_e && item <= dItemNo_MIRROR_PIECE_4_e) return true;
+    if (item >= dItemNo_SMELL_YELIA_POUCH_e && item <= dItemNo_SMELL_MEDICINE_e) return true;
+    if (item >= dItemNo_M_BEETLE_e && item <= dItemNo_F_MAYFLY_e) return true;
+    switch (item) {
+    case dItemNo_KAKERA_HEART_e:
+    case dItemNo_UTAWA_HEART_e:
+    case dItemNo_MAGIC_LV1_e:
+    case dItemNo_BOMB_BAG_LV2_e:
+    case dItemNo_BOMB_BAG_LV1_e:
+    case dItemNo_LIGHT_ARROW_e:
+
+    case dItemNo_LIGHT_SWORD_e:
+    case dItemNo_LURE_ROD_e:
+    case dItemNo_EMPTY_BOTTLE_e:
+    case dItemNo_RAFRELS_MEMO_e:
+    case dItemNo_ASHS_SCRIBBLING_e:
+    case dItemNo_POU_SPIRIT_e:
+    case dItemNo_ANCIENT_DOCUMENT_e:
+    case dItemNo_AIR_LETTER_e:
+    case dItemNo_ANCIENT_DOCUMENT2_e:
+    case dItemNo_TOMATO_PUREE_e:
+    case dItemNo_TASTE_e:
+    case dItemNo_SURFBOARD_e:
+    case dItemNo_KANTERA2_e:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool item_is_check_extra(uint8_t item) {
+    switch (item) {
+
+    case 0x14: case 0x15: case 0x39: case 0x3A: case 0x3B: case 0x3C: case 0x4D: case 0x4E:
+    case 0x52: case 0x57: case 0x8F: case 0xAE: case 0xAF: case 0xBF: case 0xE8:
+        return true;
+    default:
+        break;
+    }
+    if (item >= 0x85 && item <= 0x8E) return true;
+    if (item >= 0x92 && item <= 0x98) return true;
+    if (item >= 0x99 && item <= 0x9B) return true;
+    if (item >= 0xA8 && item <= 0xAD) return true;
+    if (item >= 0xB6 && item <= 0xBE) return true;
+    if (item >= 0xD8 && item <= 0xDB) return true;
+    if (item >= 0xE1 && item <= 0xE7) return true;
+
+    if ((item >= 0xF9 && item <= 0xFB) || item == 0xFD) return rando_active();
+    if (is_skybook(item)) return rando_active();
+    return false;
+}
+
+const uint8_t kChainSword[] = {0x3F, 0x28, 0x29, 0x49};
+const uint8_t kChainBow[] = {0x43, 0x55, 0x56};
+const uint8_t kChainClawshot[] = {0x44, 0x47};
+const uint8_t kChainRod[] = {0x46, 0x4C};
+const uint8_t kChainFishing[] = {0x4A, 0x3D};
+const uint8_t kChainWallet[] = {0x35, 0x36};
+const uint8_t kChainSkill[] = {0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7};
+const uint8_t kChainKeyShard[] = {0xF9, 0xFA, 0xFD};
+const uint8_t kChainMirror[] = {0xDB, 0xA5, 0xA6, 0xA7};
+const uint8_t kChainShadow[] = {0xD8, 0xD9, 0xDA};
+
+struct Chain {
+    const uint8_t* items;
+    int count;
+};
+#define COOP_CHAIN(a) {a, static_cast<int>(sizeof(a) / sizeof(a[0]))}
+const Chain kChains[] = {
+    COOP_CHAIN(kChainSword), COOP_CHAIN(kChainBow), COOP_CHAIN(kChainClawshot),
+    COOP_CHAIN(kChainRod), COOP_CHAIN(kChainFishing), COOP_CHAIN(kChainWallet),
+    COOP_CHAIN(kChainSkill), COOP_CHAIN(kChainKeyShard), COOP_CHAIN(kChainMirror),
+    COOP_CHAIN(kChainShadow),
+};
+#undef COOP_CHAIN
+
+uint8_t progressive_step(uint8_t item) {
+    if (!rando_active()) return item;
+    for (const Chain& chain : kChains) {
+        bool inChain = false;
+        for (int i = 0; i < chain.count; ++i) inChain = inChain || chain.items[i] == item;
+        if (!inChain) continue;
+
+        if (checkItemGet(item, 1) == 0) return item;
+        for (int i = 0; i < chain.count; ++i) {
+            if (checkItemGet(chain.items[i], 1) == 0) return chain.items[i];
+        }
+        return dItemNo_NONE_e;
+    }
+    return item;
+}
+
+bool item_is_stackable(uint8_t item) {
+    switch (item) {
+    case dItemNo_KAKERA_HEART_e:
+    case dItemNo_UTAWA_HEART_e:
+    case dItemNo_POU_SPIRIT_e:
+    case dItemNo_EMPTY_BOTTLE_e:
+    case dItemNo_BOMB_BAG_LV1_e:
+        return true;
+    default:
+        return false;
+    }
+}
+
+const char* item_name(uint8_t item) {
+    if (item >= dItemNo_M_BEETLE_e && item <= dItemNo_F_MAYFLY_e) return "a Golden Bug";
+    if (item >= dItemNo_MIRROR_PIECE_2_e && item <= dItemNo_MIRROR_PIECE_4_e) {
+        return "a Mirror Shard";
+    }
+    if (item >= dItemNo_SMELL_YELIA_POUCH_e && item <= dItemNo_SMELL_MEDICINE_e) return "a scent";
+    if (item >= dItemNo_BEE_ROD_e && item <= dItemNo_JEWEL_WORM_ROD_e) {
+        return "a Fishing Rod upgrade";
+    }
+    if (item >= dItemNo_WALLET_LV1_e && item <= dItemNo_WALLET_LV3_e) return "a bigger Wallet";
+    if (item >= dItemNo_CHUCHU_RARE_e && item <= dItemNo_CHUCHU_PURPLE_e) return "Chu Jelly";
+    switch (item) {
+    case dItemNo_KAKERA_HEART_e: return "a Piece of Heart";
+    case dItemNo_UTAWA_HEART_e: return "a Heart Container";
+    case dItemNo_SWORD_e: return "the Ordon Sword";
+    case dItemNo_MASTER_SWORD_e: return "the Master Sword";
+    case dItemNo_WOOD_SHIELD_e: return "the Wooden Shield";
+    case dItemNo_SHIELD_e: return "the Ordon Shield";
+    case dItemNo_HYLIA_SHIELD_e: return "the Hylian Shield";
+    case dItemNo_TKS_LETTER_e: return "a letter";
+    case dItemNo_WEAR_CASUAL_e: return "the Ordon Clothes";
+    case dItemNo_WEAR_KOKIRI_e: return "the Hero's Clothes";
+    case dItemNo_ARMOR_e: return "the Magic Armor";
+    case dItemNo_WEAR_ZORA_e: return "the Zora Armor";
+    case dItemNo_MAGIC_LV1_e: return "the Shadow Crystal";
+    case dItemNo_ZORAS_JEWEL_e: return "the Coral Earring";
+    case dItemNo_HAWK_EYE_e: return "the Hawkeye";
+    case dItemNo_WOOD_STICK_e: return "the Wooden Sword";
+    case dItemNo_BOOMERANG_e: return "the Gale Boomerang";
+    case dItemNo_SPINNER_e: return "the Spinner";
+    case dItemNo_IRONBALL_e: return "the Ball and Chain";
+    case dItemNo_BOW_e: return "the Hero's Bow";
+    case dItemNo_HOOKSHOT_e: return "the Clawshot";
+    case dItemNo_HVY_BOOTS_e: return "the Iron Boots";
+    case dItemNo_COPY_ROD_e: return "the Dominion Rod";
+    case dItemNo_W_HOOKSHOT_e: return "the Double Clawshots";
+    case dItemNo_KANTERA_e: return "the Lantern";
+    case dItemNo_KANTERA2_e: return "the Lantern";
+    case dItemNo_LIGHT_SWORD_e: return "the Master Sword's light";
+    case dItemNo_FISHING_ROD_1_e: return "the Fishing Rod";
+    case dItemNo_PACHINKO_e: return "the Slingshot";
+    case dItemNo_COPY_ROD_2_e: return "the restored Dominion Rod";
+    case dItemNo_BOMB_BAG_LV1_e: return "a Bomb Bag";
+    case dItemNo_BOMB_BAG_LV2_e: return "the Giant Bomb Bag";
+    case dItemNo_LIGHT_ARROW_e: return "Light Arrows";
+    case dItemNo_ARROW_LV1_e: return "a Quiver";
+    case dItemNo_ARROW_LV2_e: return "the Big Quiver";
+    case dItemNo_ARROW_LV3_e: return "the Giant Quiver";
+    case dItemNo_LURE_ROD_e: return "a fishing lure";
+    case dItemNo_EMPTY_BOTTLE_e: return "an Empty Bottle";
+    case dItemNo_LETTER_e: return "Renado's Letter";
+    case dItemNo_BILL_e: return "the Invoice";
+    case dItemNo_WOOD_STATUE_e: return "the Wooden Statue";
+    case dItemNo_IRIAS_PENDANT_e: return "Ilia's Charm";
+    case dItemNo_HORSE_FLUTE_e: return "the Horse Call";
+    case dItemNo_RAFRELS_MEMO_e: return "Auru's Memo";
+    case dItemNo_ASHS_SCRIBBLING_e: return "Ashei's Sketch";
+    case dItemNo_POU_SPIRIT_e: return "a Poe Soul";
+    case dItemNo_ANCIENT_DOCUMENT_e: return "an Ancient Sky Book";
+    case dItemNo_AIR_LETTER_e: return "an Ancient Sky Character";
+    case dItemNo_ANCIENT_DOCUMENT2_e: return "the Ancient Sky Book";
+    case dItemNo_TOMATO_PUREE_e: return "the Ordon Pumpkin";
+    case dItemNo_TASTE_e: return "the Ordon Goat Cheese";
+    case dItemNo_SURFBOARD_e: return "the Snowboard";
+    case dItemNo_RED_BOTTLE_e: return "Red Potion";
+    case dItemNo_RED_BOTTLE_2_e: return "Red Potion";
+    case dItemNo_GREEN_BOTTLE_e: return "Green Potion";
+    case dItemNo_BLUE_BOTTLE_e: return "Blue Potion";
+    case dItemNo_MILK_BOTTLE_e: return "Milk";
+    case dItemNo_HALF_MILK_BOTTLE_e: return "Half Milk";
+    case dItemNo_OIL_BOTTLE_e: return "Lantern Oil";
+    case dItemNo_OIL_BOTTLE_2_e: return "Lantern Oil";
+    case dItemNo_OIL_BOTTLE3_e: return "Lantern Oil";
+    case dItemNo_OIL_e: return "Lantern Oil";
+    case dItemNo_OIL2_e: return "Lantern Oil";
+    case dItemNo_WATER_BOTTLE_e: return "Water";
+    case dItemNo_UGLY_SOUP_e: return "Nasty Soup";
+    case dItemNo_HOT_SPRING_e: return "Hot Spring Water";
+    case dItemNo_HOT_SPRING_2_e: return "Hot Spring Water";
+    case dItemNo_FAIRY_e: return "a Fairy";
+    case dItemNo_FAIRY_DROP_e: return "Great Fairy's Tears";
+    case dItemNo_DROP_BOTTLE_e: return "Great Fairy's Tears";
+    case dItemNo_WORM_e: return "a Worm";
+    case dItemNo_BEE_CHILD_e: return "Bee Larva";
+    case dItemNo_SHOP_BEE_CHILD_e: return "Bee Larva";
+    case dItemNo_CHUCHU_YELLOW2_e: return "Chu Jelly";
+    case dItemNo_CHUCHU_BLACK_e: return "Chu Jelly";
+    case dItemNo_LV1_SOUP_e: return "Simple Soup";
+    case dItemNo_LV2_SOUP_e: return "Good Soup";
+    case dItemNo_LV3_SOUP_e: return "Superb Soup";
+    default: return "an item";
+    }
+}
+
+const int kItemIdCount = 256;
+uint8_t s_invLastBits[kItemIdCount] = {};
+uint8_t s_invLastSlots[MAX_ITEM_SLOTS] = {};
+uint8_t s_invLastWallet = 0;
+bool s_haveInv = false;
+uint32_t s_invTick = 0;
+uint32_t s_invExpectUntil[kItemIdCount] = {};
+
+uint32_t s_invOwedSince[kItemIdCount] = {};
+const uint32_t kOwedRetryTicks = 600;
+
+const uint16_t kQueuedOwed = 0x100;
+uint16_t s_invQueued[96] = {};
+int s_invQueuedCount = 0;
+
+void give_silent(uint8_t item, bool owed) {
+    svc_item->give_item(mod_ctx, nullptr, item, ITEM_GIVE_SILENT);
+    if (s_invQueuedCount < static_cast<int>(sizeof(s_invQueued) / sizeof(s_invQueued[0]))) {
+        s_invQueued[s_invQueuedCount++] = static_cast<uint16_t>(item | (owed ? kQueuedOwed : 0));
+    }
+}
+
+bool item_still_queued(uint8_t item) {
+    for (int i = 0; i < s_invQueuedCount; ++i) {
+        if (s_invQueued[i] == (item | kQueuedOwed)) return true;
+    }
+    return false;
+}
+
+void note_queued_item_landed() {
+    if (s_invQueuedCount == 0) return;
+    const uint16_t entry = s_invQueued[0];
+    --s_invQueuedCount;
+    std::memmove(s_invQueued, s_invQueued + 1, static_cast<size_t>(s_invQueuedCount) * sizeof(s_invQueued[0]));
+    const uint8_t item = static_cast<uint8_t>(entry);
+    if ((entry & kQueuedOwed) != 0 && !item_still_queued(item)) s_invOwedSince[item] = 0;
+}
+
+bool on_title_screen() {
+    const char* stage = dComIfGp_getStartStageName();
+    return stage != nullptr && (std::strcmp(stage, "F_SP102") == 0 || std::strcmp(stage, "title") == 0);
+}
+
+void relay_item(uint8_t item) {
+    world_note_item_taken();
+    MsgItem msg{item};
+    coop_net_send(kMsgItem, &msg, sizeof(msg));
+    coop_log::info("coop_mod: [INV] relayed item {:#x}", item);
+}
+
+void retry_owed_items() {
+    if (svc_item == nullptr || dComIfGp_event_runCheck() || dComIfGp_isEnableNextStage()) return;
+    for (int i = 0; i < kItemIdCount; ++i) {
+        if (s_invOwedSince[i] == 0) continue;
+        const uint8_t item = static_cast<uint8_t>(i);
+        if (dComIfGs_isItemFirstBit(item)) {
+            s_invOwedSince[i] = 0;
+            continue;
+        }
+        if (s_invTick - s_invOwedSince[i] < kOwedRetryTicks) continue;
+        if (item_still_queued(item)) continue;
+        coop_log::info("coop_mod: [INV] item {:#x} not received, requesting again", item);
+        give_silent(item, true);
+        s_invOwedSince[i] = s_invTick;
+        s_invExpectUntil[i] = s_invTick + 1200;
+    }
+}
+
+void scan_inventory() {
+    ++s_invTick;
+    if (on_title_screen()) {
+        s_haveInv = false;
+        std::memset(s_invOwedSince, 0, sizeof(s_invOwedSince));
+        s_invQueuedCount = 0;
+        return;
+    }
+    if (!in_gameplay() || (s_invTick % 30) != 0) return;
+    if (coop_net_connected()) retry_owed_items();
+
+    uint8_t bits[kItemIdCount] = {};
+    for (int i = 0; i < kItemIdCount; ++i) {
+        const uint8_t item = static_cast<uint8_t>(i);
+        if (item_is_relayed(item) && !item_is_stackable(item) && dComIfGs_isItemFirstBit(item)) {
+            bits[i] = 1;
+        }
+    }
+    uint8_t slots[MAX_ITEM_SLOTS] = {};
+    for (int s = 0; s < MAX_ITEM_SLOTS; ++s) {
+
+        slots[s] = (s >= SLOT_11 && s <= SLOT_14) ? static_cast<uint8_t>(dItemNo_NONE_e)
+                                                  : dComIfGs_getItem(s, false);
+    }
+    const uint8_t wallet = dComIfGs_getWalletSize();
+
+    if (!s_haveInv) {
+        std::memcpy(s_invLastBits, bits, sizeof(bits));
+        std::memcpy(s_invLastSlots, slots, sizeof(slots));
+        s_invLastWallet = wallet;
+        s_haveInv = true;
+        return;
+    }
+
+    bool handled[kItemIdCount] = {};
+    auto consider = [&](uint8_t item) {
+        if (handled[item]) return;
+        handled[item] = true;
+        if (!item_is_relayed(item) || item_is_stackable(item)) return;
+        if (s_invExpectUntil[item] != 0 && s_invExpectUntil[item] >= s_invTick) {
+            s_invExpectUntil[item] = 0;
+            return;
+        }
+        relay_item(item);
+    };
+
+    for (int i = 0; i < kItemIdCount; ++i) {
+        if (bits[i] && !s_invLastBits[i]) consider(static_cast<uint8_t>(i));
+    }
+    for (int s = 0; s < MAX_ITEM_SLOTS; ++s) {
+        const uint8_t item = slots[s];
+        if (item == dItemNo_NONE_e || item == s_invLastSlots[s]) continue;
+        bool hadBefore = false;
+        for (int t = 0; t < MAX_ITEM_SLOTS; ++t) {
+            if (s_invLastSlots[t] == item) hadBefore = true;
+        }
+        if (!hadBefore) consider(item);
+    }
+    if (wallet > s_invLastWallet) {
+        if (wallet >= BIG_WALLET && s_invLastWallet < BIG_WALLET) consider(dItemNo_WALLET_LV2_e);
+        if (wallet >= GIANT_WALLET && s_invLastWallet < GIANT_WALLET) consider(dItemNo_WALLET_LV3_e);
+    }
+
+    for (int s = SLOT_15; s <= SLOT_17; ++s) {
+        if (s_invLastSlots[s] != dItemNo_NONE_e && slots[s] == dItemNo_NONE_e) {
+            coop_log::warn("coop_mod: [INV] bomb bag slot {} emptied (was {:#x}) connected={}", s,
+                s_invLastSlots[s], coop_net_connected());
+        }
+    }
+
+    std::memcpy(s_invLastBits, bits, sizeof(bits));
+    std::memcpy(s_invLastSlots, slots, sizeof(slots));
+    s_invLastWallet = wallet;
+}
+
+static uint32_t s_heartGraceUntil = 0;
+
+uint16_t s_lastLife = 0xFFFF;
+uint32_t s_deathLinkQuietUntil = 0;
+
+void update_death_link() {
+    if (!coop_net_connected() || !coop_session(kSessDeathLink, cfg_bool(s_vars.deathLink, false))) {
+        s_lastLife = 0xFFFF;
+        return;
+    }
+    if (daAlink_getAlinkActorClass() == nullptr || dComIfGp_event_runCheck()) return;
+    const uint16_t life = dComIfGs_getLife();
+    const uint16_t was = s_lastLife;
+    s_lastLife = life;
+    if (was == 0xFFFF || was == 0 || life != 0) return;
+    if (s_invTick < s_deathLinkQuietUntil) return;
+    MsgDeathLink msg{};
+    const std::string me = features_local_name();
+    std::strncpy(msg.name, me.c_str(), kCoopNameMax - 1);
+    coop_net_send(kMsgDeathLink, &msg, sizeof(msg));
+    coop_log::info("coop_mod: [DEATH] local death, sent");
+}
+
+void apply_death_link(const MsgDeathLink& msg) {
+    if (!coop_session(kSessDeathLink, cfg_bool(s_vars.deathLink, false))) return;
+    if (daAlink_getAlinkActorClass() == nullptr) return;
+    if (dComIfGs_getLife() == 0) return;
+
+    s_deathLinkQuietUntil = s_invTick + 300;
+    dComIfGs_setLife(0);
+    char who[kCoopNameMax];
+    std::strncpy(who, msg.name, kCoopNameMax - 1);
+    who[kCoopNameMax - 1] = '\0';
+    coop_log::info("coop_mod: [DEATH] {} died, dying too", who);
+    toast(who[0] != '\0' ? who : "Your partner", "died, so did you.");
+}
+
+void on_item_given(ModContext*, const ItemGiveInfo* info, void*) {
+    if (info == nullptr) return;
+    if (info->origin == ITEM_GIVE_ORIGIN_QUEUE_SILENT && info->check_name == nullptr) {
+        note_queued_item_landed();
+    }
+
+    const bool queuedCheck = info->origin == ITEM_GIVE_ORIGIN_QUEUE && info->check_name != nullptr;
+    if (info->origin != ITEM_GIVE_ORIGIN_GAME && !queuedCheck) return;
+    if (!coop_net_connected() || !coop_session(kSessItems, cfg_bool(s_vars.syncInventory, true))) return;
+
+    if (info->item == dItemNo_UTAWA_HEART_e) s_heartGraceUntil = s_invTick + 120;
+
+    if (item_is_check_extra(info->item) && info->check_name != nullptr) {
+        MsgItem msg{info->item};
+        coop_net_send(kMsgItem, &msg, sizeof(msg));
+        coop_log::info("coop_mod: [INV] relayed {:#x} from check '{}'", info->item,
+            info->check_name);
+        return;
+    }
+    if (!item_is_relayed(info->item)) return;
+
+    if (!item_is_stackable(info->item)) return;
+
+    if (info->item == dItemNo_EMPTY_BOTTLE_e) return;
+    MsgItem msg{info->item};
+    coop_net_send(kMsgItem, &msg, sizeof(msg));
+    coop_log::info("coop_mod: [INV] relayed item {:#x}", info->item);
+}
+
+uint8_t s_pendingShield = dItemNo_NONE_e;
+
+void equip_pending_shield() {
+    if (s_pendingShield == dItemNo_NONE_e) return;
+    const uint8_t item = s_pendingShield;
+    s_pendingShield = dItemNo_NONE_e;
+    const uint8_t shield = dComIfGs_getSelectEquipShield();
+    if (!dComIfGs_isItemFirstBit(item)) return;
+    if (shield == dItemNo_NONE_e || (item == dItemNo_SHIELD_e && shield == dItemNo_WOOD_SHIELD_e)) {
+        dMeter2Info_setShield(item, false);
+        coop_log::info("coop_mod: [INV] equipped received {:#x} on stage change", item);
+    }
+}
+
+void equip_if_better(uint8_t item) {
+    const uint8_t sword = dComIfGs_getSelectEquipSword();
+    const uint8_t shield = dComIfGs_getSelectEquipShield();
+    switch (item) {
+    case dItemNo_WOOD_STICK_e:
+    case dItemNo_SWORD_e:
+    case dItemNo_MASTER_SWORD_e:
+    case dItemNo_LIGHT_SWORD_e:
+        if (sword == dItemNo_NONE_e || (item == dItemNo_SWORD_e && sword == dItemNo_WOOD_STICK_e) ||
+            (item == dItemNo_LIGHT_SWORD_e && sword == dItemNo_MASTER_SWORD_e))
+        {
+            dMeter2Info_setSword(item, false);
+            coop_log::info("coop_mod: [INV] equipped received {:#x}", item);
+        }
+        break;
+    case dItemNo_WOOD_SHIELD_e:
+    case dItemNo_SHIELD_e:
+    case dItemNo_HYLIA_SHIELD_e:
+        if (shield == dItemNo_NONE_e || (item == dItemNo_SHIELD_e && shield == dItemNo_WOOD_SHIELD_e)) {
+            s_pendingShield = item;
+            coop_log::info("coop_mod: [INV] received {:#x}, equip deferred to next stage",
+                item);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+bool grant_equipment(uint8_t item) {
+    switch (item) {
+    case dItemNo_SWORD_e: dComIfGs_setCollectSword(COLLECT_ORDON_SWORD); break;
+    case dItemNo_MASTER_SWORD_e: dComIfGs_setCollectSword(COLLECT_MASTER_SWORD); break;
+    case dItemNo_WOOD_STICK_e: dComIfGs_setCollectSword(COLLECT_WOODEN_SWORD); break;
+    case dItemNo_LIGHT_SWORD_e: dComIfGs_setCollectSword(COLLECT_LIGHT_SWORD); break;
+    case dItemNo_WOOD_SHIELD_e: dComIfGs_setCollectShield(COLLECT_WOODEN_SHIELD); break;
+    case dItemNo_WEAR_KOKIRI_e: dComIfGs_setCollectClothes(KOKIRI_CLOTHES_FLAG); break;
+    case dItemNo_SHIELD_e:
+    case dItemNo_HYLIA_SHIELD_e:
+    case dItemNo_WEAR_CASUAL_e:
+    case dItemNo_WEAR_ZORA_e:
+    case dItemNo_ARMOR_e:
+        break;
+    default:
+        return false;
+    }
+    dComIfGs_onItemFirstBit(item);
+    equip_if_better(item);
+    return true;
+}
+
+bool local_on_stage(const char* stage8);
+
+const int16_t kProcItem = 0x218;
+const int16_t kProcLifeContainer = 0x21B;
+
+const int16_t kProcDemoItem = fpcNm_Demo_Item_e;
+
+bool is_field_item(fopAc_ac_c* actor) {
+    if (actor == nullptr) return false;
+    const s16 name = fopAcM_GetName(actor);
+    return name == kProcItem || name == kProcDemoItem;
+}
+
+fpc_ProcID s_announcedItemId = fpcM_ERROR_PROCESS_ID_e;
+
+void announce_item_taken() {
+    if (!coop_net_connected()) {
+        s_announcedItemId = fpcM_ERROR_PROCESS_ID_e;
+        return;
+    }
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == nullptr) {
+        s_announcedItemId = fpcM_ERROR_PROCESS_ID_e;
+        return;
+    }
+    fopAc_ac_c* partner = fopAcM_getItemEventPartner(alink);
+    if (!is_field_item(partner)) {
+        s_announcedItemId = fpcM_ERROR_PROCESS_ID_e;
+        return;
+    }
+
+    const u32 itemBitNo = (fopAcM_GetParam(partner) >> 8) & 0xFF;
+    if (itemBitNo == 0xFF) {
+        s_announcedItemId = fopAcM_GetID(partner);
+        return;
+    }
+    const fpc_ProcID id = fopAcM_GetID(partner);
+    if (id == s_announcedItemId) return;
+    s_announcedItemId = id;
+
+    auto* item = static_cast<daItemBase_c*>(partner);
+    MsgItemTaken msg{};
+
+    msg.home[0] = partner->home.pos.x;
+    msg.home[1] = partner->home.pos.y;
+    msg.home[2] = partner->home.pos.z;
+    msg.itemNo = item->getItemNo();
+    coop_net_send(kMsgItemTaken, &msg, sizeof(msg));
+    coop_log::info("coop_mod: [ITEM] took item {:#x} at ({:.0f},{:.0f},{:.0f}), sent",
+        static_cast<int>(msg.itemNo), msg.home[0], msg.home[1], msg.home[2]);
+}
+
+struct ItemTakenSearch {
+    cXyz home;
+    uint8_t itemNo;
+    int hidden;
+};
+
+void* hide_taken_item(void* proc, void* data) {
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    auto* want = static_cast<ItemTakenSearch*>(data);
+    if (!is_field_item(actor)) return nullptr;
+    auto* item = static_cast<daItemBase_c*>(actor);
+    if (item->getItemNo() != want->itemNo) return nullptr;
+
+    const f32 dx = actor->home.pos.x - want->home.x;
+    const f32 dy = actor->home.pos.y - want->home.y;
+    const f32 dz = actor->home.pos.z - want->home.z;
+    if (dx * dx + dy * dy + dz * dz > 80.0f * 80.0f) return nullptr;
+
+    fopAcM_OnStatus(actor, fopAcStts_NODRAW_e);
+    item->mCcCyl.OffCoSetBit();
+    ++want->hidden;
+    return nullptr;
+}
+
+void apply_item_taken(const MsgItemTaken& msg) {
+    ItemTakenSearch want{};
+    want.home.set(msg.home[0], msg.home[1], msg.home[2]);
+    want.itemNo = msg.itemNo;
+    want.hidden = 0;
+    fopAcM_Search(hide_taken_item, &want);
+    coop_log::info("coop_mod: [ITEM] peer took item {:#x}, cleared {} local copies", static_cast<int>(msg.itemNo), want.hidden);
+}
+
+struct HeartSweep {
+    fopAc_ac_c* found[8];
+    int count;
+};
+
+static void* collect_heart_item(void* proc, void* data) {
+    auto* sweep = static_cast<HeartSweep*>(data);
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr || sweep->count >= 8) return nullptr;
+    const s16 name = fopAcM_GetName(actor);
+    if (name != kProcItem && name != kProcLifeContainer) return nullptr;
+    if ((fopAcM_GetParam(actor) & 0xFF) != dItemNo_UTAWA_HEART_e) return nullptr;
+    sweep->found[sweep->count++] = actor;
+    return nullptr;
+}
+
+static void remove_local_heart_containers(uint8_t from) {
+
+    const CoopPeer& sender = features_peer_of(from);
+    if (!sender.inGame || !local_on_stage(sender.stage)) {
+        coop_log::info("coop_mod: [INV] peer heart container in another stage, local kept");
+        return;
+    }
+    HeartSweep sweep;
+    sweep.count = 0;
+    fopAcM_Search(collect_heart_item, &sweep);
+    for (int i = 0; i < sweep.count; ++i) {
+        coop_log::info("coop_mod: [INV] removing local heart container (already paid)");
+        fopAcM_delete(sweep.found[i]);
+    }
+}
+
+struct Found {
+    uint8_t from;
+    uint8_t item;
+    uint8_t got;
+    bool haveCheck;
+    bool shared;
+    std::string place;
+    uint32_t since;
+};
+std::vector<Found> s_found;
+uint32_t s_foundTick = 0;
+const uint32_t kFoundWaitTicks = 60;
+
+bool found_is_junk(uint8_t item) {
+    if (item <= 0x07 || item == 0xED) return true;
+    if (item >= 0x0A && item <= 0x12) return true;
+    if ((item >= 0x16 && item <= 0x18) || item == 0x1A || item == 0x1B) return true;
+    return false;
+}
+
+const char* found_item_name(uint8_t item) {
+    if (rando_active()) {
+        if (const char* name = rando_item_name(item)) return name;
+    }
+    return item_name(item);
+}
+
+Found& found_entry(uint8_t from, uint8_t item) {
+    for (Found& f : s_found) {
+        if (f.from == from && f.item == item) return f;
+    }
+    if (s_found.size() >= 16) s_found.erase(s_found.begin());
+    Found f{};
+    f.from = from;
+    f.item = item;
+    f.got = item;
+    f.since = s_foundTick;
+    s_found.push_back(f);
+    return s_found.back();
+}
+
+bool found_will_share(uint8_t item) {
+    return coop_session(kSessItems, cfg_bool(s_vars.syncInventory, true)) &&
+           (item_is_relayed(item) || item_is_check_extra(item));
+}
+
+void show_found(const Found& f) {
+    if (!cfg_bool(s_vars.notifyItems, true)) return;
+
+    std::string body = f.place;
+    if (body.empty() && f.shared) {
+        body = f.got == f.item ? "You got it too."
+                               : std::string("You got ") + found_item_name(f.got) + ".";
+    }
+    toast_kind(kNotifyItems, sender_name(f.from) + " found " + found_item_name(f.item), body);
+}
+
+void found_update() {
+    ++s_foundTick;
+    for (size_t i = 0; i < s_found.size();) {
+        const Found& f = s_found[i];
+        const bool whole = f.haveCheck && (f.shared || !found_will_share(f.item));
+        if (whole || s_foundTick - f.since >= kFoundWaitTicks) {
+            show_found(f);
+            s_found.erase(s_found.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            ++i;
+        }
+    }
+}
+
+uint8_t s_lastScent = dItemNo_NONE_e;
+bool s_haveScent = false;
+uint8_t s_scentOwed = dItemNo_NONE_e;
+uint8_t s_scentOwedFrom = 0;
+
+bool is_scent(uint8_t item) {
+    return item >= dItemNo_SMELL_YELIA_POUCH_e && item <= dItemNo_SMELL_MEDICINE_e;
+}
+
+const char* scent_name(uint8_t smell) {
+    switch (smell) {
+    case dItemNo_SMELL_YELIA_POUCH_e: return "Ilia's scent";
+    case dItemNo_SMELL_POH_e: return "the Poe scent";
+    case dItemNo_SMELL_FISH_e: return "the Reekfish scent";
+    case dItemNo_SMELL_CHILDREN_e: return "the children's scent";
+    case dItemNo_SMELL_MEDICINE_e: return "the medicine scent";
+    default: return "a scent";
+    }
+}
+
+void take_scent(uint8_t smell, uint8_t from) {
+    if (dComIfGs_getCollectSmell() == smell) return;
+    if (dComIfGp_event_runCheck()) {
+        s_scentOwed = smell;
+        s_scentOwedFrom = from;
+        return;
+    }
+    if (dComIfGs_getCollectSmell() == dItemNo_SMELL_MEDICINE_e) {
+        dComIfGs_offEventBit(dSv_event_flag_c::F_0387);
+    }
+    dComIfGs_onItemFirstBit(smell);
+    dComIfGs_setCollectSmell(smell);
+    dComIfGs_setSelectItemIndex(2, smell);
+    if (smell == dItemNo_SMELL_MEDICINE_e) dComIfGs_onEventBit(dSv_event_flag_c::F_0387);
+
+    s_lastScent = smell;
+    s_invExpectUntil[smell] = s_invTick + 1200;
+    coop_log::info("coop_mod: [INV] {} picked up {:#x}, granted", sender_name(from), smell);
+    if (cfg_bool(s_vars.notifyItems, true)) {
+        toast_kind(kNotifyItems, sender_name(from) + " picked up " + scent_name(smell),
+            "You're following it too.");
+    }
+}
+
+void scan_scent() {
+    if (!in_gameplay()) {
+        s_haveScent = false;
+        return;
+    }
+    if (s_scentOwed != dItemNo_NONE_e && !dComIfGp_event_runCheck()) {
+        const uint8_t owed = s_scentOwed;
+        s_scentOwed = dItemNo_NONE_e;
+        take_scent(owed, s_scentOwedFrom);
+    }
+    const uint8_t now = dComIfGs_getCollectSmell();
+    if (!s_haveScent) {
+        s_haveScent = true;
+        s_lastScent = now;
+        return;
+    }
+    if (now == s_lastScent) return;
+    s_lastScent = now;
+    if (!is_scent(now) || !coop_net_connected()) return;
+    MsgItem msg{now};
+    coop_net_send(kMsgItem, &msg, sizeof(msg));
+    coop_log::info("coop_mod: [INV] picked up scent {:#x}, sent", now);
+}
+
+void apply_remote_item(uint8_t item, uint8_t from) {
+    if (!coop_session(kSessItems, cfg_bool(s_vars.syncInventory, true))) return;
+    if (svc_item == nullptr) return;
+    if (is_scent(item)) {
+        take_scent(item, from);
+        return;
+    }
+    const bool extra = item_is_check_extra(item);
+    if (!item_is_relayed(item) && !extra) return;
+
+    const uint8_t relayed = item;
+    item = progressive_step(item);
+    if (item == dItemNo_NONE_e) {
+        coop_log::info("coop_mod: [INV] {:#x} from {}: all tiers owned", relayed,
+            sender_name(from));
+        return;
+    }
+    if (item != relayed) {
+        coop_log::info("coop_mod: [INV] {:#x} from {} already owned, next tier {:#x}", relayed, sender_name(from), item);
+    } else if (!extra && !item_is_stackable(item) && dComIfGs_isItemFirstBit(item)) {
+        return;
+    }
+
+    if (item == dItemNo_UTAWA_HEART_e && s_invTick < s_heartGraceUntil) {
+
+        coop_log::info("coop_mod: [INV] ignoring peer heart container (just took one)");
+        return;
+    }
+
+    if (item == dItemNo_UTAWA_HEART_e) {
+
+        for (int i = 0; i < 5; ++i) {
+            give_silent(dItemNo_KAKERA_HEART_e, false);
+        }
+
+        remove_local_heart_containers(from);
+    } else if (!grant_equipment(item)) {
+        const bool owed = !item_is_stackable(item) && !extra;
+        give_silent(item, owed);
+        if (owed) s_invOwedSince[item] = s_invTick != 0 ? s_invTick : 1;
+    }
+
+    s_invExpectUntil[item] = s_invTick + 1200;
+    coop_log::info("coop_mod: [INV] received item {:#x} from {}", item, sender_name(from));
+
+    if (!rando_active()) {
+        if (cfg_bool(s_vars.notifyItems, true)) {
+            toast_kind(kNotifyItems, sender_name(from) + " found " + item_name(item),
+                "You got it too.");
+        }
+        return;
+    }
+    Found& found = found_entry(from, relayed);
+    found.shared = true;
+    found.got = item;
+}
+
+const int kBottleSlots = 4;
+uint8_t s_lastBottles[kBottleSlots] = {};
+bool s_haveBottles = false;
+
+bool is_empty_bottle(uint8_t v) {
+    return v == dItemNo_EMPTY_BOTTLE_e;
+}
+
+void read_bottles(uint8_t* out) {
+    for (int i = 0; i < kBottleSlots; ++i) {
+        out[i] = dComIfGs_getItem(SLOT_11 + i, true);
+    }
+}
+
+void scan_bottles() {
+
+    if (!in_gameplay()) {
+        s_haveBottles = false;
+        return;
+    }
+    uint8_t now[kBottleSlots];
+    read_bottles(now);
+    if (!s_haveBottles) {
+        std::memcpy(s_lastBottles, now, sizeof(now));
+        s_haveBottles = true;
+        return;
+    }
+    for (int i = 0; i < kBottleSlots; ++i) {
+        const uint8_t before = s_lastBottles[i];
+        const uint8_t after = now[i];
+        if (before == after || after == dItemNo_NONE_e) continue;
+
+        if (is_empty_bottle(after) && before != dItemNo_NONE_e) continue;
+        MsgBottle msg{};
+        msg.item = after;
+        if (is_empty_bottle(before)) {
+            msg.event = kBottleFillEmpty;
+        } else if (before == dItemNo_NONE_e) {
+            msg.event = kBottleNewFilled;
+        } else {
+            continue;
+        }
+        coop_net_send(kMsgBottle, &msg, sizeof(msg));
+        coop_log::info("coop_mod: [INV] relayed bottle event={} item={:#x}", msg.event, msg.item);
+    }
+    std::memcpy(s_lastBottles, now, sizeof(now));
+}
+
+void apply_remote_bottle(uint8_t event, uint8_t item, uint8_t from) {
+    if (!coop_session(kSessItems, cfg_bool(s_vars.syncInventory, true)) || !in_gameplay()) {
+        coop_log::info("coop_mod: [INV] bottle event={} item={:#x} from {} ignored (items off or not in play)", event, item, from);
+        return;
+    }
+    if (item == dItemNo_NONE_e) return;
+    if (is_empty_bottle(item) && event != kBottleNewFilled) return;
+
+    uint8_t now[kBottleSlots];
+    read_bottles(now);
+    bool applied = false;
+    if (event == kBottleFillEmpty) {
+        for (int i = 0; i < kBottleSlots; ++i) {
+            if (is_empty_bottle(now[i])) {
+                dComIfGs_setEmptyBottleItemIn(item);
+                applied = true;
+                break;
+            }
+        }
+    } else if (event == kBottleNewFilled) {
+        for (int i = 0; i < kBottleSlots; ++i) {
+            if (now[i] == dItemNo_NONE_e) {
+                if (is_empty_bottle(item)) {
+                    dComIfGs_setEmptyBottle();
+                } else {
+                    dComIfGs_setEmptyBottle(item);
+                }
+                applied = true;
+                break;
+            }
+        }
+    }
+
+    read_bottles(s_lastBottles);
+    s_haveBottles = true;
+
+    coop_log::info("coop_mod: [INV] bottle event={} item={:#x} from {}: {} (slots {:02x} {:02x} {:02x} {:02x})",
+        event, item, from, applied ? "applied" : "no slot for it", now[0], now[1], now[2], now[3]);
+
+    if (applied && cfg_bool(s_vars.notifyItems, true)) {
+        const std::string who = sender_name(from);
+        if (event == kBottleFillEmpty) {
+            toast_kind(kNotifyItems, who + " bottled " + item_name(item), "You got one too.");
+        } else {
+            toast_kind(kNotifyItems,
+                is_empty_bottle(item) ? who + " got a bottle"
+                                      : who + " got a bottle of " + std::string(item_name(item)),
+                "You got one too.");
+        }
+    }
+}
+
+void send_hello() {
+    MsgHello msg{};
+    msg.version = kCoopWireVersion;
+    copy_name(msg.name, features_local_name());
+    coop_net_send(kMsgHello, &msg, sizeof(msg));
+}
+
+const u16 kSharedStoryFlags[] = {
+    dSv_event_flag_c::M_067,
+    dSv_event_flag_c::M_022,
+    dSv_event_flag_c::M_031,
+    dSv_event_flag_c::M_045,
+    dSv_event_flag_c::F_0265,
+    dSv_event_flag_c::F_0266,
+    dSv_event_flag_c::F_0267,
+    dSv_event_flag_c::F_0268,
+    dSv_event_flag_c::M_009,
+    dSv_event_flag_c::F_0550,
+    dSv_event_flag_c::M_021,
+    dSv_event_flag_c::M_051,
+    dSv_event_flag_c::M_023,
+    dSv_event_flag_c::M_015,
+
+    dSv_event_flag_c::M_014,
+
+    dSv_event_flag_c::M_050,
+    dSv_event_flag_c::M_092,
+    dSv_event_flag_c::M_018,
+    dSv_event_flag_c::M_032,
+    dSv_event_flag_c::F_0400,
+    dSv_event_flag_c::M_035,
+
+    dSv_event_flag_c::M_037,
+    dSv_event_flag_c::M_029,
+    dSv_event_flag_c::F_0361,
+    dSv_event_flag_c::F_0354,
+
+    dSv_event_flag_c::M_071,
+    dSv_event_flag_c::F_0250,
+};
+static_assert(sizeof(kSharedStoryFlags) / sizeof(kSharedStoryFlags[0]) <= 32, "MsgSharedStory is 32 bits");
+
+uint32_t shared_story_bits() {
+    if (daAlink_getAlinkActorClass() == nullptr) return 0;
+    uint32_t bits = 0;
+    for (int i = 0; i < static_cast<int>(sizeof(kSharedStoryFlags) / sizeof(kSharedStoryFlags[0])); ++i) {
+        if (dComIfGs_isEventBit(kSharedStoryFlags[i])) bits |= 1u << i;
+    }
+    return bits;
+}
+
+bool story_flag_applies_now(u16 flag) {
+    if (flag == dSv_event_flag_c::M_023 && !dComIfGs_isDarkClearLV(0)) return false;
+
+    if (flag == dSv_event_flag_c::M_067 && !dComIfGs_isEventBit(dSv_event_flag_c::M_009)) return false;
+
+    if ((flag == dSv_event_flag_c::M_071 || flag == dSv_event_flag_c::F_0250) &&
+        !dComIfGs_isTransformLV(3)) {
+        return false;
+    }
+    return true;
+}
+
+void take_shared_story_bits(uint32_t bits) {
+    if (bits == 0 || daAlink_getAlinkActorClass() == nullptr || dComIfGp_event_runCheck()) return;
+    for (int i = 0; i < static_cast<int>(sizeof(kSharedStoryFlags) / sizeof(kSharedStoryFlags[0])); ++i) {
+        if ((bits & (1u << i)) == 0 || dComIfGs_isEventBit(kSharedStoryFlags[i])) continue;
+        if (!story_flag_applies_now(kSharedStoryFlags[i])) continue;
+        if (i == 0) {
+
+            dComIfGs_onEventBit(kSharedStoryFlags[i]);
+            coop_log::info("coop_mod: [STORY] shared flag {:#06x} on (remote)",
+                kSharedStoryFlags[i]);
+        } else if (rando_join_sync_allowed() && world_hold_story_flag(kSharedStoryFlags[i])) {
+
+            coop_log::info("coop_mod: [STORY] shared flag {:#06x} (remote), deferred to stage load", kSharedStoryFlags[i]);
+        }
+    }
+}
+
+const u16 kOpening[] = {
+    dSv_event_flag_c::M_010,
+    dSv_event_flag_c::M_011,
+    dSv_event_flag_c::M_009,
+    dSv_event_flag_c::M_012,
+    dSv_event_flag_c::M_014,
+    dSv_event_flag_c::M_016,
+    dSv_event_flag_c::M_017,
+    dSv_event_flag_c::M_019,
+};
+
+void close_opening() {
+    if (rando_active() || daAlink_getAlinkActorClass() == nullptr || dComIfGp_event_runCheck()) return;
+    const int n = static_cast<int>(sizeof(kOpening) / sizeof(kOpening[0]));
+    int latest = -1;
+    for (int i = 0; i < n; ++i) {
+        if (dComIfGs_isEventBit(kOpening[i])) latest = i;
+    }
+    for (int i = 0; i < latest; ++i) {
+        if (dComIfGs_isEventBit(kOpening[i])) continue;
+        if (world_hold_story_flag(kOpening[i])) {
+            coop_log::info("coop_mod: [STORY] repair: {:#06x} queued, a later opening scene is already done",
+                kOpening[i]);
+        }
+    }
+}
+
+void finish_sky_book() {
+    if (rando_active() || daAlink_getAlinkActorClass() == nullptr || dComIfGp_event_runCheck()) return;
+    if (dComIfGs_getItem(SLOT_22, false) != dItemNo_AIR_LETTER_e) return;
+    static const u16 kLetters[] = {dSv_event_flag_c::F_0791, dSv_event_flag_c::F_0792, dSv_event_flag_c::F_0793,
+        dSv_event_flag_c::F_0794, dSv_event_flag_c::F_0795, dSv_event_flag_c::F_0812};
+    for (u16 flag : kLetters) {
+        if (!dComIfGs_isEventBit(flag)) return;
+    }
+    dComIfGs_setItem(SLOT_22, dItemNo_ANCIENT_DOCUMENT2_e);
+    dComIfGs_onEventBit(dSv_event_flag_c::F_0796);
+    coop_log::info("coop_mod: [STORY] repair: sky book finished, all six characters were in");
+    features_toast("Ancient Sky Book", "All six characters are in. The book is complete.");
+}
+
+bool teleport_in_progress();
+
+struct NearActor {
+    int name = -1;
+    float dist = 0.0f;
+};
+struct NearFind {
+    cXyz at;
+    NearActor best[3];
+};
+
+void* find_near(void* proc, void* data) {
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    auto* f = static_cast<NearFind*>(data);
+    if (actor == nullptr || !fopAcM_IsActor(actor) || fopAcM_GetGroup(actor) == fopAc_PLAYER_e) return nullptr;
+    const float d = actor->current.pos.abs(f->at);
+    if (d > 1500.0f) return nullptr;
+    for (int i = 0; i < 3; ++i) {
+        if (f->best[i].name >= 0 && f->best[i].dist <= d) continue;
+        for (int k = 2; k > i; --k) f->best[k] = f->best[k - 1];
+        f->best[i] = NearActor{fopAcM_GetName(actor), d};
+        break;
+    }
+    return nullptr;
+}
+
+void log_hitch() {
+    using namespace std::chrono;
+    static steady_clock::time_point s_last{};
+    static steady_clock::time_point s_lastLog{};
+    static int s_logged = 0;
+    const steady_clock::time_point now = steady_clock::now();
+    const steady_clock::time_point prev = s_last;
+    s_last = now;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (prev == steady_clock::time_point{} || alink == nullptr || dComIfGp_isEnableNextStage()) return;
+    const auto ms = duration_cast<milliseconds>(now - prev).count();
+    if (ms < 100 || s_logged >= 40 || now - s_lastLog < seconds(5)) return;
+    s_lastLog = now;
+    ++s_logged;
+    coop_log::info("coop_mod: [HITCH] {} ms frame, proc {} equip {:#x} event {} | {}", ms,
+        static_cast<int>(alink->mProcID), static_cast<int>(alink->mEquipItem),
+        dComIfGp_event_runCheck() ? 1 : 0, coop_mem_status());
+}
+
+void log_hurt() {
+    static int s_lastLife = -1;
+    static uint32_t s_ticks = 0;
+    static uint32_t s_lastLog = 0;
+    static uint32_t s_hits[16] = {};
+    static int s_hitNext = 0;
+    ++s_ticks;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == nullptr || coop_on_title_screen()) {
+        s_lastLife = -1;
+        return;
+    }
+    const int life = dComIfGs_getLife();
+    const int was = s_lastLife;
+    s_lastLife = life;
+    if (was < 0 || life >= was) return;
+    s_hits[s_hitNext] = s_ticks;
+    s_hitNext = (s_hitNext + 1) % 16;
+    if (s_ticks - s_lastLog < 30) return;
+    s_lastLog = s_ticks;
+    int recent = 0;
+    for (uint32_t t : s_hits) {
+        if (t != 0 && s_ticks - t < 300) ++recent;
+    }
+    NearFind f;
+    f.at = alink->current.pos;
+    fopAcM_Search(find_near, &f);
+    coop_log::info("coop_mod: [HURT] {} -> {} at {:.0f},{:.0f},{:.0f} hits10s={} near {}@{:.0f} {}@{:.0f} {}@{:.0f}",
+        was, life, f.at.x, f.at.y, f.at.z, recent, f.best[0].name, f.best[0].dist, f.best[1].name,
+        f.best[1].dist, f.best[2].name, f.best[2].dist);
+}
+
+void log_events() {
+    static bool s_running = false;
+    static std::string s_last;
+    static int s_repeats = 0;
+    static uint32_t s_lastStart = 0;
+    static uint32_t s_ticks = 0;
+    ++s_ticks;
+    const bool running = dComIfGp_event_runCheck() != 0;
+    if (running == s_running) return;
+    s_running = running;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (!running || alink == nullptr) return;
+    const char* name = dComIfGp_getPEvtManager()->getRunEventName();
+    fopAc_ac_c* partner = dComIfGp_getEvent()->getPt2();
+    const std::string now = (name != nullptr ? std::string(name) : std::string("-")) + "/" +
+        std::to_string(partner != nullptr ? static_cast<int>(fopAcM_GetName(partner)) : -1);
+    s_repeats = (now == s_last && s_ticks - s_lastStart < 1800) ? s_repeats + 1 : 0;
+    s_last = now;
+    s_lastStart = s_ticks;
+    coop_log::info("coop_mod: [EVENT] '{}' by actor {} mode {} at {:.0f},{:.0f},{:.0f}{}",
+        name != nullptr ? name : "-",
+        partner != nullptr ? static_cast<int>(fopAcM_GetName(partner)) : -1,
+        static_cast<int>(dComIfGp_getEvent()->getMode()), alink->current.pos.x, alink->current.pos.y,
+        alink->current.pos.z, s_repeats >= 2 ? " REPEATING" : "");
+
+    if (s_repeats >= 2 && coop_net_connected()) {
+        static uint32_t s_toldAt = 0;
+        if (s_toldAt == 0 || s_ticks - s_toldAt > 36000) {
+            s_toldAt = s_ticks;
+            features_toast("Stuck?", "Co-op > Players > Catch up takes another player's progress.");
+        }
+    }
+
+    if (name != nullptr && std::strcmp(name, "NEED_YOUR_HELP") == 0 && s_repeats >= 1 &&
+        !dComIfGs_isEventBit(dSv_event_flag_c::F_0037)) {
+        dComIfGs_onEventBit(dSv_event_flag_c::F_0037);
+        coop_log::info("coop_mod: [STORY] repair: Jaggle's hill talk looped, F_0037 set");
+    }
+}
+
+bool movement_event(const char* name) {
+    if (name == nullptr) return true;
+    const std::string n = name;
+    return n.empty() || n == "-" || n == "NO DATA" || n == "DEFAULT_START" || n == "demo38_01" ||
+           n == "SCENE_EXIT" || n == "OLD_DOOR_IN" || n == "door_i" || n == "SAVEREQ" || n == "POTAL_WARPIN" ||
+           n == "MHINT_TALK" || n == "NORMAL_COMEBACK" || n.find("DOOR") != std::string::npos;
+}
+
+bool s_nextStageSeen = false;
+bool s_loadFromScene = false;
+
+void watch_next_stage() {
+    if (!dComIfGp_isEnableNextStage()) {
+        s_nextStageSeen = false;
+        return;
+    }
+    if (s_nextStageSeen) return;
+    s_nextStageSeen = true;
+    const bool running = dComIfGp_event_runCheck() != 0;
+    const char* name = running ? dComIfGp_getPEvtManager()->getRunEventName() : nullptr;
+    s_loadFromScene = running && !movement_event(name);
+    if (s_loadFromScene) coop_log::info("coop_mod: [STORY] '{}' is changing stage", name != nullptr ? name : "?");
+}
+
+bool load_is_cutscene() {
+    const bool scene = s_loadFromScene;
+    s_loadFromScene = false;
+    return scene;
+}
+
+void catch_up_story() {
+    static uint32_t s_calm = 0;
+    static uint32_t s_lastAt = 0;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    bool forced = false;
+    if (alink == nullptr || !coop_net_connected() || coop_on_title_screen() ||
+        dComIfGp_event_runCheck() || dComIfGp_isEnableNextStage() || teleport_in_progress() ||
+        alink->mClothesChangeWaitTimer != 0 || (!forced && !world_story_stale_here())) {
+        s_calm = 0;
+        return;
+    }
+    if (!forced) {
+        if (++s_calm < 3 || (s_lastAt != 0 && s_invTick - s_lastAt < 600)) return;
+    }
+    s_calm = 0;
+    s_lastAt = s_invTick != 0 ? s_invTick : 1;
+
+    if (alink->checkRideOn() || alink->getGrabActorID() != fpcM_ERROR_PROCESS_ID_e ||
+        dComIfG_Bgsp().ChkMoveBG(alink->mLinkAcch.m_gnd)) {
+        s_lastAt = 0;
+        return;
+    }
+
+    if (!world_story_refresh_here() || world_story_stale_here()) s_lastAt = 0;
+}
+
+void place_epona_after_rescue() {
+    static bool s_known = false;
+    static bool s_had = false;
+    static bool s_owed = false;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == nullptr || !coop_net_connected() || coop_on_title_screen()) {
+        s_known = false;
+        s_owed = false;
+        return;
+    }
+    const bool has = dComIfGs_isEventBit(dSv_event_flag_c::M_023) != 0;
+    if (!s_known) {
+        s_known = true;
+        s_had = has;
+        return;
+    }
+    if (has && !s_had) s_owed = true;
+
+    if (has && std::strncmp(dComIfGs_getHorseRestartStageName(), "coop", 8) == 0) s_owed = true;
+    s_had = has;
+    if (!s_owed || dComIfGp_event_runCheck()) return;
+    if (alink->checkHorseRide()) {
+        s_owed = false;
+        return;
+    }
+    auto* horse = static_cast<daHorse_c*>(dComIfGp_getHorseActor());
+    if (horse == nullptr) return;
+    s_owed = false;
+    cXyz pos = alink->current.pos;
+    pos.x += 150.0f;
+    dComIfGs_setHorseRestart(dComIfGp_getStartStageName(), pos, alink->shape_angle.y,
+        fopAcM_GetRoomNo(alink));
+    horse->setHorsePosAndAngle(&pos, alink->shape_angle.y);
+
+    horse->offNoDrawWait();
+    coop_log::info("coop_mod: [HORSE] M_023 from a peer, horse placed at ({:.0f},{:.0f},{:.0f})", pos.x, pos.y, pos.z);
+}
+
+void log_state() {
+    static char s_lastStage[9] = {};
+    static int s_lastRoom = -2;
+    static uint32_t s_tick = 0;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    const char* stage = dComIfGp_getStartStageName();
+    if (alink == nullptr || stage == nullptr || stage[0] == '\0') return;
+    const int room = dComIfGp_roomControl_getStayNo();
+    const bool moved = std::strncmp(stage, s_lastStage, 8) != 0 || room != s_lastRoom;
+    if (!moved && ++s_tick % 1800 != 0) return;
+    s_tick = 0;
+    std::strncpy(s_lastStage, stage, 8);
+    s_lastRoom = room;
+    const int layer = dComIfG_play_c::getLayerNo_common(stage, room, dComIfGp_getStartStageLayer());
+
+    coop_log::info("coop_mod: [STATE] {:.8} room {} layer {} hour {:.1f} | {} twilight={} | sword {:#04x} shield "
+                   "{:#04x} ({}) clothes {:#04x} | hearts {}/{} | {} | midna M_009={} M_067={} "
+                   "F_0800={} M_017={}",
+        stage, room, layer, dComIfGs_getTime() / 15.0f, alink->checkWolf() ? "wolf" : "human",
+        dKy_darkworld_check() ? 1 : 0,
+        dComIfGs_getSelectEquipSword(), dComIfGs_getSelectEquipShield(),
+        alink->mShieldArcName != nullptr ? alink->mShieldArcName : "-",
+        dComIfGs_getSelectEquipClothes(), dComIfGs_getLife(), dComIfGs_getMaxLife(),
+        !coop_net_connected() ? "alone" : coop_net_is_host() ? "host" : "joiner",
+
+        dComIfGs_isEventBit(dSv_event_flag_c::M_009) ? 1 : 0,
+        dComIfGs_isEventBit(dSv_event_flag_c::M_067) ? 1 : 0,
+        dComIfGs_isEventBit(dSv_event_flag_c::F_0800) ? 1 : 0,
+        dComIfGs_isEventBit(dSv_event_flag_c::M_017) ? 1 : 0);
+}
+
+void send_presence() {
+    MsgPresence msg{};
+    features_build_presence(&msg);
+
+    const uint32_t storyBits = joinsync_ready_to_share() ? shared_story_bits() : 0;
+    msg.storyBits = static_cast<uint8_t>(storyBits & 0xFF);
+    coop_net_send(kMsgPresence, &msg, sizeof(msg));
+    if (storyBits != 0) {
+        MsgSharedStory story{};
+        story.bits = storyBits;
+        coop_net_send(kMsgSharedStory, &story, sizeof(story));
+    }
+}
+
+}
+
+bool features_story_flag_applies_now(uint16_t flag) { return story_flag_applies_now(flag); }
+
+void features_build_presence(MsgPresence* out) {
+    MsgPresence msg{};
+    copy_name(msg.name, features_local_name());
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    const char* stage = dComIfGp_getStartStageName();
+    msg.inGame = (alink != nullptr && stage != nullptr && stage[0] != '\0') ? 1 : 0;
+    msg.skinStamp = local_skin_stamp();
+    if (stage != nullptr) {
+        std::memcpy(msg.stage, stage, strnlen(stage, sizeof(msg.stage)));
+    }
+    msg.startRoom = dComIfGp_getStartStageRoomNo();
+    msg.layer = dComIfGp_getStartStageLayer();
+    msg.point = dComIfGp_getStartStagePoint();
+    if (alink != nullptr) {
+        msg.curRoom = fopAcM_GetRoomNo(alink);
+        msg.x = alink->current.pos.x;
+        msg.y = alink->current.pos.y;
+        msg.z = alink->current.pos.z;
+        msg.angleY = alink->shape_angle.y;
+        if (map_markers_local_pose(&msg.mapX, &msg.mapY, &msg.mapZ, &msg.mapAngleY)) msg.mapValid = 1;
+        msg.life = dComIfGs_getLife();
+        msg.maxLife = dComIfGs_getMaxLife();
+    }
+    *out = msg;
+}
+
+void features_build_skin_choices(MsgSkinChoices* out) {
+    SkinChoices choices;
+    skins_local_choices(&choices);
+    MsgSkinChoices msg{};
+    static_assert(sizeof(msg.name) == sizeof(choices.name), "slot count changed");
+    std::memcpy(msg.name, choices.name, sizeof(msg.name));
+    std::memcpy(msg.hash, choices.hash, sizeof(msg.hash));
+    *out = msg;
+}
+
+namespace {
+
+struct LifeGuess {
+    bool on = false;
+    uint16_t base = 0;
+    int pending = 0;
+    uint32_t tick = 0;
+};
+LifeGuess s_lifeGuess[kCoopMaxPlayers];
+const uint32_t kLifeGuessTicks = 60;
+
+void announce_peer_once(uint8_t from) {
+    if (from >= kCoopMaxPlayers || s_peerAnnounced[from] || !s_peers[from].present) return;
+    s_peerAnnounced[from] = true;
+
+    if (global_slot_present(from)) return;
+    toast_kind(kNotifyPlayers, sender_name(from) + " joined", "");
+}
+
+void on_hello(const uint8_t* payload, size_t size, uint8_t from) {
+
+    if (from >= kCoopMaxPlayers) return;
+    if (size < sizeof(MsgHello)) return;
+    MsgHello msg;
+    std::memcpy(&msg, payload, sizeof(msg));
+    peer_slot(from).present = true;
+    peer_slot(from).name = wire_name(msg.name);
+    remember_name(from, peer_slot(from).name);
+    coop_log::info("coop_mod: hello from '{}' (version {})", peer_slot(from).name,
+        coop_version_text(msg.version));
+    if (msg.version != kCoopWireVersion) {
+
+        coop_log::info("coop_mod: refusing '{}': version {} vs local {}",
+            peer_slot(from).name, coop_version_text(msg.version), COOP_MOD_VERSION);
+
+        if (msg.version > kCoopWireVersion) {
+            toast("Update Crests of Courage",
+                peer_slot(from).name + " is on " + coop_version_text(msg.version) + ", you're on " +
+                    COOP_MOD_VERSION,
+                12000);
+        } else {
+            toast("Different mod version",
+                peer_slot(from).name + " is on " + coop_version_text(msg.version) +
+                    ", they need to update",
+                12000);
+        }
+        coop_net_disconnect();
+        return;
+    }
+    announce_peer_once(from);
+}
+
+void on_presence(const uint8_t* payload, size_t size, uint8_t from) {
+    if (from >= kCoopMaxPlayers) return;
+    if (size < sizeof(MsgPresence)) return;
+    MsgPresence msg;
+    std::memcpy(&msg, payload, sizeof(msg));
+
+    if (std::strncmp(peer_slot(from).stage, msg.stage, 8) != 0) peer_slot(from).mapValid = false;
+    peer_slot(from).present = true;
+    peer_slot(from).name = wire_name(msg.name);
+    remember_name(from, peer_slot(from).name);
+    std::memcpy(peer_slot(from).stage, msg.stage, sizeof(msg.stage));
+    peer_slot(from).stage[8] = '\0';
+    peer_slot(from).inGame = msg.inGame != 0;
+    peer_slot(from).startRoom = msg.startRoom;
+    peer_slot(from).curRoom = msg.curRoom;
+    peer_slot(from).layer = msg.layer;
+    peer_slot(from).point = msg.point;
+    peer_slot(from).x = msg.x;
+    peer_slot(from).y = msg.y;
+    peer_slot(from).z = msg.z;
+    peer_slot(from).angleY = msg.angleY;
+    if (msg.mapValid != 0) {
+        peer_slot(from).mapValid = true;
+        peer_slot(from).mapX = msg.mapX;
+        peer_slot(from).mapY = msg.mapY;
+        peer_slot(from).mapZ = msg.mapZ;
+        peer_slot(from).mapAngleY = msg.mapAngleY;
+    }
+    take_shared_story_bits(msg.storyBits);
+
+    if (peer_slot(from).skinStamp != msg.skinStamp) {
+        peer_slot(from).skinStamp = msg.skinStamp;
+        coop_net_send_to(from, kMsgSkinRequest, nullptr, 0);
+    }
+    peer_slot(from).lifeKnown = msg.inGame != 0 && msg.maxLife != 0;
+    peer_slot(from).life = msg.life;
+    peer_slot(from).maxLife = msg.maxLife;
+    announce_peer_once(from);
+}
+
+struct PendingTeleport {
+    bool active = false;
+    uint8_t playerId = kCoopNoPlayer;
+    char stage[9] = {};
+    uint32_t ticks = 0;
+    uint32_t settledTicks = 0;
+    uint32_t arrivedTicks = 0;
+
+    bool placed = false;
+    bool sawEvent = false;
+    uint32_t watchTicks = 0;
+    cXyz placedAt;
+    int reloads = 0;
+};
+PendingTeleport s_teleport;
+
+bool teleport_in_progress() {
+    return s_teleport.active;
+}
+
+const uint32_t kTeleportTimeoutTicks = 60 * 30;
+const uint32_t kTeleportSettleTicks = 45;
+const uint32_t kTeleportMinTicks = 3;
+const uint32_t kTeleportWatchTicks = 60;
+const f32 kTeleportDraggedAway = 150.0f;
+const uint32_t kArrivalCutsceneWait = 150;
+
+bool local_on_stage(const char* stage8) {
+    const char* stage = dComIfGp_getStartStageName();
+    return stage != nullptr && std::strncmp(stage, stage8, 8) == 0;
+}
+
+bool ground_under_player(uint8_t playerId) {
+    const CoopPeer& who = features_peer_of(playerId);
+    f32 x = who.x, y = who.y, z = who.z;
+    f32 live[3];
+    if (puppet_hook_pose_fresh(playerId) &&
+        puppet_hook_get_pose_of(playerId, &live[0], &live[1], &live[2], nullptr, nullptr, nullptr)) {
+        x = live[0];
+        y = live[1];
+        z = live[2];
+    }
+    cXyz at(x, y + 60.0f, z);
+    if (!fopAcM_gc_c::gndCheck(&at)) return false;
+    const f32 ground = fopAcM_gc_c::getGroundY();
+    return ground > y - 400.0f && ground < y + 120.0f;
+}
+
+void place_at_player(daAlink_c* alink, uint8_t playerId) {
+    const CoopPeer& who = features_peer_of(playerId);
+
+    f32 px = who.x, py = who.y, pz = who.z;
+    f32 live[3] = {0.0f, 0.0f, 0.0f};
+    if (puppet_hook_pose_fresh(playerId) &&
+        puppet_hook_get_pose_of(playerId, &live[0], &live[1], &live[2], nullptr, nullptr,
+            nullptr)) {
+        px = live[0];
+        py = live[1];
+        pz = live[2];
+    }
+
+    cXyz pos(px, py, pz);
+
+    alink->setPlayerPosAndAngle(&pos, who.angleY, TRUE);
+    coop_log::info("coop_mod: placed at {} ({:.0f}, {:.0f}, {:.0f})", who.name, pos.x, pos.y,
+        pos.z);
+}
+
+bool in_local_room(uint8_t playerId) {
+    const CoopPeer& who = features_peer_of(playerId);
+    return who.curRoom < 0 || who.curRoom == dComIfGp_roomControl_getStayNo();
+}
+
+bool arrival_cutscene_pending() {
+    const int id = dComIfGp_getEventManager().mException.mEventInfoIdx;
+    return id >= 0 && id != 0xFF;
+}
+
+bool teleport_event_busy() {
+    dEvt_control_c* event = dComIfGp_getEvent();
+    return dComIfGp_isEnableNextStage() || dComIfGp_event_runCheck() ||
+           (event != nullptr && event->mNum != 0);
+}
+
+bool teleport_target_here() {
+    const CoopPeer& who = features_peer_of(s_teleport.playerId);
+    return who.present && who.inGame && std::strncmp(who.stage, s_teleport.stage, 8) == 0;
+}
+
+void update_pending_teleport() {
+    if (!s_teleport.active) return;
+    if (++s_teleport.ticks > kTeleportTimeoutTicks) {
+        if (!s_teleport.placed) toast_kind(kNotifyTeleport, "Teleport cancelled", "It took too long.");
+        s_teleport.active = false;
+        return;
+    }
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == nullptr || !local_on_stage(s_teleport.stage)) {
+        s_teleport.settledTicks = 0;
+        s_teleport.arrivedTicks = 0;
+        if (s_teleport.placed) s_teleport.active = false;
+        return;
+    }
+    ++s_teleport.arrivedTicks;
+
+    if (s_teleport.placed) {
+        if (teleport_event_busy()) {
+            s_teleport.sawEvent = true;
+            return;
+        }
+        if (s_teleport.sawEvent) {
+            if (alink->mDemo.getDemoType() != 0) return;
+            s_teleport.active = false;
+            const cXyz now = alink->current.pos;
+            if ((now - s_teleport.placedAt).abs() > kTeleportDraggedAway && teleport_target_here() &&
+                in_local_room(s_teleport.playerId)) {
+                coop_log::info("coop_mod: arrival cutscene moved player, placing again");
+                place_at_player(alink, s_teleport.playerId);
+            }
+            return;
+        }
+        if (++s_teleport.watchTicks >= kTeleportWatchTicks) s_teleport.active = false;
+        return;
+    }
+
+    if (teleport_event_busy() || alink->mDemo.getDemoType() != 0 ||
+        (arrival_cutscene_pending() && s_teleport.arrivedTicks < kArrivalCutsceneWait)) {
+        s_teleport.settledTicks = 0;
+        return;
+    }
+
+    ++s_teleport.settledTicks;
+    if (s_teleport.settledTicks < kTeleportMinTicks) return;
+    if (s_teleport.settledTicks < kTeleportSettleTicks && !ground_under_player(s_teleport.playerId)) {
+        return;
+    }
+
+    if (teleport_target_here() && !in_local_room(s_teleport.playerId)) {
+
+        const uint8_t id = s_teleport.playerId;
+        const int reloads = s_teleport.reloads;
+        if (reloads < 2) {
+            coop_log::info("coop_mod: {} moved to room {} during load, following",
+                features_peer_of(id).name, static_cast<int>(features_peer_of(id).curRoom));
+            features_teleport_to_player(id);
+            s_teleport.reloads = reloads + 1;
+        } else {
+            s_teleport.active = false;
+            toast_kind(kNotifyTeleport, "Teleport stopped here",
+                features_peer_of(id).name + " keeps moving - try again when they stop.");
+        }
+        return;
+    }
+    if (teleport_target_here()) {
+        place_at_player(alink, s_teleport.playerId);
+        s_teleport.placed = true;
+        s_teleport.placedAt = alink->current.pos;
+        s_teleport.ticks = 0;
+    } else {
+        s_teleport.active = false;
+        toast_kind(kNotifyTeleport, "Teleport cancelled",
+            features_peer_of(s_teleport.playerId).name + " left before we got there.");
+    }
+}
+
+struct ClockPlace {
+    char stage[8] = {};
+    int8_t room = -1;
+    int8_t layer = -1;
+};
+ClockPlace s_clockPlace;
+uint32_t s_clockSince = 0;
+
+bool local_clock_trusted() {
+    if (!in_gameplay() || dKy_darkworld_check() || g_env_light.using_time_control_tag != 0) return false;
+    stage_stag_info_class* stag = dComIfGp_getStageStagInfo();
+    return stag != nullptr && static_cast<s8>(dStage_stagInfo_GetTimeH(stag)) < 0;
+}
+
+void track_clock_place() {
+    if (!in_gameplay()) {
+        s_clockPlace = ClockPlace{};
+        return;
+    }
+    const char* stage = dComIfGp_getStartStageName();
+    if (stage == nullptr) return;
+    ClockPlace now;
+    std::strncpy(now.stage, stage, sizeof(now.stage));
+    now.room = static_cast<int8_t>(dComIfGp_roomControl_getStayNo());
+    now.layer = static_cast<int8_t>(
+        dComIfG_play_c::getLayerNo_common(stage, now.room, dComIfGp_getStartStageLayer()));
+    if (std::memcmp(now.stage, s_clockPlace.stage, sizeof(now.stage)) != 0 ||
+        now.room != s_clockPlace.room || now.layer != s_clockPlace.layer) {
+        s_clockPlace = now;
+        s_clockSince = s_invTick;
+    }
+}
+
+void send_time() {
+    if (!local_clock_trusted() || s_clockPlace.room < 0) return;
+    MsgTime msg{};
+    msg.time = dComIfGs_getTime();
+    msg.date = dComIfGs_getDate();
+    std::memcpy(msg.stage, s_clockPlace.stage, sizeof(msg.stage));
+    msg.room = s_clockPlace.room;
+    msg.layer = s_clockPlace.layer;
+    msg.age = s_invTick - s_clockSince;
+    coop_net_send(kMsgTime, &msg, sizeof(msg));
+}
+
+void on_time(const uint8_t* payload, size_t size, uint8_t from) {
+    if (size < sizeof(MsgTime)) return;
+    if (!coop_session(kSessTime, cfg_bool(s_vars.syncTime, true))) return;
+    if (!local_clock_trusted() || dComIfGp_event_runCheck() || s_clockPlace.room < 0) return;
+    MsgTime msg;
+    std::memcpy(&msg, payload, sizeof(msg));
+    if (!std::isfinite(msg.time) || msg.time < 0.0f || msg.time >= 360.0f) return;
+
+    if (std::memcmp(msg.stage, s_clockPlace.stage, sizeof(msg.stage)) != 0 ||
+        msg.room != s_clockPlace.room || msg.layer != s_clockPlace.layer) {
+        return;
+    }
+
+    const uint32_t ours = s_invTick - s_clockSince;
+    const bool first = msg.age > ours + 30 ||
+                       (msg.age + 30 >= ours && msg.age <= ours + 30 && from < coop_net_local_id());
+    if (!first) return;
+    const f32 local = dComIfGs_getTime();
+    f32 diff = msg.time - local;
+    while (diff > 180.0f) diff -= 360.0f;
+    while (diff < -180.0f) diff += 360.0f;
+    if (msg.date == dComIfGs_getDate() && std::fabs(diff) <= 2.0f) return;
+    dComIfGs_setDate(msg.date);
+    dComIfGs_setTime(msg.time);
+}
+
+}
+
+void features_on_link_destroyed() {
+    equip_pending_shield();
+}
+
+void features_check_found(uint8_t from, const char* check, uint8_t item) {
+    if (check == nullptr || found_is_junk(item) || !rando_active()) return;
+    Found& found = found_entry(from, item);
+    found.haveCheck = true;
+    if (const char* place = check_place_name(check)) found.place = place;
+    coop_log::info("coop_mod: [CHECKS] {} found {:#x} at '{}' ({})", sender_name(from), item, check,
+        found.place.empty() ? "no name for it" : found.place);
+}
+
+void features_register_vars() {
+    s_vars.name = register_var("player_name", CONFIG_VAR_STRING, false, 0, "Player");
+    s_vars.syncInventory = register_var("sync_inventory", CONFIG_VAR_BOOL, true, 0, nullptr);
+    s_vars.notifyItems = register_var("notify_items", CONFIG_VAR_BOOL, true, 0, nullptr);
+    notify_register_vars(s_vars.notifyItems);
+    s_vars.nametags = register_var("show_nametags", CONFIG_VAR_BOOL, true, 0, nullptr);
+    s_vars.nametagsEdge = register_var("nametag_offscreen", CONFIG_VAR_BOOL, true, 0, nullptr);
+    s_vars.nametagsHealth = register_var("nametag_health", CONFIG_VAR_BOOL, true, 0, nullptr);
+    s_vars.nametagsHideFar = register_var("nametag_hide_far", CONFIG_VAR_BOOL, false, 0, nullptr);
+    s_vars.syncSounds = register_var("sync_sounds", CONFIG_VAR_BOOL, true, 0, nullptr);
+    s_vars.soundVolume = register_var("sound_volume", CONFIG_VAR_INT, false, 35, nullptr);
+    s_vars.syncTime = register_var("sync_time", CONFIG_VAR_BOOL, true, 0, nullptr);
+    s_vars.syncVfx = register_var("sync_attack_effects", CONFIG_VAR_BOOL, true, 0, nullptr);
+
+    s_vars.puppetWarpFx = register_var("puppet_warp_fx", CONFIG_VAR_BOOL, false, 0, nullptr);
+
+    s_vars.puppetWarpWarm = register_var("puppet_warp_warmup", CONFIG_VAR_BOOL, false, 0, nullptr);
+
+    s_vars.debugMenu = register_var("debug_menu", CONFIG_VAR_BOOL, false, 0, nullptr);
+    s_devLogging = cfg_bool(s_vars.debugMenu, false);
+
+    s_vars.debugAutowarp = register_var("debug_autowarp_ticks", CONFIG_VAR_INT, false, 0, nullptr);
+
+    s_vars.deathLink = register_var("death_link", CONFIG_VAR_BOOL, false, 0, nullptr);
+    s_vars.debugShiftTicks = register_var("debug_shift_ticks", CONFIG_VAR_INT, false, 0, nullptr);
+    s_vars.debugShiftX = register_var("debug_shift_x", CONFIG_VAR_INT, false, 0, nullptr);
+    s_vars.debugShiftZ = register_var("debug_shift_z", CONFIG_VAR_INT, false, 0, nullptr);
+    colors_register_vars();
+    global_hud_register_vars();
+    horse_register_vars();
+    squad_hud_register_vars();
+    pvp_register_vars();
+    spawns_register_vars();
+    boss_register_vars();
+    world_register_vars();
+    enemies_register_vars();
+    joinsync_register_vars();
+}
+
+void features_init() {
+    fx_init();
+    enemies_init();
+    spawns_init();
+    boss_init();
+
+    if (svc_item != nullptr) {
+        const ModResult observe = svc_item->observe_gives(mod_ctx, on_item_given, nullptr, nullptr);
+        coop_log::info("coop_mod: item observer: {}", static_cast<int>(observe));
+    } else {
+        coop_log::warn("coop_mod: item service unavailable, inventory sync off");
+    }
+    colors_init();
+}
+
+void features_leave_after_state_load() {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    static uint32_t s_inGameTicks = 0;
+    if (!coop_net_connected() || info == nullptr || daAlink_getAlinkActorClass() == nullptr) {
+        s_haveStateItemBits = false;
+        s_inGameTicks = 0;
+        return;
+    }
+
+    if (s_inGameTicks < 300) {
+        ++s_inGameTicks;
+        s_haveStateItemBits = false;
+    }
+    const auto& flags = info->getSavedata().getPlayer().getGetItem().mItemFlags;
+    int appeared = 0;
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t now = flags[i];
+        for (uint32_t fresh = now & ~s_stateItemBits[i]; s_haveStateItemBits && fresh != 0;
+             fresh &= fresh - 1) {
+            ++appeared;
+        }
+        s_stateItemBits[i] = now;
+    }
+    const bool loaded = s_haveStateItemBits && appeared >= kStateLoadNewItems;
+    s_haveStateItemBits = true;
+    if (!loaded) return;
+    coop_log::warn("coop_mod: [STATE-SHARE] {} new items at once (state loaded), disconnecting", appeared);
+    coop_net_disconnect();
+    features_toast("Left co-op", "Loaded a Dusklight state. Rejoin to play together.");
+}
+
+static void run_debug_autowarp() {
+    int64_t every = 0;
+    if (s_vars.debugAutowarp != 0) svc_config->get_int(mod_ctx, s_vars.debugAutowarp, &every);
+    if (every <= 0) return;
+    static uint32_t ticks = 0;
+    daAlink_c* awLink = daAlink_getAlinkActorClass();
+    if (awLink == nullptr || dComIfGp_isEnableNextStage()) {
+        ticks = 0;
+        return;
+    }
+
+    if (dComIfGp_event_runCheck() || awLink->mClothesChangeWaitTimer != 0) return;
+    if (++ticks < static_cast<uint32_t>(every)) return;
+    ticks = 0;
+    const char* stage = dComIfGp_getStartStageName();
+    if (stage == nullptr || stage[0] == '\0') return;
+    coop_log::info("coop_mod: [AUTOWARP] reloading stage {} point={} room={} layer={}", stage,
+        dComIfGp_getStartStagePoint(), static_cast<int>(dComIfGp_getStartStageRoomNo()),
+        static_cast<int>(dComIfGp_getStartStageLayer()));
+    dComIfGp_setNextStage(stage, dComIfGp_getStartStagePoint(), dComIfGp_getStartStageRoomNo(),
+        dComIfGp_getStartStageLayer());
+}
+
+static void run_debug_shift() {
+    int64_t after = 0;
+    if (s_vars.debugShiftTicks != 0) svc_config->get_int(mod_ctx, s_vars.debugShiftTicks, &after);
+    if (after <= 0) return;
+    static uint32_t ticks = 0;
+    static bool done = false;
+    if (done) return;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == nullptr || dComIfGp_event_runCheck() || dComIfGp_isEnableNextStage()) {
+        ticks = 0;
+        return;
+    }
+    if (++ticks < static_cast<uint32_t>(after)) return;
+    done = true;
+
+    int64_t dx = 0, dz = 0;
+    if (s_vars.debugShiftX != 0) svc_config->get_int(mod_ctx, s_vars.debugShiftX, &dx);
+    if (s_vars.debugShiftZ != 0) svc_config->get_int(mod_ctx, s_vars.debugShiftZ, &dz);
+    cXyz pos(alink->current.pos.x + static_cast<f32>(dx), alink->current.pos.y,
+        alink->current.pos.z + static_cast<f32>(dz));
+
+    alink->setPlayerPosAndAngle(&pos, alink->shape_angle.y, TRUE);
+    coop_log::info("coop_mod: [SHIFT] moved to ({:.0f}, {:.0f}, {:.0f})", pos.x, pos.y, pos.z);
+}
+
+void coop_remember_last_host(const char* name, const char* address) {
+    if (name == nullptr || name[0] == '\0') return;
+    std::string body = "Last played with " + std::string(name);
+    if (address != nullptr && address[0] != '\0') {
+        const std::string where(address);
+        body += (where.rfind("room ", 0) == 0 ? " in " : " at ") + where;
+    }
+    features_toast("Co-op save", (body + ".").c_str());
+}
+
+uint32_t local_skin_stamp() {
+    SkinChoices choices;
+    skins_local_choices(&choices);
+    uint32_t stamp = 2166136261u;
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&choices);
+    for (size_t i = 0; i < sizeof(choices); ++i) {
+        stamp = (stamp ^ bytes[i]) * 16777619u;
+    }
+    return stamp;
+}
+
+void send_skin_choices() {
+    if (!coop_net_connected()) return;
+    SkinChoices choices;
+    skins_local_choices(&choices);
+    MsgSkinChoices msg{};
+    static_assert(sizeof(msg.name) == sizeof(choices.name), "slot count changed");
+    std::memcpy(msg.name, choices.name, sizeof(msg.name));
+    std::memcpy(msg.hash, choices.hash, sizeof(msg.hash));
+    coop_net_send(kMsgSkinChoices, &msg, sizeof(msg));
+}
+
+void on_skin_choices(const uint8_t* payload, size_t size, uint8_t from) {
+    if (size < sizeof(MsgSkinChoices) || from >= kCoopMaxPlayers) return;
+    MsgSkinChoices msg;
+    std::memcpy(&msg, payload, sizeof(msg));
+    SkinChoices& theirs = peer_slot(from).skins;
+    bool changed = false;
+    for (int i = 0; i < kSkinChoiceCount; ++i) {
+        if (std::strncmp(theirs.name[i], msg.name[i], kSkinNameMax - 1) != 0 ||
+            theirs.hash[i] != msg.hash[i]) {
+            changed = true;
+        }
+        std::memset(theirs.name[i], 0, kSkinNameMax);
+        std::strncpy(theirs.name[i], msg.name[i], kSkinNameMax - 1);
+        theirs.hash[i] = msg.hash[i];
+    }
+
+    if (changed) puppet_hook_peer_skin_changed(from);
+}
+
+void repair_skin_tpose() {
+    daAlink_c* me = daAlink_getAlinkActorClass();
+    if (me == nullptr || me->mpLinkModel == nullptr || me->mpLinkFaceModel == nullptr ||
+        me->mpLinkHatModel == nullptr || me->field_0x1f20 == nullptr) {
+        return;
+    }
+    if (dComIfGp_event_runCheck() || dComIfGp_isEnableNextStage() || me->mClothesChangeWaitTimer != 0 ||
+        me->mShieldChangeWaitTimer != 0 || me->checkNoResetFlg2(daPy_py_c::FLG2_STATUS_WINDOW_DRAW)) {
+        return;
+    }
+    J3DModelData* body = me->mpLinkModel->getModelData();
+    if (!models_is_skin(body) || body->getJointNum() < 17) return;
+    if (body->getJointNodePointer(0)->getMtxCalc() == static_cast<J3DMtxCalc*>(me->field_0x1f20)) return;
+    static int s_logged = 0;
+    if (s_logged++ < 10) {
+        coop_log::info("coop_mod: [SKIN-ANM] body lost its animation in {:.8}, hooked again ({})",
+            dComIfGp_getStartStageName(), me->checkWolf() ? "wolf" : "human");
+    }
+    if (me->checkWolf()) {
+        me->changeModelDataDirectWolf(0);
+    } else {
+        me->changeModelDataDirect(0);
+    }
+}
+
+void features_update() {
+
+    {
+        static uint32_t s_memTick = 0;
+        if (++s_memTick % 1200 == 0) coop_log::info("coop_mod: [MEM] {}", coop_mem_status());
+    }
+    s_devLogging = features_debug_menu();
+    {
+        static uint32_t s_eponaTick = 0;
+        log_state();
+        log_events();
+        watch_next_stage();
+        log_hurt();
+        log_hitch();
+        if (++s_eponaTick % 60 == 0) {
+            close_opening();
+            finish_sky_book();
+            softlocks_update();
+            place_epona_after_rescue();
+            catch_up_story();
+        }
+    }
+
+    if (daAlink_c* me = daAlink_getAlinkActorClass(); me != nullptr && me->mClothesChangeWaitTimer == 0 &&
+        me->mShieldChangeWaitTimer == 0 && !dComIfGp_isEnableNextStage()) {
+        J3DModel* const models[] = {me->mpLinkModel, me->mpLinkFaceModel, me->mpLinkHatModel,
+            me->mpLinkHandModel, me->mpSwAModel, me->mpSwASheathModel, me->mpSwMModel,
+            me->mpSwMSheathModel, me->mShieldModel};
+        J3DModelData* worn[9] = {};
+        int n = 0;
+        for (J3DModel* m : models) {
+            if (m != nullptr) worn[n++] = m->getModelData();
+        }
+        models_note_worn(worn, n);
+    }
+    coop_stage("skins");
+    repair_skin_tpose();
+    found_update();
+    voices_update();
+    local_skin_colors_update();
+    local_skin_equipment_update();
+    icons_update();
+    skins_cycle_update();
+    skins_outfit_cycle_update();
+    send_session_settings();
+
+    static bool s_devModeDone = false;
+    if (!s_devModeDone && features_debug_menu()) {
+        s_devModeDone = true;
+        if (mDoMain::developmentMode == 0) mDoMain::developmentMode = 1;
+    }
+    run_debug_autowarp();
+    run_debug_shift();
+    update_death_link();
+    announce_item_taken();
+    coop_stage("colors");
+    colors_update();
+    coop_stage("projectiles");
+    projectiles_update();
+    coop_stage("fx");
+    fx_update();
+    coop_stage("pvp");
+    pvp_update();
+    coop_stage("spawns");
+    spawns_update();
+    coop_stage("boss");
+    boss_update();
+    coop_stage("world");
+    world_update();
+    coop_stage("enemies");
+    enemies_update();
+    coop_stage("horse");
+    horse_update();
+    coop_stage("grass");
+    grass_update();
+    coop_stage("joinsync");
+    joinsync_update();
+    skipvote_update();
+    skills_update();
+    twilight_update();
+    coop_stage("puppets");
+    const bool connected = coop_net_connected();
+
+    const bool nametagsOn = cfg_bool(s_vars.nametags, true);
+    const bool nametagsFar = cfg_bool(s_vars.nametagsHideFar, false);
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        const uint8_t id = static_cast<uint8_t>(i);
+        if (id == coop_net_local_id()) continue;
+        const CoopPeer& p = s_peers[i];
+        bool visible = true;
+        if ((connected || global_active()) && p.present) {
+            visible = p.inGame && local_on_stage(p.stage);
+        }
+        puppet_hook_set_player_visible(id, visible);
+        const char* tag = "Player";
+        if (p.present) {
+            tag = p.name.c_str();
+        } else if (!s_knownName[i].empty()) {
+            tag = s_knownName[i].c_str();
+            if (connected && coop_net_player_present(id) && !s_nameGapLogged[i]) {
+                s_nameGapLogged[i] = true;
+                coop_log::info("coop_mod: player {} ('{}') in roster without presence, keeping name", i, s_knownName[i]);
+            }
+        }
+        puppet_hook_set_player_nametag(id, tag, nametagsOn, nametagsFar);
+
+        const bool low = p.lifeKnown && p.maxLife >= 5 && p.life <= p.maxLife / 5;
+        puppet_hook_set_player_low_health(id, low);
+    }
+    puppet_hook_set_edge_tags(cfg_bool(s_vars.nametagsEdge, true));
+    puppet_hook_set_nametag_health(cfg_bool(s_vars.nametagsHealth, true));
+    puppet_hook_set_vfx_enabled(true);
+
+    update_pending_teleport();
+
+    if (!connected) {
+            s_haveBottles = false;
+        return;
+    }
+
+    static uint16_t s_sentLife = 0xFFFF;
+    const uint16_t lifeNow = dComIfGs_getLife();
+    if (++s_presenceTicks >= 30 || (lifeNow != s_sentLife && s_presenceTicks >= 2)) {
+        s_presenceTicks = 0;
+        s_sentLife = lifeNow;
+        send_presence();
+    }
+    track_clock_place();
+    if (++s_timeTicks >= 60) {
+        s_timeTicks = 0;
+        if (coop_session(kSessTime, cfg_bool(s_vars.syncTime, true))) send_time();
+    }
+    if (coop_session(kSessItems, cfg_bool(s_vars.syncInventory, true))) {
+        scan_inventory();
+        scan_bottles();
+        scan_scent();
+    } else {
+        s_haveBottles = false;
+    }
+}
+
+void features_on_roster_changed() {
+    if (!coop_net_connected()) return;
+
+    const uint16_t now = coop_net_roster();
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        const uint16_t bit = static_cast<uint16_t>(1u << i);
+        if ((s_lastRoster & bit) == 0 || (now & bit) != 0) continue;
+        if (static_cast<uint8_t>(i) == coop_net_local_id()) continue;
+        if (s_peers[i].present) {
+            toast_kind(kNotifyPlayers, sender_name(static_cast<uint8_t>(i)) + " left", "");
+        }
+        s_peers[i] = CoopPeer{};
+        s_peerAnnounced[i] = false;
+        colors_forget_player(static_cast<uint8_t>(i));
+        joinsync_forget_player(static_cast<uint8_t>(i));
+    }
+    if ((now & ~s_lastRoster) != 0) colors_resend();
+    s_lastRoster = now;
+    send_hello();
+}
+
+void features_global_forget(uint8_t slot) {
+    if (slot == 0 || slot >= kCoopMaxPlayers) return;
+    s_peers[slot] = CoopPeer{};
+    s_peerAnnounced[slot] = false;
+    colors_forget_player(slot);
+}
+
+void features_on_connected() {
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        s_peers[i] = CoopPeer{};
+        s_peerAnnounced[i] = false;
+    }
+    s_lastRoster = coop_net_roster();
+    s_haveBottles = false;
+    s_haveInv = false;
+    s_presenceTicks = 0;
+    s_timeTicks = 0;
+    send_hello();
+    send_presence();
+    colors_on_connected();
+    send_skin_choices();
+    pvp_on_connected();
+    spawns_on_connected();
+    boss_on_connected();
+    world_on_connected();
+    enemies_on_connected();
+    joinsync_on_connected();
+}
+
+void features_on_disconnected() {
+    int others = 0;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (s_peers[i].present) ++others;
+    }
+    if (others == 1) {
+        toast_kind(kNotifyPlayers, first_peer().name + " left", "Disconnected.");
+    } else if (others > 1) {
+        toast_kind(kNotifyPlayers, "Disconnected", "");
+    }
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        s_peers[i] = CoopPeer{};
+        s_peerAnnounced[i] = false;
+    }
+    s_lastRoster = coop_net_roster();
+    s_haveBottles = false;
+    s_teleport.active = false;
+    colors_on_disconnected();
+    pvp_on_disconnected();
+    spawns_on_disconnected();
+    enemies_on_disconnected();
+    horse_reset();
+
+    horses_on_disconnected();
+    grass_reset();
+    s_haveHostSession = false;
+}
+
+void features_reset_sync_baselines() {
+    s_haveStateItemBits = false;
+    s_haveInv = false;
+    s_haveBottles = false;
+}
+
+std::string features_peer_name(uint8_t id) {
+    if (id >= kCoopMaxPlayers) return "";
+    return peer_slot(id).name;
+}
+
+bool coop_on_title_screen() {
+    return on_title_screen();
+}
+
+void features_toast(const char* title, const char* body) {
+    toast(title != nullptr ? title : "", body != nullptr ? body : "");
+}
+
+bool should_log_breadcrumb(uint8_t type) {
+    switch (type) {
+    case kMsgSounds:
+    case kMsgParticles:
+    case kMsgHorse:
+    case kMsgAnimal:
+    case kMsgNpcTalk:
+    case kMsgTorch:
+    case kMsgEnemyState:
+    case kMsgEnemyTargets:
+    case kMsgActorState:
+    case kMsgObjectMove:
+    case kMsgBossState:
+    case kMsgGrassCut:
+    case kMsgPing:
+    case kMsgPong:
+    case kMsgSkipVote:
+    case kMsgPause:
+    case kMsgCarry:
+
+    case kMsgPresence:
+    case kMsgTime:
+    case kMsgSessionSettings:
+    case kMsgSharedStory:
+    case kMsgWorldDigest:
+    case kMsgRandoSeed:
+        return false;
+    default:
+        return true;
+    }
+}
+
+void features_on_message(uint8_t type, const uint8_t* payload, size_t size, uint8_t from) {
+    if (should_log_breadcrumb(type)) {
+        char line[64];
+        std::snprintf(line, sizeof(line), "msg type=%d from=%d size=%d", static_cast<int>(type),
+            static_cast<int>(from), static_cast<int>(size));
+        coop_crash_trail(line);
+    }
+    switch (type) {
+    case kMsgAssignId: {
+        if (size < sizeof(MsgAssignId)) break;
+        MsgAssignId msg;
+        std::memcpy(&msg, payload, sizeof(msg));
+        coop_net_set_local_id(msg.playerId, msg.maxPlayers);
+        break;
+    }
+    case kMsgRoster: {
+        if (size < sizeof(MsgRoster)) break;
+        MsgRoster msg;
+        std::memcpy(&msg, payload, sizeof(msg));
+        coop_net_set_roster(msg.present);
+        break;
+    }
+    case kMsgHello: on_hello(payload, size, from); break;
+    case kMsgSkinChoices: on_skin_choices(payload, size, from); break;
+    case kMsgSkinRequest: send_skin_choices(); break;
+    case kMsgLogRequest: report_on_message(payload, size, from); break;
+    case kMsgPause:
+        if (size >= sizeof(MsgPause)) coop_net_set_player_paused(from, payload[0] != 0);
+        break;
+    case kMsgPresence: on_presence(payload, size, from); break;
+    case kMsgChat: chat_on_lobby_message(from, payload, size); break;
+    case kMsgCatchUpWant:
+    case kMsgCatchUp: joinsync_on_catch_up(type, payload, size, from); break;
+    case kMsgSharedStory:
+        if (size >= sizeof(MsgSharedStory)) {
+            MsgSharedStory story;
+            std::memcpy(&story, payload, sizeof(story));
+            take_shared_story_bits(story.bits);
+        }
+        break;
+    case kMsgItem:
+        if (size >= sizeof(MsgItem)) apply_remote_item(payload[0], from);
+        break;
+    case kMsgBottle:
+        if (size >= sizeof(MsgBottle)) apply_remote_bottle(payload[0], payload[1], from);
+        break;
+    case kMsgItemTaken: {
+        if (size < sizeof(MsgItemTaken)) break;
+        MsgItemTaken msg;
+        std::memcpy(&msg, payload, sizeof(msg));
+        apply_item_taken(msg);
+        break;
+    }
+    case kMsgDeathLink: {
+        if (size < sizeof(MsgDeathLink)) break;
+        MsgDeathLink msg;
+        std::memcpy(&msg, payload, sizeof(msg));
+        apply_death_link(msg);
+        break;
+    }
+    case kMsgTime: on_time(payload, size, from); break;
+    case kMsgSounds: fx_on_sounds(payload, size, from); break;
+    case kMsgParticles: fx_on_particles(payload, size, from); break;
+    case kMsgPvpState:
+    case kMsgPvpHit: pvp_on_message(type, payload, size, from); break;
+    case kMsgWorldDelta:
+    case kMsgWorldSyncRequest:
+    case kMsgWorldFull:
+    case kMsgTbox2:
+    case kMsgShopSoldOut:
+    case kMsgStoryBundle:
+    case kMsgWorldDigest: world_on_message(type, payload, size, from); break;
+    case kMsgEnemyState:
+    case kMsgEnemyGone:
+    case kMsgEnemyDamage:
+    case kMsgEnemyHit:
+    case kMsgEnemySwitch:
+    case kMsgBombCaught:
+    case kMsgCageBars:
+    case kMsgRotBridge:
+    case kMsgEnemyClaim:
+    case kMsgObjectHit:
+    case kMsgObjectMove:
+    case kMsgCarry:
+    case kMsgObjectPush:
+    case kMsgTorch:
+    case kMsgAnimal:
+    case kMsgNpcTalk:
+    case kMsgRoomClaim:
+    case kMsgRoomOwner:
+    case kMsgEnemyTargets: enemies_on_message(type, payload, size, from); break;
+
+    case kMsgSkipVote: skipvote_on_message(payload, size, from); break;
+    case kMsgSkills: skills_on_message(payload, size); break;
+    case kMsgRandoSeed:
+    case kMsgRandoSeedRequest:
+    case kMsgRandoChunk: rando_on_message(type, payload, size, from); break;
+    case kMsgCheckTaken:
+    case kMsgCheckList: checks_on_message(type, payload, size, from); break;
+    case kMsgSumo: sumo_on_message(payload, size, from); break;
+    case kMsgSumoState: sumo_on_state(payload, size, from); break;
+    case kMsgTwilightBug:
+    case kMsgTearGot: twilight_on_message(type, payload, size); break;
+    case kMsgActorSpawn:
+    case kMsgActorState:
+    case kMsgActorGone: spawns_on_message(type, payload, size, from); break;
+    case kMsgBossState:
+    case kMsgBossReady:
+    case kMsgBossHit:
+    case kMsgPillarShake:
+    case kMsgBossStem: boss_on_message(type, payload, size, from); break;
+    case kMsgJoinSync: joinsync_on_message(payload, size); break;
+    case kMsgJoinSyncWant: joinsync_on_want(from); break;
+    case kMsgColors: colors_on_message(payload, size, from); break;
+    case kMsgArrowShot: projectiles_on_message(payload, size); break;
+    case kMsgHorse: horse_on_message(payload, size, from); break;
+    case kMsgGrassCut: grass_on_message(payload, size, from); break;
+    case kMsgSessionSettings:
+        if (size >= sizeof(MsgSessionSettings) && !coop_net_is_host()) {
+            MsgSessionSettings msg;
+            std::memcpy(&msg, payload, sizeof(msg));
+            if (!s_haveHostSession || msg.flags != s_hostSession) {
+                coop_log::info("coop_mod: [SESSION] host settings flags={:#x}",
+                    msg.flags);
+            }
+            s_hostSession = msg.flags;
+            s_haveHostSession = true;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+const CoopPeer& features_peer_of(uint8_t playerId) {
+    static const CoopPeer none;
+    return playerId < kCoopMaxPlayers ? s_peers[playerId] : none;
+}
+
+bool features_any_peer_on_stage(const char* stage) {
+    if (stage == nullptr) return false;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (static_cast<uint8_t>(i) == coop_net_local_id()) continue;
+        const CoopPeer& p = s_peers[i];
+        if (p.present && p.inGame && std::strncmp(stage, p.stage, 8) == 0) return true;
+    }
+    return false;
+}
+
+const CoopPeer& features_peer() {
+    return first_peer();
+}
+
+const CoopFeatureVars& features_vars() {
+    return s_vars;
+}
+
+bool features_puppet_warp_fx() {
+    return cfg_bool(s_vars.puppetWarpFx, false);
+}
+
+bool features_puppet_warp_warm() {
+    return cfg_bool(s_vars.puppetWarpWarm, true);
+}
+
+bool features_debug_menu() {
+    return cfg_bool(s_vars.debugMenu, false);
+}
+
+bool coop_dev_logging() {
+    return s_devLogging;
+}
+
+bool coop_session_from_host() {
+    return coop_net_connected() && !coop_net_is_host() && s_haveHostSession;
+}
+
+bool coop_session(uint16_t flag, bool localValue) {
+    if (!coop_session_from_host()) return localValue;
+    return (s_hostSession & flag) != 0;
+}
+
+namespace {
+
+uint16_t local_session_flags() {
+    uint16_t f = 0;
+    if (cfg_bool(enemies_enabled_var(), false)) f |= kSessEnemies;
+    if (cfg_bool(boss_enabled_var(), false)) f |= kSessBosses;
+    if (cfg_bool(boss_wait_var(), false)) f |= kSessBossWait;
+    if (cfg_bool(enemies_breakables_var(), true)) f |= kSessWorldObjects;
+    if (cfg_bool(world_dungeon_var(), true)) f |= kSessDungeon;
+    if (cfg_bool(world_story_var(), false)) f |= kSessStory;
+    if (cfg_bool(s_vars.syncInventory, true)) f |= kSessItems;
+    if (cfg_bool(s_vars.syncTime, true)) f |= kSessTime;
+    if (cfg_bool(s_vars.deathLink, false)) f |= kSessDeathLink;
+    return f;
+}
+
+void send_session_settings() {
+    static uint32_t s_sessionTick = 0;
+    if (!coop_net_connected() || !coop_net_is_host()) return;
+    if (++s_sessionTick % 30 != 0) return;
+    MsgSessionSettings msg{};
+    msg.flags = local_session_flags();
+    coop_net_send(kMsgSessionSettings, &msg, sizeof(msg));
+}
+
+}
+
+bool features_puppet_midna() {
+    return true;
+}
+
+bool features_puppet_lantern_light() {
+    return true;
+}
+
+std::string features_local_name() {
+    return sanitize_name(cfg_string(s_vars.name, "Player"));
+}
+
+static void load_into_peer_room(const CoopPeer& who, int localRoom) {
+
+    const int room = who.curRoom;
+    if (room >= 0 && room < 64) {
+        const cXyz at(who.x, who.y, who.z);
+        dComIfGs_setRestartRoom(at, who.angleY, static_cast<s8>(room));
+        dComIfGp_setNextStage(who.stage, -1, static_cast<s8>(room), who.layer);
+
+        dComIfGs_setRestartRoomParam(static_cast<u32>(room & 0x3F) | (0xFFu << 24));
+        coop_log::info(
+            "coop_mod: teleport to {} stage={} room={} pos=({:.0f}, {:.0f}, {:.0f}) layer={} (local stage={} room={})",
+            who.name, who.stage, room, who.x, who.y, who.z, who.layer,
+            dComIfGp_getStartStageName(), localRoom);
+    } else {
+        dComIfGp_setNextStage(who.stage, who.point, who.startRoom, who.layer);
+        coop_log::info(
+            "coop_mod: teleport to {} stage={} point={} room={} layer={} (local stage={} room={})",
+            who.name, who.stage, who.point, who.startRoom, who.layer,
+            dComIfGp_getStartStageName(), localRoom);
+    }
+}
+
+void features_teleport_to_player(uint8_t playerId) {
+    const CoopPeer& who = features_peer_of(playerId);
+    if (!coop_net_connected() || !who.present) {
+        toast_kind(kNotifyTeleport, "Can't teleport", "Nobody is connected.");
+        return;
+    }
+    if (!who.inGame || who.stage[0] == '\0') {
+        toast_kind(kNotifyTeleport, "Can't teleport", who.name + " is not in the game yet.");
+        return;
+    }
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == nullptr) {
+        toast_kind(kNotifyTeleport, "Can't teleport", "Load your save first.");
+        return;
+    }
+    if (dComIfGp_event_runCheck() || dComIfGp_isEnableNextStage()) {
+        toast_kind(kNotifyTeleport, "Can't teleport right now", "Wait for the cutscene or loading screen.");
+        return;
+    }
+
+    if (local_on_stage(who.stage) && in_local_room(playerId)) {
+        place_at_player(alink, playerId);
+        return;
+    }
+
+    s_teleport = PendingTeleport{};
+    s_teleport.active = true;
+    s_teleport.playerId = playerId;
+    std::memcpy(s_teleport.stage, who.stage, 9);
+    load_into_peer_room(who, fopAcM_GetRoomNo(alink));
+    toast_kind(kNotifyTeleport, "Teleporting", "Heading to " + who.name + ".", 2500);
+}
+
+void features_debug_fake_peer(uint8_t id, bool on, const char* name, const float* pos, uint16_t life,
+    uint16_t maxLife) {
+    if (id >= kCoopMaxPlayers) return;
+    CoopPeer& p = peer_slot(id);
+    if (!on) {
+        p = CoopPeer{};
+        return;
+    }
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    const char* stage = dComIfGp_getStartStageName();
+    p.present = true;
+    p.inGame = alink != nullptr;
+    if (name != nullptr) p.name = name;
+    if (stage != nullptr) {
+        std::strncpy(p.stage, stage, 8);
+        p.stage[8] = '\0';
+    }
+    p.curRoom = alink != nullptr ? static_cast<int8_t>(fopAcM_GetRoomNo(alink)) : 0;
+    if (pos != nullptr) {
+        p.x = pos[0];
+        p.y = pos[1];
+        p.z = pos[2];
+    }
+    p.lifeKnown = maxLife != 0;
+    p.life = life;
+    p.maxLife = maxLife;
+}
+
+bool features_reload_at_player(uint8_t playerId) {
+    const CoopPeer& who = features_peer_of(playerId);
+    if (!who.present || !who.inGame || who.stage[0] == '\0') return false;
+    if (daAlink_getAlinkActorClass() == nullptr || dComIfGp_isEnableNextStage()) return false;
+    s_teleport = PendingTeleport{};
+    s_teleport.active = true;
+    s_teleport.playerId = playerId;
+    std::memcpy(s_teleport.stage, who.stage, 9);
+    coop_log::info("coop_mod: [JOIN] loading into {} room {} where {} is", who.stage, who.curRoom,
+        who.name);
+    load_into_peer_room(who, fopAcM_GetRoomNo(daAlink_getAlinkActorClass()));
+    return true;
+}
+
+void features_debug_receive_item(uint8_t item, uint8_t from) {
+    apply_remote_item(item, from);
+}
+
+void features_guess_damage(uint8_t playerId, int dmg) {
+    if (playerId >= kCoopMaxPlayers || dmg <= 0) return;
+    const CoopPeer& p = features_peer_of(playerId);
+    if (!p.present || !p.lifeKnown) return;
+    LifeGuess& g = s_lifeGuess[playerId];
+    if (!g.on || g.base != p.life) {
+        g.on = true;
+        g.base = p.life;
+        g.pending = 0;
+    }
+    g.pending += dmg;
+    g.tick = s_invTick;
+}
+
+uint16_t features_shown_life(uint8_t playerId) {
+    if (playerId >= kCoopMaxPlayers) return 0;
+    const CoopPeer& p = features_peer_of(playerId);
+    LifeGuess& g = s_lifeGuess[playerId];
+    if (!g.on) return p.life;
+    if (p.life != g.base || s_invTick - g.tick > kLifeGuessTicks) {
+        g.on = false;
+        return p.life;
+    }
+    const int shown = static_cast<int>(p.life) - g.pending;
+    return static_cast<uint16_t>(shown > 0 ? shown : 0);
+}
+
+bool features_load_is_cutscene() {
+    return load_is_cutscene();
+}
+
+bool features_bottles_relay() {
+    return coop_net_connected() && coop_session(kSessItems, cfg_bool(s_vars.syncInventory, true));
+}

@@ -1,0 +1,3458 @@
+#include "mods/service.hpp"
+#include "mods/svc/config.h"
+#include "mods/svc/hook.hpp"
+#include "mods/svc/log.hpp"
+#include "print.hpp"
+#include "mods/svc/net.hpp"
+#include "mods/svc/websocket.hpp"
+#include "mods/svc/ui.h"
+#include "mods/svc/item.h"
+#include "mods/svc/host.h"
+#include "mods/svc/overlay.h"
+#include "mods/svc/resource.h"
+#include "mods/svc/texture.h"
+
+#include "d/actor/d_a_alink.h"
+#include "d/actor/d_a_itembase.h"
+#include "d/actor/d_a_arrow.h"
+#include "d/actor/d_a_boomerang.h"
+#include "d/actor/d_a_mg_rod.h"
+#include "d/actor/d_a_midna.h"
+#include "d/actor/d_a_spinner.h"
+#include "d/actor/d_a_horse.h"
+#include "d/actor/d_a_nbomb.h"
+#include "d/actor/d_a_canoe.h"
+#include "d/actor/d_a_obj_iceleaf.h"
+#include "d/d_com_inf_game.h"
+#include "d/d_item_data.h"
+#include "JSystem/J3DGraphBase/J3DMaterial.h"
+
+#include "m_Do/m_Do_mtx.h"
+
+#include "net/protocol.hpp"
+#include "net/messages.hpp"
+#include "net/seal.hpp"
+#include "net/reliable.hpp"
+#include "mod.hpp"
+
+#include "res/Object/AlAnm.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <cstdio>
+#include <span>
+#include <string_view>
+
+void puppet_hook_init();
+
+void puppet_hook_on_network_snapshot(uint8_t playerId, float x, float y, float z, int16_t angleX, int16_t angleY,
+    int16_t angleZ, int8_t roomNo, uint8_t outfit, const AnmSlotSnapshot* under,
+    const AnmSlotSnapshot* upper, uint8_t handL, uint8_t handR,
+    const PlayerSnapshot& equipment);
+void puppet_hook_on_midna_snapshot(uint8_t playerId, const MidnaSnapshot& snap);
+void puppet_hook_on_horse_snapshot(uint8_t playerId, const HorseSnapshot& snap);
+
+void puppet_hook_trigger_spawn();
+
+DEFINE_MOD();
+IMPORT_SERVICE(LogService, svc_log);
+IMPORT_SERVICE(ConfigService, svc_config);
+IMPORT_SERVICE(NetService, svc_net);
+IMPORT_SERVICE(HookService, svc_hook);
+IMPORT_SERVICE(UiService, svc_ui);
+IMPORT_OPTIONAL_SERVICE(ItemService, svc_item);
+IMPORT_OPTIONAL_SERVICE(TextureService, svc_texture);
+IMPORT_OPTIONAL_SERVICE(HostService, svc_host);
+IMPORT_OPTIONAL_SERVICE(OverlayService, svc_overlay);
+
+IMPORT_OPTIONAL_SERVICE(ResourceService, svc_resource);
+
+IMPORT_OPTIONAL_SERVICE(WebSocketService, svc_websocket);
+
+namespace {
+
+ConfigVarHandle g_modeVar = 0;
+ConfigVarHandle g_bindPortVar = 0;
+ConfigVarHandle g_joinAddressVar = 0;
+ConfigVarHandle g_joinPortVar = 0;
+ConfigVarHandle g_autoConnectVar = 0;
+ConfigVarHandle g_upnpVar = 0;
+ConfigVarHandle g_migrateVar = 0;
+
+std::string g_sessionCode;
+std::string g_hostNameOverride;
+struct Migration {
+    bool active = false;
+    bool hostIt = false;
+    std::string code;
+    std::string hostName;
+    uint64_t nextMs = 0;
+    int tries = 0;
+    int takenTimes = 0;
+};
+Migration g_migr;
+bool g_rejoinIsMigration = false;
+ConfigVarHandle g_roomCodeVar = 0;
+ConfigVarHandle g_roomServerVar = 0;
+ConfigVarHandle g_roomsVar = 0;
+ConfigVarHandle g_hostKeyVar = 0;
+ConfigVarHandle g_fakePlayersVar = 0;
+
+uint16_t g_fakeMask = 0;
+}
+
+bool upnp_owns(NetHandle handle);
+void upnp_on_net_event(const mods::net::Event& event);
+
+namespace {
+ConfigVarHandle g_autoConnectDelayTicksVar = 0;
+bool g_autoConnectPending = false;
+uint32_t g_autoConnectTicksWaited = 0;
+
+uint32_t g_ticksSinceRx = 0;
+
+mods::net::Socket g_listener;
+mods::net::Socket g_udp;
+
+CoopNetTraffic g_traffic;
+
+void udp_send_plain(std::string_view endpoint, std::span<const std::byte> bytes) {
+    g_traffic.txBytes += bytes.size();
+    ++g_traffic.txPackets;
+
+    if (g_udp.send_to(endpoint, bytes) != MOD_OK) {
+        static uint32_t s_refused = 0;
+        if (s_refused++ % 600 == 0) {
+            coop_log::warn("coop_mod: [NET] udp send to {} refused ({} so far)", endpoint,
+                s_refused);
+        }
+    }
+}
+void udp_send(std::string_view endpoint, std::span<const std::byte> bytes);
+bool g_isHost = true;
+bool g_handshakeSent = false;
+bool g_connecting = false;
+std::string g_statusText = "Not connected";
+
+int g_udpPort = 0;
+
+void remember_udp_port(const std::string& local) {
+    const size_t colon = local.rfind(':');
+    g_udpPort = colon == std::string::npos ? 0 : std::atoi(local.c_str() + colon + 1);
+}
+
+struct PeerLink {
+    bool used = false;
+
+    bool viaUdp = false;
+    rudp::Channel rel;
+
+    bool helloAcked = false;
+    uint64_t token = 0;
+
+    bool sealed = false;
+    uint8_t key[32] = {};
+    uint32_t keyId = 0;
+    seal::Window sealSeen;
+    uint64_t helloSentMs = 0;
+    uint64_t createdMs = 0;
+    mods::net::Socket sock;
+    std::vector<uint8_t> rx;
+    std::string udpEndpoint;
+    bool haveUdp = false;
+
+    uint32_t udpHeardTick = 0;
+
+    uint32_t lastRecvSeq = 0;
+    bool haveRecvSeq = false;
+};
+PeerLink g_links[kCoopMaxPlayers];
+
+struct KeyCounter {
+    uint32_t keyId = 0;
+    uint64_t used = 0;
+};
+KeyCounter g_keyCounters[kCoopMaxPlayers * 2];
+int g_keyCounterNext = 0;
+
+uint64_t next_seal_counter(uint32_t keyId) {
+    for (KeyCounter& k : g_keyCounters) {
+        if (k.used != 0 && k.keyId == keyId) return ++k.used;
+    }
+
+    const int count = static_cast<int>(sizeof(g_keyCounters) / sizeof(g_keyCounters[0]));
+    for (int tries = 0; tries < count; ++tries) {
+        KeyCounter& slot = g_keyCounters[g_keyCounterNext];
+        g_keyCounterNext = (g_keyCounterNext + 1) % count;
+        bool live = false;
+        for (const PeerLink& link : g_links) live = live || (slot.used != 0 && link.used && link.sealed && link.keyId == slot.keyId);
+        if (live) continue;
+        slot.keyId = keyId;
+        slot.used = 1;
+        return 1;
+    }
+    return 0;
+}
+
+void udp_send(std::string_view endpoint, std::span<const std::byte> bytes) {
+    for (PeerLink& link : g_links) {
+        if (!link.used || !link.sealed || link.udpEndpoint != endpoint) continue;
+        std::vector<std::byte> packet(bytes.size() + seal::kOverhead);
+        seal::wrap(link.key, link.keyId, g_isHost ? seal::kFromHost : seal::kFromJoiner,
+            next_seal_counter(link.keyId), reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+            reinterpret_cast<uint8_t*>(packet.data()));
+        udp_send_plain(endpoint, packet);
+        return;
+    }
+    udp_send_plain(endpoint, bytes);
+}
+
+struct SealedArrival {
+    bool sealed = false;
+    uint8_t key[32] = {};
+    uint32_t keyId = 0;
+    uint64_t counter = 0;
+};
+SealedArrival g_arrival;
+
+bool open_sealed(const uint8_t* raw, size_t size, std::vector<std::byte>& out) {
+    const uint32_t keyId = seal::key_id_of(raw);
+    const uint64_t counter = seal::counter_of(raw);
+    const uint32_t sender = g_isHost ? seal::kFromJoiner : seal::kFromHost;
+    out.resize(size - seal::kOverhead);
+    uint8_t* plain = reinterpret_cast<uint8_t*>(out.data());
+    for (PeerLink& link : g_links) {
+        if (!link.used || !link.sealed || link.keyId != keyId) continue;
+        if (!seal::unwrap(link.key, sender, raw, size, plain)) return false;
+        if (!link.sealSeen.take(counter)) return false;
+        g_arrival.sealed = true;
+        std::memcpy(g_arrival.key, link.key, sizeof(g_arrival.key));
+        g_arrival.keyId = keyId;
+        g_arrival.counter = counter;
+        return true;
+    }
+    uint8_t key[32];
+    if (!g_isHost || !online_pending_key(keyId, key)) return false;
+    if (!seal::unwrap(key, sender, raw, size, plain)) return false;
+    g_arrival.sealed = true;
+    std::memcpy(g_arrival.key, key, sizeof(g_arrival.key));
+    g_arrival.keyId = keyId;
+    g_arrival.counter = counter;
+    return true;
+}
+
+bool sealed_link_at(std::string_view endpoint) {
+    for (const PeerLink& link : g_links) {
+        if (link.used && link.sealed && link.udpEndpoint == endpoint) return true;
+    }
+    return false;
+}
+
+int arrival_link() {
+    if (!g_arrival.sealed) return -1;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (g_links[i].used && g_links[i].sealed && g_links[i].keyId == g_arrival.keyId) return i;
+    }
+    return -1;
+}
+
+const uint32_t kUdpRelearnTicks = 60;
+const int32_t kSeqRestartGap = 240;
+
+bool fresh_seq(bool& have, uint32_t& last, uint32_t seq) {
+    if (have) {
+        const int32_t ahead = static_cast<int32_t>(seq - last);
+        if (ahead <= 0 && ahead > -kSeqRestartGap) return false;
+    }
+    have = true;
+    last = seq;
+    return true;
+}
+
+uint8_t g_localId = kCoopHostId;
+CoopRoster g_roster = 1u << kCoopHostId;
+
+uint32_t g_playerQuiet[kCoopMaxPlayers] = {};
+
+uint32_t g_snapIn[kCoopMaxPlayers] = {};
+uint32_t g_snapStale[kCoopMaxPlayers] = {};
+uint32_t g_snapUnknown = 0;
+
+uint32_t g_playerSnapTick[kCoopMaxPlayers] = {};
+
+uint32_t g_udpSnapTick[kCoopMaxPlayers] = {};
+uint32_t g_expectTicks[kCoopMaxPlayers] = {};
+bool g_wantStream[kCoopMaxPlayers] = {};
+uint32_t g_wantSentTick[kCoopMaxPlayers] = {};
+bool g_streamTo[kCoopMaxPlayers] = {};
+const uint32_t kStarvedTicks = 90;
+
+void reset_backup_route(int id) {
+    if (id < 0 || id >= kCoopMaxPlayers) return;
+    g_udpSnapTick[id] = 0;
+    g_expectTicks[id] = 0;
+    g_wantStream[id] = false;
+    g_wantSentTick[id] = 0;
+    g_streamTo[id] = false;
+}
+
+uint32_t g_playerWorldTick[kCoopMaxPlayers] = {};
+bool g_playerWorldSeen[kCoopMaxPlayers] = {};
+uint32_t g_playerWorldStill[kCoopMaxPlayers] = {};
+
+bool g_playerPaused[kCoopMaxPlayers] = {};
+
+uint32_t g_pingToken[kCoopMaxPlayers] = {};
+
+std::chrono::steady_clock::time_point g_pingSentAt[kCoopMaxPlayers];
+uint32_t g_rttMs[kCoopMaxPlayers] = {};
+bool g_haveRttMs[kCoopMaxPlayers] = {};
+uint32_t g_pingSentTick[kCoopMaxPlayers] = {};
+uint32_t g_rttTicks[kCoopMaxPlayers] = {};
+uint32_t g_pingTick = 0;
+
+int live_link_count() {
+    int n = 0;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (g_links[i].used) ++n;
+    }
+    return n;
+}
+
+uint32_t g_sendSeq = 0;
+uint32_t g_tickCounter = 0;
+
+constexpr uint16_t kPuppetHookTipBck = dRes_INDEX_ALANM_BCK_HS_TIP_OPEN_e;
+
+constexpr s16 kProcFieldItem = 0x218;
+
+constexpr s16 kProcDemoItem = fpcNm_Demo_Item_e;
+
+constexpr uint16_t kEquipTransformEffect = 0x106;
+constexpr uint16_t kTransformEffectJoint = 4;
+constexpr uint32_t kModelHoldTicks = 30;
+uint8_t g_lastLocalOutfit = 0xFF;
+uint8_t g_lastLocalWolf = 0xFF;
+uint32_t g_modelHoldTicks = 0;
+
+uint8_t g_lastHandL = 0xFE;
+uint8_t g_lastHandR = 0xFE;
+uint8_t g_lastSwordInHand = 0;
+uint8_t g_lastShieldInHand = 0;
+int g_swapDiagLogs = 0;
+int g_poseDiagLogs = 0;
+
+uint8_t g_vfxJumpLandCounter = 0;
+u16 g_vfxLastProc = 0xFFFF;
+bool g_peerConnected = false;
+
+uint32_t send_every_n_ticks() {
+    int players = 0;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if ((g_roster & (1u << i)) != 0) ++players;
+    }
+    if (players <= 4) return 1;
+    if (players <= 8) return 2;
+    return 3;
+}
+
+const f32 kFarForSnapshots = 5000.0f;
+
+bool worth_sending(uint8_t about, int to, uint32_t seq) {
+    if (!g_isHost || to < 0 || to >= kCoopMaxPlayers) return true;
+    const CoopPeer& dest = features_peer_of(static_cast<uint8_t>(to));
+    if (!dest.present || dest.stage[0] == '\0') return true;
+    const char* stage = nullptr;
+    cXyz pos;
+    if (about == g_localId) {
+        daAlink_c* alink = daAlink_getAlinkActorClass();
+        stage = dComIfGp_getStartStageName();
+        if (alink == nullptr || stage == nullptr) return true;
+        pos = alink->current.pos;
+    } else {
+        if (about >= kCoopMaxPlayers) return true;
+        const CoopPeer& src = features_peer_of(about);
+        if (!src.present || src.stage[0] == '\0') return true;
+        stage = src.stage;
+        pos.set(src.x, src.y, src.z);
+    }
+    if (std::strncmp(stage, dest.stage, 8) != 0) return false;
+    const cXyz there(dest.x, dest.y, dest.z);
+    if ((pos - there).abs() > kFarForSnapshots) return seq % 4 == 0;
+    return true;
+}
+
+bool stage_local_message(uint8_t type) {
+    switch (type) {
+    case kMsgSounds:
+    case kMsgParticles:
+    case kMsgArrowShot:
+    case kMsgObjectMove:
+    case kMsgObjectPush:
+    case kMsgTorch:
+    case kMsgAnimal:
+    case kMsgNpcTalk:
+    case kMsgCarry:
+    case kMsgGrassCut:
+    case kMsgActorState:
+    case kMsgEnemyState:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void process_tcp_rx(PeerLink& link, uint8_t fromId);
+
+uint64_t steady_ms() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(
+        duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+void send_frame_to(PeerLink& link, uint8_t type, uint8_t from, const void* payload, size_t size) {
+    if (!link.used) return;
+    if (link.viaUdp) {
+        std::vector<uint8_t> frame(sizeof(MsgHeader) + size);
+        const MsgHeader header{static_cast<uint16_t>(size), type, from};
+        std::memcpy(frame.data(), &header, sizeof(header));
+        if (size > 0 && payload != nullptr) {
+            std::memcpy(frame.data() + sizeof(header), payload, size);
+        }
+
+        link.rel.write(frame.data(), frame.size());
+        return;
+    }
+    if (!link.sock) return;
+    std::vector<std::byte> frame(sizeof(MsgHeader) + size);
+    const MsgHeader header{static_cast<uint16_t>(size), type, from};
+    std::memcpy(frame.data(), &header, sizeof(header));
+    if (size > 0 && payload != nullptr) {
+        std::memcpy(frame.data() + sizeof(header), payload, size);
+    }
+    g_traffic.txBytes += frame.size();
+    ++g_traffic.txPackets;
+    link.sock.send({frame.data(), frame.size()});
+}
+
+void relay_frame(uint8_t type, uint8_t from, const uint8_t* payload, size_t size) {
+    if (!g_isHost) return;
+    const bool local = stage_local_message(type);
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (i == from) continue;
+        if (local && !worth_sending(from, i, 0)) continue;
+        send_frame_to(g_links[i], type, from, payload, size);
+    }
+}
+void broadcast_roster();
+
+int link_index_for(const mods::net::Event& event) {
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (g_links[i].used && g_links[i].sock && g_links[i].sock.handle() == event.handle) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int lowest_free_id() {
+    for (int i = 1; i < kCoopMaxPlayers; ++i) {
+        if (!g_links[i].used) return i;
+    }
+    return -1;
+}
+
+void drop_link(int id, const char* why);
+void disconnect_quietly();
+ModResult start_hosting(int64_t port);
+ModResult start_joining_code(const std::string& typed);
+
+void begin_migration(CoopRoster before, uint8_t me) {
+    if (g_sessionCode.empty() || !cfg_bool(g_migrateVar, true) || me == kCoopHostId) return;
+    int successor = -1;
+    for (int i = 1; i < kCoopMaxPlayers; ++i) {
+        if ((before & (1u << i)) != 0) {
+            successor = i;
+            break;
+        }
+    }
+    if (successor < 0) return;
+    g_migr = Migration{};
+    g_migr.active = true;
+    g_migr.hostIt = successor == me;
+    g_migr.code = g_sessionCode;
+    g_migr.hostName = g_migr.hostIt ? std::string() : features_peer_of(static_cast<uint8_t>(successor)).name;
+
+    g_migr.nextMs = steady_ms() + (g_migr.hostIt ? 1500 : 4000);
+    g_rejoinIsMigration = true;
+    coop_log::info("coop_mod: [MIGRATE] host gone, successor player {}{}, room {}", successor,
+        g_migr.hostIt ? " (us)" : "", g_migr.code);
+    if (g_migr.hostIt) {
+        coop_toast("The host left", ("You're the host now. Room " + g_migr.code + " carries on.").c_str());
+    } else {
+        coop_toast("The host left", ((g_migr.hostName.empty() ? std::string("Another player") : g_migr.hostName) +
+                                        " is taking over. Rejoining...").c_str());
+    }
+}
+
+void migration_update() {
+    if (!g_migr.active) return;
+    const uint64_t now = steady_ms();
+    if (g_peerConnected) {
+        coop_log::info("coop_mod: [MIGRATE] back in the session");
+        g_migr = Migration{};
+        g_rejoinIsMigration = false;
+        return;
+    }
+    if (g_migr.hostIt && g_isHost && g_listener) {
+        if (online_room_taken()) {
+
+            ++g_migr.takenTimes;
+            coop_log::info("coop_mod: [MIGRATE] room {} still taken ({})", g_migr.code, g_migr.takenTimes);
+            disconnect_quietly();
+            if (g_migr.takenTimes >= 3) g_migr.hostIt = false;
+            g_migr.nextMs = now + 4000;
+            return;
+        }
+
+        if (online_room_code() == g_migr.code) {
+            coop_log::info("coop_mod: [MIGRATE] hosting room {} again", g_migr.code);
+            g_migr.active = false;
+            g_rejoinIsMigration = false;
+        }
+        return;
+    }
+    if (g_connecting || now < g_migr.nextMs) return;
+    if (++g_migr.tries > 15) {
+        coop_log::info("coop_mod: [MIGRATE] gave up on room {}", g_migr.code);
+        coop_toast("Couldn't carry on", ("Room " + g_migr.code + " didn't come back. Host or join again.").c_str());
+        g_migr = Migration{};
+        g_rejoinIsMigration = false;
+        return;
+    }
+    g_migr.nextMs = now + 4000;
+    if (g_migr.hostIt) {
+        int64_t port = 27716;
+        svc_config->get_int(mod_ctx, g_bindPortVar, &port);
+        g_hostNameOverride = g_migr.code;
+        start_hosting(port);
+        g_hostNameOverride.clear();
+    } else {
+        start_joining_code(g_migr.code);
+    }
+}
+
+void send_bye(PeerLink& link) {
+    if (!link.used || !link.viaUdp || !g_udp || link.udpEndpoint.empty()) return;
+    std::vector<uint8_t> packet;
+    link.rel.control_packet(packet, rudp::kKindBye);
+    for (int i = 0; i < 3; ++i) {
+        udp_send(link.udpEndpoint,
+            {reinterpret_cast<const std::byte*>(packet.data()), packet.size()});
+    }
+}
+
+void on_session_up() {
+    report_hint_arm();
+    g_peerConnected = true;
+    g_connecting = false;
+    features_on_connected();
+}
+
+void on_extra_link_up() {
+    g_peerConnected = true;
+    g_connecting = false;
+}
+
+void broadcast_roster() {
+    if (!g_isHost) return;
+    MsgRoster msg{};
+    msg.present = g_roster;
+    coop_net_send(kMsgRoster, &msg, sizeof(msg));
+}
+
+void drop_link(int id, const char* why) {
+    if (id < 0 || id >= kCoopMaxPlayers || !g_links[id].used) return;
+    coop_log::warn("coop_mod: player {} disconnected ({})", id, why);
+    voice_peer_left(static_cast<uint8_t>(id));
+    send_bye(g_links[id]);
+    g_links[id].sock.close();
+    g_links[id] = PeerLink{};
+    g_haveRttMs[id] = false;
+    g_playerPaused[id] = false;
+    reset_backup_route(id);
+    g_roster = static_cast<CoopRoster>(g_roster & ~(1u << id));
+    puppet_hook_release_player(static_cast<uint8_t>(id));
+    if (g_isHost) {
+        broadcast_roster();
+        g_connecting = static_cast<bool>(g_listener);
+        if (live_link_count() == 0) {
+            g_peerConnected = false;
+            g_statusText = g_listener ? "Hosting. Waiting for players" : "Disconnected";
+            features_on_disconnected();
+        } else {
+            g_statusText = "Hosting, " + std::to_string(live_link_count() + 1) + " players";
+
+            features_on_roster_changed();
+        }
+    } else {
+
+        const CoopRoster before = g_roster;
+        const uint8_t me = g_localId;
+        g_peerConnected = false;
+        begin_migration(before, me);
+        g_roster = 1u << kCoopHostId;
+        g_localId = kCoopHostId;
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            g_playerPaused[i] = false;
+            reset_backup_route(i);
+        }
+        g_connecting = static_cast<bool>(g_listener);
+        g_statusText = "Disconnected";
+        features_on_disconnected();
+    }
+}
+
+void admit_player(int id) {
+    g_roster = static_cast<CoopRoster>(g_roster | (1u << id));
+
+    MsgAssignId assign{};
+    assign.playerId = static_cast<uint8_t>(id);
+    assign.maxPlayers = static_cast<uint8_t>(kCoopMaxPlayers);
+    send_frame_to(g_links[id], kMsgAssignId, kCoopHostId, &assign, sizeof(assign));
+    g_statusText = "Hosting, " + std::to_string(live_link_count() + 1) + " players";
+    const bool firstLink = live_link_count() == 1;
+    broadcast_roster();
+    if (firstLink) {
+        on_session_up();
+    } else {
+        on_extra_link_up();
+    }
+    features_on_roster_changed();
+}
+
+void handle_tcp_event(const mods::net::Event& event) {
+    switch (event.type) {
+        case NET_EVENT_ACCEPTED: {
+            const int id = lowest_free_id();
+            if (id < 0) {
+
+                coop_log::warn("coop_mod: session full ({} players), refused {}",
+                    kCoopMaxPlayers, event.endpoint);
+                mods::net::Socket extra = mods::net::adopt(event.accepted);
+                extra.close();
+                break;
+            }
+            coop_log::info("coop_mod: player {} connected from {}", id, event.endpoint);
+            g_links[id] = PeerLink{};
+            g_links[id].used = true;
+            g_links[id].sock = mods::net::adopt(event.accepted);
+            admit_player(id);
+            break;
+        }
+        case NET_EVENT_CONNECTED:
+
+            coop_log::info("coop_mod: connected to host");
+
+            if (!g_isHost && event.endpoint.rfind("tcp://", 0) == 0) {
+                const std::string udp = "udp://" + std::string{event.endpoint.substr(6)};
+                if (udp != g_links[kCoopHostId].udpEndpoint) {
+                    coop_log::info("coop_mod: host's udp endpoint {} (was {})", udp,
+                        g_links[kCoopHostId].udpEndpoint);
+                    g_links[kCoopHostId].udpEndpoint = udp;
+                }
+            }
+            g_statusText = "Connected";
+            on_session_up();
+            break;
+        case NET_EVENT_STREAM_DATA: {
+            const int id = link_index_for(event);
+            if (id < 0) break;
+            g_ticksSinceRx = 0;
+            if (event.data.empty()) break;
+            PeerLink& link = g_links[id];
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(event.data.data());
+            g_traffic.rxBytes += event.data.size();
+            ++g_traffic.rxPackets;
+            link.rx.insert(link.rx.end(), bytes, bytes + event.data.size());
+
+            process_tcp_rx(link, g_isHost ? static_cast<uint8_t>(id) : kCoopNoPlayer);
+
+            if (link.used && link.rx.size() > sizeof(MsgHeader) + kCoopMaxMessagePayload) {
+                mods::log::error("coop_mod: player {} overflowed the reliable channel", id);
+                drop_link(id, "reliable channel overflowed");
+            }
+            break;
+        }
+        case NET_EVENT_DROPPED: {
+            const int id = link_index_for(event);
+            if (id >= 0) drop_link(id, "link dropped");
+            puppet_hook_request_release();
+            break;
+        }
+        case NET_EVENT_CLOSED: {
+
+            const int id = link_index_for(event);
+            coop_log::info("coop_mod: socket closed{}", id >= 0 ? " - that player is gone" : "");
+            if (id >= 0) {
+                drop_link(id, "connection closed");
+                puppet_hook_request_release();
+            }
+            break;
+        }
+        default:
+            if (event.error != NET_ERROR_NONE) {
+                mods::log::error("coop_mod: net error: {}", event.message);
+                if (!g_peerConnected) g_connecting = static_cast<bool>(g_listener);
+
+                g_statusText = g_isHost
+                    ? "Connection problem: " + std::string{event.message}
+                    : "Couldn't connect. Check the address and that the host's port is open";
+            }
+            break;
+    }
+}
+
+void take_player_snapshot(int id, PlayerSnapshot& snapshot);
+
+void on_backup_route_frame(uint8_t type, uint8_t from, const uint8_t* payload, size_t size) {
+    if (from >= kCoopMaxPlayers || from == g_localId) return;
+    if (type == kMsgSnapWant) {
+        if (size < sizeof(MsgSnapWant)) return;
+        MsgSnapWant w;
+        std::memcpy(&w, payload, sizeof(w));
+        if (w.target == g_localId) {
+            if (g_streamTo[from] != (w.want != 0)) {
+                coop_log::info("coop_mod: [NET] player {} {}, {} backup position route",
+                    from, w.want ? "gets none of our UDP positions" : "hears our UDP again",
+                    w.want ? "also" : "stopped");
+            }
+            g_streamTo[from] = w.want != 0;
+        } else if (g_isHost && w.target < kCoopMaxPlayers && w.target != from) {
+            send_frame_to(g_links[w.target], type, from, payload, size);
+        }
+        return;
+    }
+    if (size < sizeof(MsgSnapStreamHead) + sizeof(PlayerSnapshot)) return;
+    MsgSnapStreamHead head;
+    std::memcpy(&head, payload, sizeof(head));
+    if (head.to != g_localId) {
+        if (g_isHost && head.to < kCoopMaxPlayers && head.to != from) {
+            send_frame_to(g_links[head.to], type, from, payload, size);
+        }
+        return;
+    }
+    PlayerSnapshot snapshot;
+    std::memcpy(&snapshot, payload + sizeof(head), sizeof(snapshot));
+    snapshot.playerId = from;
+    take_player_snapshot(from, snapshot);
+}
+
+void process_tcp_rx(PeerLink& link, uint8_t fromId) {
+    size_t offset = 0;
+    while (link.rx.size() - offset >= sizeof(MsgHeader)) {
+        MsgHeader header;
+        std::memcpy(&header, link.rx.data() + offset, sizeof(header));
+        if (header.size > kCoopMaxMessagePayload) {
+
+            if (g_isHost && fromId != kCoopNoPlayer) {
+                mods::log::error("coop_mod: malformed message (size {}) from player {} - dropping them",
+                    header.size, fromId);
+                drop_link(fromId, "malformed message");
+                return;
+            }
+            mods::log::error("coop_mod: malformed message (size {}) - disconnecting", header.size);
+            coop_net_disconnect();
+            return;
+        }
+        if (link.rx.size() - offset < sizeof(header) + header.size) break;
+        const uint8_t* payload = link.rx.data() + offset + sizeof(header);
+
+        const uint8_t from = (fromId != kCoopNoPlayer) ? fromId : header.from;
+
+        if (from >= kCoopMaxPlayers) {
+            offset += sizeof(header) + header.size;
+            continue;
+        }
+        g_playerQuiet[from] = 0;
+
+        const bool addressed = header.type == kMsgSnapWant || header.type == kMsgSnapStream;
+        if (g_isHost && from != kCoopHostId && !addressed) {
+            relay_frame(header.type, from, payload, header.size);
+        }
+
+        if (addressed) {
+            on_backup_route_frame(header.type, from, payload, header.size);
+        } else if (header.type == kMsgPing && header.size >= sizeof(MsgPing)) {
+            MsgPing echo;
+            std::memcpy(&echo, payload, sizeof(echo));
+            coop_net_send_to(from, kMsgPong, &echo, sizeof(echo));
+        } else if (header.type == kMsgPong && header.size >= sizeof(MsgPing)) {
+            MsgPing back;
+            std::memcpy(&back, payload, sizeof(back));
+            if (from < kCoopMaxPlayers && back.token == g_pingToken[from]) {
+                const uint32_t elapsed = g_pingTick - g_pingSentTick[from];
+
+                g_rttTicks[from] = (g_rttTicks[from] * 3 + elapsed) / 4;
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - g_pingSentAt[from]).count();
+                const uint32_t sample = ms < 0 ? 0u : static_cast<uint32_t>(ms);
+                g_rttMs[from] = g_haveRttMs[from] ? (g_rttMs[from] * 3 + sample) / 4 : sample;
+                g_haveRttMs[from] = true;
+            }
+        } else {
+            features_on_message(header.type, payload, header.size, from);
+        }
+        offset += sizeof(header) + header.size;
+        if (!link.used) return;
+    }
+    if (offset > 0) {
+        link.rx.erase(link.rx.begin(), link.rx.begin() + static_cast<std::ptrdiff_t>(offset));
+    }
+}
+
+ModResult start_hosting(int64_t port) {
+    global_shutdown();
+    g_listener.close();
+    g_udp.close();
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        g_links[i].sock.close();
+        g_links[i] = PeerLink{};
+    }
+    g_localId = kCoopHostId;
+    g_roster = 1u << kCoopHostId;
+
+    const std::string bind = "tcp://0.0.0.0:" + std::to_string(port);
+    mods::net::BindOutcome outcome;
+    g_listener = mods::net::listen(bind, &outcome);
+    if (!g_listener) {
+        mods::log::error(
+            "coop_mod: failed to listen on {}: {}", bind, static_cast<int>(outcome.error));
+        g_statusText = "Could not host on port " + std::to_string(port) +
+                       ". Is something else using it?";
+        return MOD_ERROR;
+    }
+    g_isHost = true;
+    g_connecting = true;
+    g_statusText = "Hosting on port " + std::to_string(port);
+    coop_log::info("coop_mod: hosting on {}", outcome.local);
+
+    mods::net::BindOutcome udpOutcome;
+    g_udp = mods::net::open_datagram("udp://0.0.0.0:" + std::to_string(port), &udpOutcome);
+    if (!g_udp) {
+        g_listener.close();
+        g_connecting = false;
+        g_statusText = "Couldn't start networking";
+        return MOD_ERROR;
+    }
+    coop_log::info("coop_mod: udp bound on {}", udpOutcome.local);
+    remember_udp_port(udpOutcome.local);
+
+    if (cfg_bool(g_upnpVar, true)) upnp_begin(static_cast<int>(port));
+
+    if (cfg_bool(g_roomsVar, true)) {
+
+        const std::string name = !g_hostNameOverride.empty()
+                                     ? g_hostNameOverride
+                                     : normalize_room_code(cfg_string(g_roomCodeVar, ""));
+        if (!name.empty() && (name.size() < kRoomNameMin || name.size() > kRoomNameMax)) {
+
+            g_statusText = "Room names are 4 to 24 letters and numbers. Hosting by address only.";
+        } else {
+            online_host_begin(static_cast<int>(port), name);
+        }
+    }
+    return MOD_OK;
+}
+
+ModResult start_joining_code(const std::string& typed) {
+    global_shutdown();
+    const std::string code = normalize_room_code(typed);
+    g_sessionCode = code;
+    if (code.size() < kRoomNameMin || code.size() > kRoomNameMax) {
+        g_statusText = "Enter the room code or name the host sees";
+        return MOD_ERROR;
+    }
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        g_links[i].sock.close();
+        g_links[i] = PeerLink{};
+    }
+    g_udp.close();
+    mods::net::BindOutcome udpOutcome;
+    g_udp = mods::net::open_datagram("udp://0.0.0.0:0", &udpOutcome);
+    if (!g_udp) {
+        g_statusText = "Couldn't start networking";
+        return MOD_ERROR;
+    }
+
+    const size_t colon = udpOutcome.local.rfind(':');
+    const int localPort =
+        colon == std::string::npos ? 0 : std::atoi(udpOutcome.local.c_str() + colon + 1);
+    remember_udp_port(udpOutcome.local);
+    g_isHost = false;
+    g_connecting = true;
+    g_localId = kCoopNoPlayer;
+    g_statusText = "Looking for room " + code + "...";
+    coop_log::info("coop_mod: joining room {} (udp {})", code, udpOutcome.local);
+    online_join_begin(code, localPort);
+    return MOD_OK;
+}
+
+std::string normalize_join_address(std::string address) {
+    const auto notSpace = [](unsigned char c) {
+        return c != ' ' && c != '\t' && c != '\r' && c != '\n';
+    };
+    while (!address.empty() && !notSpace(static_cast<unsigned char>(address.front()))) {
+        address.erase(address.begin());
+    }
+    while (!address.empty() && !notSpace(static_cast<unsigned char>(address.back()))) {
+        address.pop_back();
+    }
+    for (const char* prefix : {"tcp://", "udp://"}) {
+        if (address.rfind(prefix, 0) == 0) address.erase(0, std::strlen(prefix));
+    }
+    if (address.empty()) return address;
+    const size_t colons = static_cast<size_t>(std::count(address.begin(), address.end(), ':'));
+    const bool bracketed = address.front() == '[';
+    if (bracketed) {
+        if (address.back() == ']') address += ":27716";
+    } else if (colons == 0) {
+        address += ":27716";
+    }
+    return address;
+}
+
+ModResult start_joining(const std::string& rawAddress) {
+    global_shutdown();
+
+    std::string typed = rawAddress;
+    const size_t colons = static_cast<size_t>(std::count(typed.begin(), typed.end(), ':'));
+    const bool hasPort = typed.rfind('[', 0) == 0 ? typed.find("]:") != std::string::npos
+                                                  : colons == 1;
+    if (!typed.empty() && !hasPort) {
+        typed += ":" + std::to_string(cfg_int(g_joinPortVar, 27716));
+    }
+    const std::string address = normalize_join_address(typed);
+    if (address.empty()) {
+        g_statusText = "Enter the host's address first";
+        return MOD_ERROR;
+    }
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        g_links[i].sock.close();
+        g_links[i] = PeerLink{};
+    }
+    g_udp.close();
+
+    const std::string endpoint = "tcp://" + address;
+    mods::net::Socket sock = mods::net::connect(endpoint);
+    if (!sock) {
+        mods::log::error("coop_mod: failed to connect to {}", endpoint);
+        g_statusText = "Could not reach " + address + ". Check the address and port";
+        return MOD_ERROR;
+    }
+    g_isHost = false;
+    g_connecting = true;
+    g_links[kCoopHostId] = PeerLink{};
+    g_links[kCoopHostId].used = true;
+    g_links[kCoopHostId].sock = std::move(sock);
+    g_links[kCoopHostId].udpEndpoint = "udp://" + address;
+    g_links[kCoopHostId].haveUdp = true;
+    g_localId = kCoopNoPlayer;
+    g_statusText = "Connecting to " + address + "...";
+    coop_log::info("coop_mod: connecting to {}", endpoint);
+
+    mods::net::BindOutcome udpOutcome;
+    g_udp = mods::net::open_datagram("udp://0.0.0.0:0", &udpOutcome);
+    if (!g_udp) {
+        g_links[kCoopHostId].sock.close();
+        g_links[kCoopHostId] = PeerLink{};
+        g_connecting = false;
+        g_statusText = "Couldn't start networking";
+        return MOD_ERROR;
+    }
+    coop_log::info("coop_mod: udp bound on {}", udpOutcome.local);
+    remember_udp_port(udpOutcome.local);
+    return MOD_OK;
+}
+
+uint32_t g_lastMidnaSeq[kCoopMaxPlayers] = {};
+bool g_haveMidnaSeq[kCoopMaxPlayers] = {};
+
+void handle_midna_datagram(const mods::net::Event& event) {
+    MidnaSnapshot snap;
+    std::memcpy(&snap, event.data.data(), sizeof(snap));
+    if (snap.magic != kMidnaSnapshotMagic) return;
+
+    int id = -1;
+    if (g_isHost) {
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (g_links[i].used && g_links[i].haveUdp && g_links[i].udpEndpoint == event.endpoint) {
+                id = i;
+                break;
+            }
+        }
+        if (id < 0) return;
+        snap.playerId = static_cast<uint8_t>(id);
+    } else {
+        id = snap.playerId;
+        if (id < 0 || id >= kCoopMaxPlayers || id == g_localId) return;
+    }
+
+    if (!fresh_seq(g_haveMidnaSeq[id], g_lastMidnaSeq[id], snap.seq)) return;
+
+    if (g_isHost) {
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (i == id || !g_links[i].used || !g_links[i].haveUdp) continue;
+            if (!worth_sending(static_cast<uint8_t>(id), i, snap.seq)) continue;
+            udp_send(g_links[i].udpEndpoint,
+                {reinterpret_cast<const std::byte*>(&snap), sizeof(snap)});
+        }
+    }
+    puppet_hook_on_midna_snapshot(static_cast<uint8_t>(id), snap);
+}
+
+const uint32_t kVoiceMagic = 0x31435643u;
+struct VoiceHead {
+    uint32_t magic;
+    uint8_t playerId;
+    uint8_t pad;
+    uint16_t size;
+    uint32_t seq;
+};
+
+bool is_voice_datagram(const mods::net::Event& event) {
+    if (event.data.size() < sizeof(VoiceHead) || event.data.size() == sizeof(PlayerSnapshot)) return false;
+    uint32_t magic = 0;
+    std::memcpy(&magic, event.data.data(), 4);
+    return magic == kVoiceMagic;
+}
+
+void handle_voice_datagram(const mods::net::Event& event) {
+    VoiceHead head;
+    std::memcpy(&head, event.data.data(), sizeof(head));
+    if (head.size == 0 || head.size > kVoiceMaxOpus || sizeof(head) + head.size > event.data.size()) return;
+    int id = -1;
+    if (g_isHost) {
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (g_links[i].used && g_links[i].haveUdp && g_links[i].udpEndpoint == event.endpoint) {
+                id = i;
+                break;
+            }
+        }
+        if (id < 0) return;
+
+        std::vector<std::byte> out(event.data.begin(), event.data.end());
+        out[4] = static_cast<std::byte>(id);
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (i == id || !g_links[i].used || !g_links[i].haveUdp) continue;
+            udp_send(g_links[i].udpEndpoint, out);
+        }
+    } else {
+        id = head.playerId;
+        if (id >= kCoopMaxPlayers || id == g_localId) return;
+    }
+    voice_on_frame(static_cast<uint8_t>(id), head.seq,
+        reinterpret_cast<const uint8_t*>(event.data.data()) + sizeof(head), head.size);
+}
+
+int udp_link_for(std::string_view endpoint) {
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (g_links[i].used && g_links[i].viaUdp && g_links[i].udpEndpoint == endpoint) return i;
+    }
+    return -1;
+}
+
+bool handle_reliable_datagram(const mods::net::Event& event) {
+    rudp::Header h;
+    const uint8_t* payload = nullptr;
+    if (!rudp::Channel::parse(event.data.data(), event.data.size(), h, payload)) return false;
+    const std::string from{event.endpoint};
+    const uint64_t now = steady_ms();
+
+    int id = udp_link_for(from);
+    if (id < 0) {
+
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            PeerLink& moved = g_links[i];
+            if (!moved.used || !moved.viaUdp || moved.rel.conn() != h.conn) continue;
+
+            if (moved.sealed && arrival_link() != i) continue;
+            if (!g_isHost && !moved.helloAcked) break;
+            if (g_tickCounter - moved.udpHeardTick <= kUdpRelearnTicks) break;
+            coop_log::info("coop_mod: player {} udp endpoint moved {} -> {} (room code)", i,
+                moved.udpEndpoint, from);
+            moved.udpEndpoint = from;
+            id = i;
+            break;
+        }
+    }
+
+    if (id >= 0 && g_links[id].sealed && arrival_link() != id &&
+        !(g_isHost && g_arrival.sealed && h.kind == rudp::kKindHello)) {
+        return true;
+    }
+    if (id >= 0) g_links[id].udpHeardTick = g_tickCounter;
+    if (id >= 0 && g_links[id].rel.conn() != h.conn) {
+
+        if (!g_isHost || h.kind != rudp::kKindHello) return true;
+        drop_link(id, "reconnected");
+        id = -1;
+    }
+    if (id < 0) {
+        if (!g_isHost || h.kind != rudp::kKindHello || h.len != sizeof(uint64_t)) return true;
+        uint64_t token;
+        std::memcpy(&token, payload, sizeof(token));
+
+        if (!online_accept_token(token, g_arrival.sealed, g_arrival.keyId)) return true;
+        id = lowest_free_id();
+        if (id < 0) {
+            coop_log::warn("coop_mod: session full ({} players), refused {}",
+                kCoopMaxPlayers, from);
+            PeerLink refused;
+            refused.rel.start(h.conn, now);
+            std::vector<uint8_t> bye;
+            refused.rel.control_packet(bye, rudp::kKindBye);
+            if (g_arrival.sealed) {
+
+                std::vector<std::byte> packet(bye.size() + seal::kOverhead);
+                seal::wrap(g_arrival.key, g_arrival.keyId, seal::kFromHost, (1ull << 62) | now,
+                    bye.data(), bye.size(), reinterpret_cast<uint8_t*>(packet.data()));
+                udp_send_plain(from, packet);
+            } else {
+                udp_send(from, {reinterpret_cast<const std::byte*>(bye.data()), bye.size()});
+            }
+            return true;
+        }
+        coop_log::info("coop_mod: player {} connected from {} (room code{})", id, from,
+            g_arrival.sealed ? ", sealed" : "");
+        g_links[id] = PeerLink{};
+        g_links[id].used = true;
+        g_links[id].viaUdp = true;
+        if (g_arrival.sealed) {
+            g_links[id].sealed = true;
+            std::memcpy(g_links[id].key, g_arrival.key, sizeof(g_arrival.key));
+            g_links[id].keyId = g_arrival.keyId;
+            g_links[id].sealSeen.take(g_arrival.counter);
+        }
+        g_links[id].udpEndpoint = from;
+        g_links[id].haveUdp = true;
+        g_links[id].createdMs = now;
+        g_links[id].rel.start(h.conn, now);
+        admit_player(id);
+        if (!g_links[id].used) return true;
+    }
+
+    PeerLink& link = g_links[id];
+    g_ticksSinceRx = 0;
+    if (h.kind == rudp::kKindBye) {
+        drop_link(id, "left");
+        return true;
+    }
+    if (g_isHost && h.kind == rudp::kKindHello) {
+
+        std::vector<uint8_t> ack;
+        link.rel.control_packet(ack, rudp::kKindHelloAck);
+        udp_send(from, {reinterpret_cast<const std::byte*>(ack.data()), ack.size()});
+    }
+    if (!g_isHost && !link.helloAcked) {
+
+        link.helloAcked = true;
+        coop_log::info("coop_mod: connected to host (room code{})", link.sealed ? ", sealed" : "");
+        g_statusText = "Connected";
+        online_stop();
+        on_session_up();
+        if (!link.used) return true;
+    }
+
+    std::vector<uint8_t> delivered;
+    link.rel.on_packet(h, payload, now, delivered);
+    if (delivered.empty()) return true;
+
+    link.rx.insert(link.rx.end(), delivered.begin(), delivered.end());
+    process_tcp_rx(link, g_isHost ? static_cast<uint8_t>(id) : kCoopNoPlayer);
+    if (link.used && link.rx.size() > sizeof(MsgHeader) + kCoopMaxMessagePayload) {
+        mods::log::error("coop_mod: player {} overflowed the reliable channel", id);
+        drop_link(id, "reliable channel overflowed");
+    }
+    return true;
+}
+
+void flush_udp_links() {
+    if (!g_udp) return;
+    const uint64_t now = steady_ms();
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        PeerLink& link = g_links[i];
+        if (!link.used || !link.viaUdp) continue;
+        const auto send = [&](const uint8_t* data, size_t size) {
+            udp_send(link.udpEndpoint, {reinterpret_cast<const std::byte*>(data), size});
+        };
+        if (!g_isHost && !link.helloAcked) {
+            if (now - link.createdMs > 8000) {
+                coop_log::warn("coop_mod: host did not answer hello");
+                const std::string why =
+                    "Reached the host but could not finish connecting. Try again, or use "
+                    "Tailscale.";
+                coop_net_disconnect();
+                g_statusText = why;
+                return;
+            }
+            if (now - link.helloSentMs >= 200) {
+                link.helloSentMs = now;
+                std::vector<uint8_t> hello;
+                link.rel.control_packet(hello, rudp::kKindHello, &link.token, sizeof(link.token));
+                send(hello.data(), hello.size());
+            }
+            continue;
+        }
+        link.rel.flush(now, send);
+        if (link.rel.dead(now)) {
+
+            drop_link(i, link.rel.overflowed() ? "fell too far behind - 4 MB unacknowledged"
+                         : link.rel.heard_any() ? "timed out" : "never answered");
+            if (!g_isHost) puppet_hook_request_release();
+        }
+    }
+}
+
+uint32_t g_lastHorseSeq[kCoopMaxPlayers] = {};
+bool g_haveHorseSeq[kCoopMaxPlayers] = {};
+
+void handle_horse_datagram(const mods::net::Event& event) {
+    HorseSnapshot snap;
+    std::memcpy(&snap, event.data.data(), sizeof(snap));
+    if (snap.magic != kHorseSnapshotMagic) return;
+    int id = -1;
+    if (g_isHost) {
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (g_links[i].used && g_links[i].haveUdp && g_links[i].udpEndpoint == event.endpoint) {
+                id = i;
+                break;
+            }
+        }
+        if (id < 0) return;
+        snap.playerId = static_cast<uint8_t>(id);
+    } else {
+        id = snap.playerId;
+        if (id < 0 || id >= kCoopMaxPlayers || id == g_localId) return;
+    }
+    if (!fresh_seq(g_haveHorseSeq[id], g_lastHorseSeq[id], snap.seq)) return;
+    if (g_isHost) {
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (i == id || !g_links[i].used || !g_links[i].haveUdp) continue;
+            if (!worth_sending(static_cast<uint8_t>(id), i, snap.seq)) continue;
+            udp_send(g_links[i].udpEndpoint,
+                {reinterpret_cast<const std::byte*>(&snap), sizeof(snap)});
+        }
+    }
+    puppet_hook_on_horse_snapshot(static_cast<uint8_t>(id), snap);
+}
+
+uint32_t g_udpReopens = 0;
+
+void reopen_udp_after_close(const char* why) {
+    if (g_udpPort <= 0) return;
+    ++g_udpReopens;
+
+    static uint32_t s_windowStart = 0;
+    static int s_inWindow = 0;
+    if (g_tickCounter - s_windowStart > 600) {
+        if (s_inWindow > 3) {
+            coop_log::warn("coop_mod: udp socket reopened {} times in the last 10 seconds",
+                s_inWindow);
+        }
+        s_windowStart = g_tickCounter;
+        s_inWindow = 0;
+    }
+    ++s_inWindow;
+    g_udp.detach();
+    mods::net::BindOutcome outcome;
+    g_udp = mods::net::open_datagram("udp://0.0.0.0:" + std::to_string(g_udpPort), &outcome);
+    if (!g_udp) {
+        coop_log::warn("coop_mod: udp socket closed ({}), reopen failed port={}", why,
+            g_udpPort);
+        g_statusText = "Lost the network socket. Disconnect and try again";
+    } else if (s_inWindow <= 3) {
+        coop_log::warn("coop_mod: udp socket closed ({}), reopened on {}", why, outcome.local);
+    }
+}
+
+void take_player_snapshot(int id, PlayerSnapshot& snapshot) {
+
+    g_playerQuiet[id] = 0;
+
+    if (!g_playerWorldSeen[id] || g_playerWorldTick[id] != snapshot.worldTick) {
+        g_playerWorldTick[id] = snapshot.worldTick;
+        g_playerWorldSeen[id] = true;
+        g_playerWorldStill[id] = 0;
+    }
+    PeerLink& from = g_links[id];
+    ++g_snapIn[id];
+    g_playerSnapTick[id] = g_tickCounter;
+    if (!fresh_seq(from.haveRecvSeq, from.lastRecvSeq, snapshot.seq)) {
+        ++g_snapStale[id];
+        return;
+    }
+
+    if (g_isHost) {
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (i == id || !g_links[i].used || !g_links[i].haveUdp) continue;
+            if (!worth_sending(static_cast<uint8_t>(id), i, snapshot.seq)) continue;
+            udp_send(g_links[i].udpEndpoint,
+                {reinterpret_cast<const std::byte*>(&snapshot), sizeof(snapshot)});
+        }
+    }
+
+    puppet_hook_on_network_snapshot(static_cast<uint8_t>(id), snapshot.posX, snapshot.posY,
+        snapshot.posZ, snapshot.angleX, snapshot.angleY, snapshot.angleZ, snapshot.roomNo,
+        snapshot.outfit, snapshot.under, snapshot.upper, snapshot.handL, snapshot.handR, snapshot);
+}
+
+void handle_udp_payload(const mods::net::Event& event);
+
+void handle_udp_event(const mods::net::Event& event) {
+    if (event.type != NET_EVENT_DATAGRAM) {
+        if (event.error != NET_ERROR_NONE) {
+            mods::log::error("coop_mod: udp error: {}", event.message);
+        }
+        if (event.type == NET_EVENT_CLOSED && (g_isHost || g_connecting || g_peerConnected)) {
+            reopen_udp_after_close(std::string{event.message}.c_str());
+        }
+        return;
+    }
+    g_traffic.rxBytes += event.data.size();
+    ++g_traffic.rxPackets;
+
+    if (online_on_datagram(std::string{event.endpoint},
+            reinterpret_cast<const uint8_t*>(event.data.data()), event.data.size())) {
+        return;
+    }
+    if (global_on_datagram(std::string{event.endpoint},
+            reinterpret_cast<const uint8_t*>(event.data.data()), event.data.size())) {
+        return;
+    }
+
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(event.data.data());
+    g_arrival.sealed = false;
+    if (seal::looks_sealed(raw, event.data.size())) {
+        std::vector<std::byte> opened;
+        if (!open_sealed(raw, event.data.size(), opened)) return;
+        mods::net::Event inner = event;
+        inner.data = opened;
+        handle_udp_payload(inner);
+        g_arrival.sealed = false;
+        return;
+    }
+    if (sealed_link_at(event.endpoint)) return;
+    handle_udp_payload(event);
+}
+
+void handle_udp_payload(const mods::net::Event& event) {
+    if (handle_reliable_datagram(event)) return;
+
+    if (g_arrival.sealed) {
+        const int from = arrival_link();
+        if (from < 0 || g_links[from].udpEndpoint != event.endpoint) return;
+    }
+
+    if (!g_isHost && !g_peerConnected) return;
+    g_ticksSinceRx = 0;
+    if (is_voice_datagram(event)) {
+        handle_voice_datagram(event);
+        return;
+    }
+    if (event.data.size() == sizeof(MidnaSnapshot)) {
+        handle_midna_datagram(event);
+        return;
+    }
+    if (event.data.size() == sizeof(HorseSnapshot)) {
+        handle_horse_datagram(event);
+        return;
+    }
+    if (event.data.size() != sizeof(PlayerSnapshot)) {
+        return;
+    }
+    PlayerSnapshot snapshot;
+    std::memcpy(&snapshot, event.data.data(), sizeof(snapshot));
+
+    int id = -1;
+    if (g_isHost) {
+
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (g_links[i].used && g_links[i].haveUdp && g_links[i].udpEndpoint == event.endpoint) {
+                id = i;
+                break;
+            }
+        }
+        if (id < 0) {
+            const uint8_t claim = snapshot.playerId;
+            if (claim < kCoopMaxPlayers && g_links[claim].used && !g_links[claim].haveUdp) {
+                g_links[claim].udpEndpoint = std::string{event.endpoint};
+                g_links[claim].haveUdp = true;
+                id = claim;
+                coop_log::info("coop_mod: learned player {} udp endpoint {}", id, event.endpoint);
+            } else if (claim < kCoopMaxPlayers && g_links[claim].used && !g_links[claim].viaUdp &&
+                       g_links[claim].haveUdp &&
+                       g_tickCounter - g_links[claim].udpHeardTick > kUdpRelearnTicks) {
+
+                coop_log::info("coop_mod: player {} udp endpoint moved {} -> {}", claim,
+                    g_links[claim].udpEndpoint, event.endpoint);
+                g_links[claim].udpEndpoint = std::string{event.endpoint};
+                id = claim;
+            }
+        }
+        if (id < 0) {
+            if (g_snapUnknown++ % 600 == 0) {
+                coop_log::warn("coop_mod: [NET] position from {} claims unknown player {}, dropped (total {})", event.endpoint,
+                    static_cast<int>(snapshot.playerId), g_snapUnknown);
+            }
+            return;
+        }
+
+        snapshot.playerId = static_cast<uint8_t>(id);
+        g_links[id].udpHeardTick = g_tickCounter;
+    } else {
+
+        id = snapshot.playerId;
+        if (id < 0 || id >= kCoopMaxPlayers || id == g_localId) return;
+    }
+
+    g_udpSnapTick[id] = g_tickCounter;
+    take_player_snapshot(id, snapshot);
+}
+
+uint8_t detect_local_outfit() {
+
+    const uint8_t clothes = dComIfGs_getSelectEquipClothes();
+    if (clothes == dItemNo_WEAR_CASUAL_e) return kPuppetOutfitCasual;
+    if (clothes == dItemNo_WEAR_ZORA_e) return kPuppetOutfitZora;
+    if (clothes == dItemNo_ARMOR_e) return kPuppetOutfitMagicArmor;
+    return kPuppetOutfitDefault;
+}
+
+bool local_models_are_unsafe() {
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    const uint8_t outfitNow = detect_local_outfit();
+    const bool outfitChanged = g_lastLocalOutfit != 0xFF && outfitNow != g_lastLocalOutfit;
+
+    const uint8_t wolfNow = (alink != nullptr && alink->checkWolf()) ? 1 : 0;
+    const bool formChanged = g_lastLocalWolf != 0xFF && wolfNow != g_lastLocalWolf;
+    g_lastLocalWolf = wolfNow;
+    const uint8_t timer = (alink != nullptr) ? alink->mClothesChangeWaitTimer : 0;
+
+    if (outfitChanged || formChanged || timer != 0) {
+        if (g_modelHoldTicks == 0 && g_swapDiagLogs < 24) {
+            ++g_swapDiagLogs;
+
+            coop_log::info("coop_mod: [SWAPDIAG] local model swap outfitChanged={} ({} -> {}) formChanged={} (wolf={}) clothesTimer={}, holding reads {} ticks",
+                static_cast<int>(outfitChanged), g_lastLocalOutfit, outfitNow,
+                static_cast<int>(formChanged), wolfNow, timer, kModelHoldTicks);
+        }
+        g_modelHoldTicks = kModelHoldTicks;
+    }
+    g_lastLocalOutfit = outfitNow;
+
+    if (g_modelHoldTicks == 0) {
+        return false;
+    }
+    if (--g_modelHoldTicks == 0 && g_swapDiagLogs < 24) {
+        ++g_swapDiagLogs;
+        coop_log::info("coop_mod: [SWAPDIAG] hold expired, resuming model reads");
+    }
+    return true;
+}
+
+}
+
+bool coop_local_models_unsafe() {
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink != nullptr && alink->mClothesChangeWaitTimer != 0) return true;
+    return g_modelHoldTicks > 0;
+}
+
+namespace {
+
+void drive_fake_players(const PlayerSnapshot& mine) {
+    int64_t want = 0;
+    if (g_fakePlayersVar != 0) svc_config->get_int(mod_ctx, g_fakePlayersVar, &want);
+    if (!g_isHost || !g_udp) want = 0;
+    want = std::clamp<int64_t>(want, 0, kCoopMaxPlayers - 1);
+
+    uint16_t mask = 0;
+    int placed = 0;
+    for (int id = kCoopMaxPlayers - 1; id >= 1 && placed < want; --id) {
+        if (id == g_localId || g_links[id].used) continue;
+        mask = static_cast<uint16_t>(mask | (1u << id));
+        ++placed;
+    }
+
+    for (int id = 0; id < kCoopMaxPlayers; ++id) {
+        const uint16_t bit = static_cast<uint16_t>(1u << id);
+        if ((g_fakeMask & bit) != 0 && (mask & bit) == 0) {
+            puppet_hook_release_player(static_cast<uint8_t>(id));
+            features_debug_fake_peer(static_cast<uint8_t>(id), false, nullptr, nullptr, 0, 0);
+        }
+    }
+    g_fakeMask = mask;
+    if (mask == 0) return;
+
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    const u16 life = dComIfGs_getLife();
+    const u16 maxLife = dComIfGs_getMaxLife();
+    int k = 0;
+    for (int id = 0; id < kCoopMaxPlayers; ++id) {
+        if ((mask & (1u << id)) == 0) continue;
+
+        const s16 around = static_cast<s16>((k * 0x10000) / placed);
+        const f32 radius = 220.0f + 60.0f * (k % 3);
+        PlayerSnapshot fake = mine;
+        fake.playerId = static_cast<uint8_t>(id);
+        fake.posX = mine.posX + radius * cM_ssin(around);
+        fake.posZ = mine.posZ + radius * cM_scos(around);
+        fake.angleY = static_cast<int16_t>(mine.angleY + around);
+        g_playerQuiet[id] = 0;
+        puppet_hook_on_network_snapshot(static_cast<uint8_t>(id), fake.posX, fake.posY, fake.posZ,
+            fake.angleX, fake.angleY, fake.angleZ, fake.roomNo, fake.outfit, fake.under, fake.upper,
+            fake.handL, fake.handR, fake);
+        const float at[3] = {fake.posX, fake.posY, fake.posZ};
+        char name[16];
+        std::snprintf(name, sizeof(name), "Bot %d", id);
+
+        const u16 peerLife = static_cast<u16>(std::max<int>(4, life - k * 4));
+        features_debug_fake_peer(static_cast<uint8_t>(id), true, name, at, peerLife, maxLife);
+        (void)alink;
+        ++k;
+    }
+}
+
+dmg_rod_class* held_fishing_rod(daAlink_c* alink) {
+    fopAc_ac_c* actor = fopAcM_SearchByID(alink->mItemAcKeep.getID());
+    if (actor == nullptr || fopAcM_GetName(actor) != fpcNm_MG_ROD_e) return nullptr;
+    return reinterpret_cast<dmg_rod_class*>(actor);
+}
+
+void send_local_snapshot() {
+    const bool modelsUnsafe = local_models_are_unsafe();
+
+    if (!g_udp || g_localId == kCoopNoPlayer) {
+        return;
+    }
+    if (++g_tickCounter % send_every_n_ticks() != 0) {
+        return;
+    }
+
+    fopAc_ac_c* player = dComIfGp_getPlayer(0);
+    if (player == nullptr) {
+        return;
+    }
+
+    PlayerSnapshot snapshot{};
+    snapshot.seq = ++g_sendSeq;
+
+    snapshot.worldTick = coop_local_world_frames();
+    snapshot.posX = player->current.pos.x;
+    snapshot.posY = player->current.pos.y;
+    snapshot.posZ = player->current.pos.z;
+    snapshot.angleX = player->shape_angle.x;
+    snapshot.angleY = player->shape_angle.y;
+    snapshot.angleZ = player->shape_angle.z;
+    snapshot.roomNo = player->current.roomNo;
+    daAlink_c* alinkForm = daAlink_getAlinkActorClass();
+    const bool localIsWolf = alinkForm != nullptr && alinkForm->checkWolf();
+    snapshot.outfit = localIsWolf ? kPuppetOutfitWolf : detect_local_outfit();
+
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    auto fill_slots = [](AnmSlotSnapshot* out, const daPy_anmHeap_c* heaps,
+                         const daPy_frameCtrl_c* frameCtrls, mDoExt_AnmRatioPack* packs) {
+        for (int i = 0; i < 3; ++i) {
+
+            out[i].resIdx = anm_pack(heaps[i].getArcNo(), heaps[i].getIdx());
+            out[i].frame = frameCtrls[i].getFrame();
+            out[i].ratio = packs[i].getRatio();
+            out[i].rate = frameCtrls[i].getRate();
+
+            switch (out[i].resIdx) {
+            case dRes_INDEX_ALANM_BCK_BOMBD_e:
+            case dRes_INDEX_ALANM_BCK_CARRYD_e:
+            case dRes_INDEX_ALANM_BCK_GRABD_e:
+            case dRes_INDEX_ALANM_BCK_RODD_e:
+                out[i].rate = 0.0f;
+                break;
+            default:
+                break;
+            }
+        }
+    };
+
+    auto looks_like_live_data = [](const void* ptr) { return coop_ptr_looks_live(ptr); };
+    auto shown_hand_index = [&](daAlink_c* a, J3DShape* shown) -> uint8_t {
+        if (a == nullptr || shown == nullptr || a->mpLinkHandModel == nullptr) return 0xFE;
+        if (!looks_like_live_data(a->mpLinkHandModel)) return 0xFE;
+        J3DModelData* md = a->mpLinkHandModel->getModelData();
+        auto scan = [&](J3DModelData* data, uint8_t flag) -> uint8_t {
+            if (data == nullptr || !looks_like_live_data(data)) return 0xFE;
+            const u16 num = data->getMaterialNum();
+            if (num == 0 || num > 0x7F) return 0xFE;
+            for (u16 i = 0; i < num; ++i) {
+                J3DMaterial* mat = data->getMaterialNodePointer(i);
+
+                if (mat == nullptr || !looks_like_live_data(mat)) continue;
+                if (mat->getShape() == shown) return static_cast<uint8_t>(i) | flag;
+            }
+            return 0xFE;
+        };
+        const uint8_t inHands = scan(md, 0x00);
+        if (inHands != 0xFE) return inHands;
+
+        J3DModelData* bodyData =
+            (a->mpLinkModel != nullptr && looks_like_live_data(a->mpLinkModel))
+                ? a->mpLinkModel->getModelData()
+                : nullptr;
+        return scan(bodyData, 0x80);
+    };
+
+    if (alink != nullptr && !localIsWolf) {
+        fill_slots(snapshot.under, alink->mUnderAnmHeap, alink->mUnderFrameCtrl,
+            alink->mNowAnmPackUnder);
+        fill_slots(snapshot.upper, alink->mUpperAnmHeap, alink->mUpperFrameCtrl,
+            alink->mNowAnmPackUpper);
+
+        if (modelsUnsafe) {
+            snapshot.handL = g_lastHandL;
+            snapshot.handR = g_lastHandR;
+        } else {
+            snapshot.handL = g_lastHandL = shown_hand_index(alink, alink->field_0x06d0);
+            snapshot.handR = g_lastHandR = shown_hand_index(alink, alink->field_0x06d4);
+        }
+
+        snapshot.sword = kPuppetSwordNone;
+        if (alink->mSwordModel != nullptr) {
+            if (alink->mSwordModel == alink->mpSwMModel) snapshot.sword = kPuppetSwordMaster;
+            else if (alink->mSwordModel == alink->mWoodSwordModel) snapshot.sword = kPuppetSwordWood;
+            else snapshot.sword = kPuppetSwordOrdon;
+        }
+        snapshot.sheath = kPuppetSheathNone;
+        if (alink->mSheathModel != nullptr) {
+            snapshot.sheath = (alink->mSheathModel == alink->mpSwMSheathModel)
+                ? kPuppetSheathMaster : kPuppetSheathOrdon;
+        }
+
+        snapshot.bootsVisible = alink->checkEquipHeavyBoots() ? 1 : 0;
+
+        fopAc_ac_c* hungFrom = alink->mCargoCarryAcKeep.getActor();
+        const bool onPeahat = alink->mProcID == daAlink_c::PROC_HOOKSHOT_ROOF_WAIT && hungFrom != nullptr &&
+                              fopAcM_GetName(hungFrom) == fpcNm_E_PH_e;
+
+        const bool hiddenByScene =
+            alink->checkNoResetFlg0(daPy_py_c::FLG0_PLAYER_NO_DRAW) != 0 ||
+            (alink->actor_status & fopAcStts_NODRAW_e) != 0;
+        snapshot.combat = static_cast<uint8_t>((alink->checkUpperGuardAnime() ? 1 : 0) |
+                                               (alink->checkCameraLargeDamage() ? 2 : 0) |
+                                               (alink->mDamageTimer != 0 ? 4 : 0) |
+                                               (onPeahat ? 8 : 0) |
+                                               (hiddenByScene ? kSnapHidden : 0) |
+                                               (dComIfGp_event_runCheck() ||
+                                                        sumo_hides_equipment(coop_net_local_id())
+                                                    ? kSnapNoHits
+                                                    : 0));
+        for (int i = 0; i < 3; ++i) {
+            snapshot.hat[i] = alink->field_0x302c[7 + i];
+            snapshot.hat[3 + i] = alink->field_0x3040[7 + i];
+            snapshot.hat[6 + i] = alink->field_0x3066[i];
+        }
+
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                snapshot.magneRot[r * 3 + c] = alink->checkMagneBootsOn()
+                    ? static_cast<int16_t>(alink->mMagneBootMtx[r][c] * kMagneRotFixed)
+                    : 0;
+            }
+        }
+        snapshot.swordVisible = daAlink_c::checkSwordGet() ? 1 : 0;
+        snapshot.shieldVisible = daAlink_c::checkShieldGet() ? 1 : 0;
+        snapshot.swordJoint = alink->mLeftItemJntNo;
+        snapshot.sheathJoint = alink->field_0x30b6;
+        snapshot.shieldJoint = alink->mRightItemJntNo;
+
+        auto origin_of = [](MtxP m) {
+            cXyz v(0.0f, 0.0f, 0.0f);
+            if (m != nullptr) mDoMtx_multVecZero(m, &v);
+            return v;
+        };
+        auto sits_on_joint = [&](J3DModel* item, u16 joint) -> uint8_t {
+            if (item == nullptr || alink->mpLinkModel == nullptr) return 0;
+            if (!looks_like_live_data(item) || !looks_like_live_data(alink->mpLinkModel)) return 0;
+            J3DModelData* body = alink->mpLinkModel->getModelData();
+            if (body == nullptr || !looks_like_live_data(body)) return 0;
+            if (body->getJointNum() == 0 || body->getJointNum() > 256) return 0;
+            if (joint >= body->getJointNum()) return 0;
+
+            const cXyz a = origin_of(item->getBaseTRMtx());
+            const cXyz b = origin_of(standin_local_joint_mtx(alink->mpLinkModel, joint));
+            return ((a - b).abs() < 1.0f) ? 1 : 0;
+        };
+
+        if (modelsUnsafe || alink->checkNoResetFlg2(daPy_py_c::FLG2_STATUS_WINDOW_DRAW)) {
+            snapshot.swordInHand = g_lastSwordInHand;
+            snapshot.shieldInHand = g_lastShieldInHand;
+        } else {
+            snapshot.swordInHand = g_lastSwordInHand =
+                sits_on_joint(alink->mSwordModel, alink->mLeftItemJntNo);
+            snapshot.shieldInHand = g_lastShieldInHand =
+                sits_on_joint(alink->mShieldModel, alink->mRightItemJntNo);
+        }
+
+        if (alink->mShieldArcName != nullptr) {
+            std::strncpy(snapshot.shieldArc, alink->mShieldArcName, sizeof(snapshot.shieldArc) - 1);
+        }
+
+        int slot = 0;
+        for (int i = 0; i < kPuppetAttachSlots; ++i) {
+            snapshot.attached[i].kind = kPuppetHeldNone;
+            snapshot.attached[i].joint = kPuppetHeldJointRoot;
+            snapshot.attached[i].bckResIdx = 0xFFFF;
+            snapshot.attached[i].frame = 0.0f;
+            snapshot.attached[i].scale = 1.0f;
+            for (int e = 0; e < 12; ++e) {
+                snapshot.attached[i].mtx[e] = (e % 5 == 0) ? 1.0f : 0.0f;
+            }
+        }
+
+        J3DModel* body = (alink->mpLinkModel != nullptr && looks_like_live_data(alink->mpLinkModel))
+                             ? alink->mpLinkModel
+                             : nullptr;
+        J3DModelData* bodyData = (body != nullptr) ? body->getModelData() : nullptr;
+        if (!looks_like_live_data(bodyData)) bodyData = nullptr;
+
+        auto add_attachment = [&](uint8_t kind, J3DModel* model, uint16_t joint, uint16_t bckResIdx,
+                                  float frame, float scale = 1.0f) {
+            if (slot >= kPuppetAttachSlots || model == nullptr || bodyData == nullptr) return;
+            if (!looks_like_live_data(model)) return;
+            const bool jointOk = joint != kPuppetHeldJointRoot && joint < bodyData->getJointNum();
+            Mtx inv;
+            Mtx local;
+            mDoMtx_inverse(jointOk ? standin_local_joint_mtx(body, joint) : body->getBaseTRMtx(), inv);
+            mDoMtx_concat(inv, model->getBaseTRMtx(), local);
+
+            AttachedModelSnapshot& out = snapshot.attached[slot++];
+            out.kind = kind;
+            out.joint = jointOk ? joint : kPuppetHeldJointRoot;
+            out.bckResIdx = bckResIdx;
+            out.frame = frame;
+            out.scale = scale;
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    out.mtx[r * 4 + c] = local[r][c];
+                }
+            }
+        };
+
+        auto nearest_hand_joint = [&](J3DModel* model) -> uint16_t {
+            if (model == nullptr || bodyData == nullptr || !looks_like_live_data(model)) {
+                return kPuppetHeldJointRoot;
+            }
+            const uint16_t candidates[2] = {alink->mLeftItemJntNo, alink->mRightItemJntNo};
+
+            const f32 kHandAttachRange = 200.0f;
+            uint16_t best = kPuppetHeldJointRoot;
+            f32 bestDist = 0.0f;
+            for (int i = 0; i < 2; ++i) {
+                if (candidates[i] >= bodyData->getJointNum()) continue;
+                cXyz jointPos(0.0f, 0.0f, 0.0f);
+                cXyz modelPos(0.0f, 0.0f, 0.0f);
+                mDoMtx_multVecZero(standin_local_joint_mtx(body, candidates[i]), &jointPos);
+                mDoMtx_multVecZero(model->getBaseTRMtx(), &modelPos);
+                const f32 dist = (jointPos - modelPos).abs();
+                if (best == kPuppetHeldJointRoot || dist < bestDist) {
+                    best = candidates[i];
+                    bestDist = dist;
+                }
+            }
+            if (best != kPuppetHeldJointRoot && bestDist > kHandAttachRange) {
+                return kPuppetHeldJointRoot;
+            }
+            return best;
+        };
+
+        J3DModel* heldModel = alink->mHeldItemModel;
+        if (!modelsUnsafe && heldModel != nullptr && looks_like_live_data(heldModel) &&
+            bodyData != nullptr)
+        {
+            const u16 equip = alink->mEquipItem;
+            uint8_t kind = kPuppetHeldNone;
+            if (daAlink_c::checkBowItem(equip)) {
+                kind = kPuppetHeldBow;
+            } else if (equip == dItemNo_PACHINKO_e) {
+                kind = kPuppetHeldSling;
+            } else if (daAlink_c::checkHookshotItem(equip)) {
+                kind = kPuppetHeldHookshot;
+            } else if (equip == dItemNo_IRONBALL_e) {
+                kind = kPuppetHeldIronBall;
+            } else if (equip == dItemNo_COPY_ROD_e) {
+                kind = kPuppetHeldCopyRod;
+            } else if (daAlink_c::checkBottleItem(equip)) {
+                kind = kPuppetHeldBottle;
+            } else if (equip == kEquipTransformEffect) {
+                kind = kPuppetHeldTransform;
+            }
+
+            if (kind != kPuppetHeldNone) {
+
+                const uint16_t itemBck = alink->mAnmHeap9.getIdx();
+                const f32 itemFrame = alink->field_0x33dc;
+
+                if (kind == kPuppetHeldTransform) {
+
+                    add_attachment(kind, heldModel, kTransformEffectJoint, itemBck, itemFrame);
+                } else if (kind == kPuppetHeldHookshot) {
+
+                    add_attachment(kind, heldModel, nearest_hand_joint(heldModel), itemBck,
+                        itemFrame);
+                    add_attachment(kPuppetHeldHookTip, alink->mpHookTipModel,
+                        nearest_hand_joint(alink->mpHookTipModel), kPuppetHookTipBck,
+                        alink->field_0x33e0);
+                    if (equip == dItemNo_W_HOOKSHOT_e) {
+                        add_attachment(kind, alink->field_0x0710,
+                            nearest_hand_joint(alink->field_0x0710), itemBck, itemFrame);
+                        add_attachment(kPuppetHeldHookTip, alink->field_0x0714,
+                            nearest_hand_joint(alink->field_0x0714), kPuppetHookTipBck,
+                            alink->field_0x33e0);
+                    }
+                } else {
+
+                    uint16_t joint = kPuppetHeldJointRoot;
+                    if (kind != kPuppetHeldIronBall) {
+                        if (alink->checkOilBottleItemNotGet(equip)) {
+                            joint = alink->mRightItemJntNo;
+                        } else if (daAlink_c::checkBottleItem(equip)) {
+                            joint = alink->mLeftItemJntNo;
+                        } else if (alink->checkBowAndSlingItem(equip)) {
+                            joint = alink->checkBowGrabLeftHand() ? alink->mLeftItemJntNo
+                                                                  : alink->mRightItemJntNo;
+                        } else {
+                            joint = alink->mLeftItemJntNo;
+                        }
+                    }
+                    add_attachment(kind, heldModel, joint, itemBck, itemFrame);
+                }
+            }
+        }
+
+        snapshot.chainKind = kPuppetChainNone;
+        snapshot.chainCount = 0;
+        snapshot.chainStopTime = 0;
+        for (int i = 0; i < kPuppetChainPts; ++i) {
+            snapshot.chainPts[i][0] = snapshot.chainPts[i][1] = snapshot.chainPts[i][2] = 0.0f;
+        }
+        if (!modelsUnsafe && body != nullptr) {
+            Mtx rootInv;
+            mDoMtx_inverse(body->getBaseTRMtx(), rootInv);
+            auto put_point = [&](int idx, const cXyz& world) {
+                if (idx < 0 || idx >= kPuppetChainPts) return;
+                cXyz local;
+                mDoMtx_multVec(rootInv, &world, &local);
+                snapshot.chainPts[idx][0] = local.x;
+                snapshot.chainPts[idx][1] = local.y;
+                snapshot.chainPts[idx][2] = local.z;
+            };
+
+            const u16 equip = alink->mEquipItem;
+            if (daAlink_c::checkHookshotItem(equip)) {
+                snapshot.chainKind = kPuppetChainHookshot;
+                snapshot.chainCount = 4;
+                snapshot.chainStopTime = alink->getHookshotStopTime();
+                put_point(0, alink->getHsChainTopPos());
+                put_point(1, alink->getHsChainRootPos());
+                put_point(2, alink->getHsSubChainTopPos());
+                put_point(3, alink->getHsSubChainRootPos());
+            } else if (equip == dItemNo_IRONBALL_e && alink->getIronBallChainPos() != nullptr) {
+
+                snapshot.chainKind = kPuppetChainIronBall;
+                snapshot.chainCount = kPuppetChainPts;
+                const cXyz* chain = alink->getIronBallChainPos();
+                for (int i = 0; i < kPuppetChainPts; ++i) {
+                    const int src = 1 + (i * 100) / (kPuppetChainPts - 1);
+                    put_point(i, chain[src]);
+                }
+            } else if (daAlink_c::checkFishingRodItem(equip)) {
+
+                if (dmg_rod_class* rod = held_fishing_rod(alink)) {
+                    snapshot.chainKind =
+                        (rod->kind == MG_ROD_KIND_UKI) ? kPuppetChainRodUki : kPuppetChainRodLure;
+                    snapshot.chainCount = kPuppetChainPts;
+                    for (int i = 0; i < kPuppetChainPts; ++i) {
+                        put_point(i, rod->mg_rod.field_0x0[i]);
+                    }
+                }
+            }
+        }
+
+        {
+            s16 pitch = alink->mBodyAngle.x;
+            if (alink->checkReinRide() && !alink->checkHorseLieAnime() &&
+                alink->mProcID != daAlink_c::PROC_HORSE_RUN &&
+                alink->mProcID != daAlink_c::PROC_BOAR_RUN)
+            {
+                pitch = static_cast<s16>(alink->mBodyAngle.x - alink->shape_angle.x);
+            }
+            snapshot.bodyRotX = pitch;
+            snapshot.bodyRotY = alink->field_0x30c8;
+            snapshot.bodyRotZ = alink->mBodyAngle.z;
+        }
+
+        if (!modelsUnsafe && bodyData != nullptr) {
+            fopAc_ac_c* itemActor = alink->getBoomerangActor();
+            if (itemActor != nullptr && looks_like_live_data(itemActor)) {
+                J3DModel* boomModel = static_cast<daBoomerang_c*>(itemActor)->mp_boomModel;
+
+                if (boomModel != nullptr && looks_like_live_data(boomModel) &&
+                    (fopAcM_GetParam(itemActor) == 0 ||
+                     !spawns_replicates_procname(fpcNm_BOOMERANG_e))) {
+                    add_attachment(kPuppetHeldBoomerang, boomModel, nearest_hand_joint(boomModel),
+                        0xFFFF, 0.0f);
+                }
+
+                daBoomerang_c* boom = static_cast<daBoomerang_c*>(itemActor);
+                const bool boomIsReplicated = spawns_replicates_procname(fpcNm_BOOMERANG_e);
+                if (!boomIsReplicated && fopAcM_GetParam(boom) != 0 &&
+                    boom->mp_shippuModel != nullptr &&
+                    looks_like_live_data(boom->mp_shippuModel) && slot < kPuppetAttachSlots)
+                {
+                    MtxP shippuBase = boom->mp_shippuModel->getBaseTRMtx();
+                    mDoMtx_stack_c::transS(shippuBase[0][3], shippuBase[1][3], shippuBase[2][3]);
+
+                    mDoMtx_stack_c::YrotM(boom->shape_angle.y);
+                    Mtx upright;
+                    Mtx inv;
+                    Mtx local;
+                    cMtx_copy(mDoMtx_stack_c::get(), upright);
+                    mDoMtx_inverse(body->getBaseTRMtx(), inv);
+                    mDoMtx_concat(inv, upright, local);
+                    AttachedModelSnapshot& out = snapshot.attached[slot++];
+                    out.kind = kPuppetHeldBoomerangWind;
+                    out.joint = kPuppetHeldJointRoot;
+                    out.bckResIdx = 0xFFFF;
+                    out.frame = boom->m_shippuFrame;
+                    out.scale = boom->m_shippuSize;
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 4; ++c) out.mtx[r * 4 + c] = local[r][c];
+                    }
+                }
+
+                if (fopAcM_GetParam(boom) == 0 && dComIfGp_checkPlayerStatus0(0, 0x80000) &&
+                    boom->mp_setboomEfModel != nullptr && looks_like_live_data(boom->mp_setboomEfModel))
+                {
+                    add_attachment(kPuppetHeldBoomerangAimWind, boom->mp_setboomEfModel,
+                        nearest_hand_joint(boom->mp_setboomEfModel), 0xFFFF, 0.0f);
+                }
+            }
+        }
+
+        if (!modelsUnsafe && bodyData != nullptr) {
+            fopAc_ac_c* gotItem = fopAcM_getItemEventPartner(alink);
+            const s16 gotName = gotItem != nullptr ? fopAcM_GetName(gotItem) : -1;
+            if (gotItem != nullptr && (gotName == kProcFieldItem || gotName == kProcDemoItem) &&
+                looks_like_live_data(gotItem))
+            {
+                auto* itemBase = static_cast<daItemBase_c*>(gotItem);
+                if (itemBase->mpModel != nullptr && looks_like_live_data(itemBase->mpModel)) {
+
+                    add_attachment(kPuppetHeldGetItem, itemBase->mpModel,
+                        nearest_hand_joint(itemBase->mpModel), itemBase->getDisplayItemNo(), 0.0f,
+                        itemBase->mpModel->getBaseScale()->x);
+                }
+            }
+        }
+
+        if (!modelsUnsafe && bodyData != nullptr) {
+            daSpinner_c* spinner = alink->getSpinnerActor();
+            if (spinner != nullptr && looks_like_live_data(spinner) &&
+                spinner->mpModel != nullptr && looks_like_live_data(spinner->mpModel))
+            {
+                add_attachment(kPuppetHeldSpinner, spinner->mpModel, kPuppetHeldJointRoot, 0xFFFF,
+                    0.0f);
+            }
+        }
+
+        if (!modelsUnsafe && bodyData != nullptr) {
+            struct ArrowSearch {
+                fopAc_ac_c* found[kPuppetAttachSlots];
+                int count;
+            };
+            ArrowSearch search{};
+            fopAcM_Search(
+                [](void* proc, void* data) -> void* {
+                    auto* s = static_cast<ArrowSearch*>(data);
+                    auto* actor = static_cast<fopAc_ac_c*>(proc);
+                    if (actor != nullptr && s->count < kPuppetAttachSlots &&
+                        fopAcM_GetName(actor) == fpcNm_ARROW_e)
+                    {
+                        s->found[s->count++] = actor;
+                    }
+                    return nullptr;
+                },
+                &search);
+            for (int i = 0; i < search.count; ++i) {
+                daArrow_c* arrow = static_cast<daArrow_c*>(search.found[i]);
+                if (!looks_like_live_data(arrow) || arrow->mpModel == nullptr ||
+                    !looks_like_live_data(arrow->mpModel) || projectiles_is_remote(arrow))
+                {
+                    continue;
+                }
+                if (fopAcM_GetParam(arrow) != 0 || arrow->field_0x942 != 0 || arrow->field_0x93f != 0) {
+                    continue;
+                }
+
+                MtxP base = arrow->mpModel->getBaseTRMtx();
+                if (base[0][3] == 0.0f && base[1][3] == 0.0f && base[2][3] == 0.0f) continue;
+                uint8_t kind = kPuppetHeldNone;
+                if (arrow->mArrowType == daArrow_c::ARROW_TYPE_BOMB) {
+                    kind = kPuppetHeldBombArrow;
+                } else if (arrow->mArrowType == daArrow_c::ARROW_TYPE_NORMAL) {
+                    kind = kPuppetHeldArrow;
+                }
+                if (kind == kPuppetHeldNone) continue;
+                add_attachment(kind, arrow->mpModel, nearest_hand_joint(arrow->mpModel), 0xFFFF, 0.0f);
+            }
+        }
+
+        if (!modelsUnsafe && bodyData != nullptr && daAlink_c::checkFishingRodItem(alink->mEquipItem)) {
+            if (dmg_rod_class* rod = held_fishing_rod(alink)) {
+                if (rod->kind == MG_ROD_KIND_UKI) {
+
+                    if (rod->uki_model != nullptr && looks_like_live_data(rod->uki_model)) {
+                        add_attachment(kPuppetHeldRodFloat, rod->uki_model,
+                            nearest_hand_joint(rod->uki_model), 0xFFFF, 0.0f);
+                    }
+                    if (rod->uki_saki_model != nullptr && looks_like_live_data(rod->uki_saki_model)) {
+                        add_attachment(kPuppetHeldRodFloatTip, rod->uki_saki_model,
+                            nearest_hand_joint(rod->uki_saki_model), 0xFFFF, 0.0f);
+                    }
+
+                    const int hookKind = rod->hook_kind;
+                    if (rod->action != ACTION_UKI_HIT && rod->action != ACTION_UKI_CATCH &&
+                        (hookKind == 0 || hookKind == 1))
+                    {
+                        J3DModel* hook = rod->hook_model[hookKind];
+                        if (hook != nullptr && looks_like_live_data(hook)) {
+                            add_attachment(hookKind == 0 ? kPuppetHeldRodHookA : kPuppetHeldRodHookB,
+                                hook, nearest_hand_joint(hook), 0xFFFF, 0.0f);
+                        }
+                    }
+                } else if (rod->rod_modelMorf != nullptr && looks_like_live_data(rod->rod_modelMorf)) {
+                    J3DModel* rodModel = rod->rod_modelMorf->getModel();
+                    if (rodModel != nullptr && looks_like_live_data(rodModel)) {
+                        if (rod->arcname != nullptr) {
+                            std::strncpy(snapshot.rodArc, rod->arcname, sizeof(snapshot.rodArc) - 1);
+                        }
+                        add_attachment(kPuppetHeldFishRod, rodModel, nearest_hand_joint(rodModel),
+                            0xFFFF, 0.0f);
+                    }
+                }
+            }
+        }
+
+        if (!modelsUnsafe && bodyData != nullptr) {
+            fopAc_ac_c* ride = alink->getRideActor();
+            const s16 rideName = ride != nullptr ? fopAcM_GetName(ride) : -1;
+            if (rideName == fpcNm_CANOE_e && looks_like_live_data(ride)) {
+                auto* canoe = static_cast<daCanoe_c*>(ride);
+                if (canoe->mArcName != nullptr) {
+                    std::strncpy(snapshot.rideArc, canoe->mArcName, sizeof(snapshot.rideArc) - 1);
+
+                    if (canoe->mpModel != nullptr && looks_like_live_data(canoe->mpModel)) {
+                        add_attachment(kPuppetHeldRide, canoe->mpModel, kPuppetHeldJointRoot, 4,
+                            0.0f);
+                    }
+                    if (canoe->mpPaddleModel != nullptr &&
+                        looks_like_live_data(canoe->mpPaddleModel)) {
+                        add_attachment(kPuppetHeldRideExtra, canoe->mpPaddleModel,
+                            nearest_hand_joint(canoe->mpPaddleModel), 3, 0.0f);
+                    }
+                }
+            } else if (rideName == fpcNm_Obj_IceLeaf_e && looks_like_live_data(ride)) {
+                auto* board = static_cast<daObjIceLeaf_c*>(ride);
+                std::strncpy(snapshot.rideArc, "V_IceLeaf", sizeof(snapshot.rideArc) - 1);
+                if (board->mpModel != nullptr && looks_like_live_data(board->mpModel)) {
+
+                    add_attachment(kPuppetHeldRide, board->mpModel, kPuppetHeldJointRoot, 7, 0.0f);
+                }
+            }
+        }
+
+        if (!modelsUnsafe && bodyData != nullptr) {
+            const fpc_ProcID grabbed = alink->getGrabActorID();
+            auto* held = grabbed != fpcM_ERROR_PROCESS_ID_e
+                             ? static_cast<fopAc_ac_c*>(fopAcM_SearchByID(grabbed))
+                             : nullptr;
+            if (held != nullptr && fopAcM_GetName(held) == fpcNm_NBOMB_e &&
+                fopAcM_checkCarryNow(held) != 0) {
+                J3DModel* bombModel = static_cast<daNbomb_c*>(held)->mpModel;
+                if (bombModel != nullptr && looks_like_live_data(bombModel)) {
+                    add_attachment(kPuppetHeldBomb, bombModel, nearest_hand_joint(bombModel),
+                        0xFFFF, 0.0f);
+                }
+            }
+        }
+
+        if (!modelsUnsafe && alink->mpKanteraModel != nullptr &&
+            looks_like_live_data(alink->mpKanteraModel) && bodyData != nullptr &&
+            alink->checkNoResetFlg2(daAlink_c::FLG2_UNK_1))
+        {
+            add_attachment(kPuppetHeldLantern, alink->mpKanteraModel, alink->mLeftItemJntNo, 0xFFFF,
+                0.0f);
+
+            if (alink->mpKanteraGlowModel != nullptr &&
+                looks_like_live_data(alink->mpKanteraGlowModel))
+            {
+                const f32 burning = alink->checkNoResetFlg1(daAlink_c::FLG1_UNK_80) ? 1.0f : 0.0f;
+                add_attachment(kPuppetHeldLanternGlow, alink->mpKanteraGlowModel,
+                    kPuppetHeldJointRoot, 0xFFFF, 0.0f, burning);
+            }
+        }
+    } else if (alink != nullptr && localIsWolf) {
+
+        fill_slots(snapshot.under, alink->mUnderAnmHeap, alink->mUnderFrameCtrl,
+            alink->mNowAnmPackUnder);
+        fill_slots(snapshot.upper, alink->mUpperAnmHeap, alink->mUpperFrameCtrl,
+            alink->mNowAnmPackUpper);
+        snapshot.handL = 0xFE;
+        snapshot.handR = 0xFE;
+        snapshot.sword = kPuppetSwordNone;
+        snapshot.sheath = kPuppetSheathNone;
+        snapshot.swordVisible = 0;
+        snapshot.shieldVisible = 0;
+
+        for (int i = 0; i < kPuppetAttachSlots; ++i) {
+            snapshot.attached[i].kind = kPuppetHeldNone;
+            snapshot.attached[i].joint = kPuppetHeldJointRoot;
+            snapshot.attached[i].bckResIdx = 0xFFFF;
+            snapshot.attached[i].frame = 0.0f;
+
+            snapshot.attached[i].scale = 1.0f;
+            for (int e = 0; e < 12; ++e) {
+                snapshot.attached[i].mtx[e] = (e % 5 == 0) ? 1.0f : 0.0f;
+            }
+        }
+
+        int wolfSlot = 4;
+        if (!modelsUnsafe && alink->mEquipItem == kEquipTransformEffect &&
+            alink->mHeldItemModel != nullptr && looks_like_live_data(alink->mHeldItemModel) &&
+            alink->mpLinkModel != nullptr && looks_like_live_data(alink->mpLinkModel) &&
+            wolfSlot < kPuppetAttachSlots)
+        {
+            J3DModelData* wolfBodyData = alink->mpLinkModel->getModelData();
+            if (looks_like_live_data(wolfBodyData) &&
+                kTransformEffectJoint < wolfBodyData->getJointNum())
+            {
+                Mtx inv;
+                Mtx local;
+                mDoMtx_inverse(alink->mpLinkModel->getAnmMtx(kTransformEffectJoint), inv);
+                mDoMtx_concat(inv, alink->mHeldItemModel->getBaseTRMtx(), local);
+                AttachedModelSnapshot& out = snapshot.attached[wolfSlot++];
+                out.kind = kPuppetHeldTransform;
+                out.joint = kTransformEffectJoint;
+                out.bckResIdx = alink->mAnmHeap9.getIdx();
+                out.frame = alink->field_0x33dc;
+                out.scale = alink->mHeldItemModel->getBaseScale()->x;
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 4; ++c) out.mtx[r * 4 + c] = local[r][c];
+                }
+            }
+        }
+
+        if (!modelsUnsafe && wolfSlot < kPuppetAttachSlots && alink->mpLinkModel != nullptr &&
+            looks_like_live_data(alink->mpLinkModel))
+        {
+            fopAc_ac_c* gotItem = fopAcM_getItemEventPartner(alink);
+            const s16 gotName = gotItem != nullptr ? fopAcM_GetName(gotItem) : -1;
+            if (gotItem != nullptr && (gotName == kProcFieldItem || gotName == kProcDemoItem) &&
+                looks_like_live_data(gotItem))
+            {
+                auto* itemBase = static_cast<daItemBase_c*>(gotItem);
+                J3DModel* itemModel = itemBase->mpModel;
+                if (itemModel != nullptr && looks_like_live_data(itemModel)) {
+                    Mtx inv;
+                    Mtx local;
+                    mDoMtx_inverse(alink->mpLinkModel->getBaseTRMtx(), inv);
+                    mDoMtx_concat(inv, itemModel->getBaseTRMtx(), local);
+                    AttachedModelSnapshot& out = snapshot.attached[wolfSlot++];
+                    out.kind = kPuppetHeldGetItem;
+                    out.joint = kPuppetHeldJointRoot;
+                    out.bckResIdx = itemBase->getDisplayItemNo();
+                    out.frame = 0.0f;
+                    out.scale = itemModel->getBaseScale()->x;
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 4; ++c) out.mtx[r * 4 + c] = local[r][c];
+                    }
+                }
+            }
+        }
+
+        J3DModel* wolfBody = alink->mpLinkModel;
+
+        if (!modelsUnsafe && wolfBody != nullptr && looks_like_live_data(wolfBody) &&
+            !beast_local_active()) {
+            Mtx rootInv;
+            mDoMtx_inverse(wolfBody->getBaseTRMtx(), rootInv);
+            const cXyz* chainPos = alink->field_0x363c;
+            const csXyz* chainAngle = alink->field_0x3142;
+            for (int i = 0; i < 4 && i < wolfSlot; ++i) {
+                mDoMtx_stack_c::transS(chainPos[i]);
+                mDoMtx_stack_c::ZXYrotM(chainAngle[i]);
+                Mtx world;
+                mDoMtx_copy(mDoMtx_stack_c::get(), world);
+                Mtx local;
+                mDoMtx_concat(rootInv, world, local);
+
+                AttachedModelSnapshot& out = snapshot.attached[i];
+                out.kind = kPuppetHeldWolfChain;
+                out.joint = kPuppetHeldJointRoot;
+                out.bckResIdx = 0xFFFF;
+                out.frame = 0.0f;
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 4; ++c) out.mtx[r * 4 + c] = local[r][c];
+                }
+            }
+        }
+    } else {
+
+        for (int i = 0; i < 3; ++i) {
+            snapshot.under[i].resIdx = 0xFFFF;
+            snapshot.under[i].frame = 0.0f;
+            snapshot.under[i].ratio = 0.0f;
+            snapshot.under[i].rate = 1.0f;
+            snapshot.upper[i] = snapshot.under[i];
+        }
+        snapshot.under[0].resIdx = dRes_INDEX_ALANM_BCK_WAITS_e;
+        snapshot.under[0].ratio = 1.0f;
+        snapshot.handL = 0xFE;
+        snapshot.handR = 0xFE;
+        snapshot.sword = kPuppetSwordNone;
+        snapshot.sheath = kPuppetSheathNone;
+        snapshot.swordVisible = 0;
+        snapshot.shieldVisible = 0;
+    }
+
+    snapshot.vfxSpin = kSpinVfxNone;
+    snapshot.vfxWolfDig = 0;
+    snapshot.vfxDigAngleX = 0;
+    snapshot.vfxDigPos[0] = snapshot.vfxDigPos[1] = snapshot.vfxDigPos[2] = 0.0f;
+
+    snapshot.headRot[0] = snapshot.headRot[1] = snapshot.headRot[2] = 0;
+    snapshot.wolfNeck[0] = snapshot.wolfNeck[1] = 0;
+    if (alink != nullptr) {
+        snapshot.headRot[0] = alink->field_0x3124.x;
+        snapshot.headRot[1] = alink->field_0x3124.y;
+        snapshot.headRot[2] = alink->field_0x3124.z;
+        if (localIsWolf) {
+            snapshot.wolfNeck[0] = static_cast<int16_t>(alink->field_0x30d6 + alink->field_0x30b2);
+            snapshot.wolfNeck[1] = alink->field_0x30b0;
+        }
+    }
+
+    snapshot.tevTint = 0;
+    snapshot.tevTintOn = 0;
+    if (alink != nullptr && (alink->mProcID == daAlink_c::PROC_METAMORPHOSE ||
+                             alink->mProcID == daAlink_c::PROC_DUNGEON_WARP ||
+                             alink->mProcID == daAlink_c::PROC_DUNGEON_WARP_SCN_START)) {
+        snapshot.tevTint = alink->mProcVar3.field_0x300e;
+        snapshot.tevTintOn = 1;
+    }
+
+    snapshot.warpOn = 0;
+    snapshot.warpScroll = 0.0f;
+    snapshot.warpDissolve = 0.0f;
+    if (alink != nullptr &&
+        (alink->mProcID == daAlink_c::PROC_WARP ||
+         (alink->mProcID == daAlink_c::PROC_TOOL_DEMO && alink->mProcVar2.field_0x300c != 0)))
+    {
+        snapshot.warpOn = 1;
+        snapshot.warpScroll = alink->field_0x3478;
+        snapshot.warpDissolve = alink->field_0x347c;
+    }
+    if (alink != nullptr) {
+        const u16 proc = alink->mProcID;
+        if ((proc == daAlink_c::PROC_CUT_TURN || proc == daAlink_c::PROC_BOARD_CUT_TURN) &&
+            alink->mUnderFrameCtrl[0].getFrame() >= alink->mProcVar1.field_0x300a)
+        {
+            const bool large = alink->mCutType == daAlink_c::CUT_TYPE_LARGE_TURN_RIGHT ||
+                               alink->mCutType == daAlink_c::CUT_TYPE_LARGE_TURN_LEFT;
+            uint8_t variant = kSpinVfxNone;
+            uint8_t flags = 0;
+            if (alink->checkNoResetFlg0(daAlink_c::FLG0_WATER_IN_MOVE)) {
+                if (alink->checkZoraWearAbility()) {
+                    variant = kSpinVfxWater;
+                    if (large) flags |= kSpinVfxFlagWaterLarge;
+                }
+            } else if (large) {
+                variant = kSpinVfxLarge;
+            } else if (alink->checkNoResetFlg3(daAlink_c::FLG3_UNK_100000)) {
+                variant = kSpinVfxLight;
+            } else {
+                variant = kSpinVfxNormal;
+            }
+            if (variant != kSpinVfxNone) {
+                if (alink->mProcVar4.field_0x3010 != 0) flags |= kSpinVfxFlagNoLocalRot;
+                snapshot.vfxSpin = static_cast<uint8_t>(variant | flags);
+            }
+        }
+
+        if (proc == daAlink_c::PROC_WOLF_ROLL_ATTACK) {
+            uint8_t flags = kSpinVfxWolf;
+            if (alink->mProcVar2.field_0x300c == 0) flags |= kSpinVfxFlagWolfFlip;
+            if (alink->mProcVar3.field_0x300e == 0) flags |= kSpinVfxFlagWolfEmitB;
+            snapshot.vfxSpin = flags;
+        }
+
+        if (proc == daAlink_c::PROC_CUT_LARGE_JUMP_LAND && g_vfxLastProc != proc) {
+            ++g_vfxJumpLandCounter;
+        }
+        g_vfxLastProc = proc;
+    }
+    snapshot.vfxJumpLand = g_vfxJumpLandCounter;
+
+    if (alink != nullptr) {
+        snapshot.rootClearMask = alink->field_0x2f99;
+        snapshot.rootClearX = alink->field_0x3588.x;
+        snapshot.rootClearY = alink->field_0x33b0;
+        snapshot.rootClearZ = alink->field_0x3588.z;
+
+        if (alink->field_0x2f99 == 0x60 && alink->field_0x384c != nullptr) {
+            snapshot.rootClearX = alink->field_0x384c->x;
+            snapshot.rootClearY = alink->field_0x384c->y;
+            snapshot.rootClearZ = alink->field_0x384c->z;
+        }
+        for (int i = 0; i < 2; ++i) {
+            snapshot.footAngles[i][0] = alink->mFootData1[i].field_0x6;
+            snapshot.footAngles[i][1] = alink->mFootData1[i].field_0x4;
+            snapshot.footAngles[i][2] = alink->mFootData1[i].field_0x2;
+            snapshot.footAngles[i + 2][0] = alink->mFootData2[i].field_0x6;
+            snapshot.footAngles[i + 2][1] = alink->mFootData2[i].field_0x4;
+            snapshot.footAngles[i + 2][2] = alink->mFootData2[i].field_0x2;
+        }
+    }
+
+    if (g_poseDiagLogs < 30 && alink != nullptr &&
+        (snapshot.rootClearMask != 0 || snapshot.footAngles[0][0] != 0 ||
+         snapshot.footAngles[0][1] != 0 || snapshot.footAngles[1][0] != 0))
+    {
+        ++g_poseDiagLogs;
+        coop_log::trace("coop_mod: [POSEDIAG-TX] rootMask={:#x} clear=({},{},{}) "
+                        "foot0=({},{},{}) foot1=({},{},{}) bodyRot=({},{},{})",
+            snapshot.rootClearMask, snapshot.rootClearX, snapshot.rootClearY, snapshot.rootClearZ,
+            snapshot.footAngles[0][0], snapshot.footAngles[0][1], snapshot.footAngles[0][2],
+            snapshot.footAngles[1][0], snapshot.footAngles[1][1], snapshot.footAngles[1][2],
+            snapshot.bodyRotX, snapshot.bodyRotY, snapshot.bodyRotZ);
+    }
+
+    snapshot.playerId = g_localId;
+    global_send_snapshot(snapshot);
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (!g_links[i].used || !g_links[i].haveUdp) continue;
+        if (!worth_sending(g_localId, i, snapshot.seq)) continue;
+        udp_send(g_links[i].udpEndpoint,
+            {reinterpret_cast<const std::byte*>(&snapshot), sizeof(snapshot)});
+    }
+
+    if (snapshot.seq % 2 == 0) {
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            if (!g_streamTo[i] || i == g_localId) continue;
+            if (!coop_net_player_present(static_cast<uint8_t>(i))) {
+                g_streamTo[i] = false;
+                continue;
+            }
+            uint8_t frame[sizeof(MsgSnapStreamHead) + sizeof(PlayerSnapshot)];
+            MsgSnapStreamHead head{};
+            head.to = static_cast<uint8_t>(i);
+            std::memcpy(frame, &head, sizeof(head));
+            std::memcpy(frame + sizeof(head), &snapshot, sizeof(snapshot));
+            coop_net_send_to(static_cast<uint8_t>(i), kMsgSnapStream, frame, sizeof(frame));
+        }
+    }
+    drive_fake_players(snapshot);
+}
+
+uint32_t g_midnaSeq = 0;
+
+int g_midnaNoneToSend = 0;
+const int kMidnaNoneRepeats = 3;
+
+bool midna_ptr_live(const void* ptr) {
+    return coop_ptr_looks_live(ptr);
+}
+
+void fill_mtx12(float* out, const Mtx m) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) out[r * 4 + c] = m[r][c];
+    }
+}
+
+int16_t to_fixed_rot(f32 v) {
+    f32 scaled = v * kMidnaRotFixed;
+    if (scaled > 32767.0f) scaled = 32767.0f;
+    if (scaled < -32768.0f) scaled = -32768.0f;
+    return static_cast<int16_t>(scaled < 0.0f ? scaled - 0.5f : scaled + 0.5f);
+}
+
+uint8_t local_midna_mode(daAlink_c* alink, daMidna_c* midna) {
+    if (alink == nullptr || midna == nullptr) return kMidnaModeNone;
+    if (!midna_ptr_live(midna) || midna->mpShadowModel == nullptr) return kMidnaModeNone;
+    if (midna->checkNoDrawState()) return kMidnaModeNone;
+    if (!midna->checkStateFlg1(static_cast<daMidna_c::daMidna_FLG1>(
+            daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE | daMidna_c::FLG1_UNK_1)) &&
+        alink->checkPlayerNoDraw() &&
+        !midna->checkStateFlg0(static_cast<daMidna_c::daMidna_FLG0>(
+            daMidna_c::FLG0_TAG_WAIT | daMidna_c::FLG0_UNK_100)))
+    {
+        return kMidnaModeNone;
+    }
+
+    if (midna->checkStateFlg1(daMidna_c::FLG1_UNK_1)) return kMidnaModeNone;
+    if (!midna->checkStateFlg0(daMidna_c::FLG0_NO_DRAW) &&
+        !midna->checkStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE) &&
+        midna->mpModel != nullptr)
+    {
+        return kMidnaModeSolid;
+    }
+    return kMidnaModeShadow;
+}
+
+uint8_t local_midna_hair_shape(daMidna_c* midna) {
+    if (midna->mpShadowHairhandBmd == nullptr) return 0;
+    J3DModelData* data = midna->mpShadowHairhandBmd->getModelData();
+    if (data == nullptr) return 0;
+    const u16 n = data->getMaterialNum() < 3 ? data->getMaterialNum() : 3;
+    for (u16 i = 0; i < n; ++i) {
+        J3DMaterial* mat = data->getMaterialNodePointer(i);
+
+        if (mat != nullptr && mat->getShape() != nullptr && !mat->getShape()->checkFlag(1)) {
+            return static_cast<uint8_t>(i);
+        }
+    }
+    return 0;
+}
+
+}
+
+void coop_voice_send(uint32_t sequence, const uint8_t* opus, size_t size) {
+    if (!g_udp || g_localId == kCoopNoPlayer || size == 0 || size > kVoiceMaxOpus) return;
+    VoiceHead head{kVoiceMagic, g_localId, 0, static_cast<uint16_t>(size), sequence};
+    std::vector<std::byte> out(sizeof(head) + size);
+    std::memcpy(out.data(), &head, sizeof(head));
+    std::memcpy(out.data() + sizeof(head), opus, size);
+
+    while (out.size() == sizeof(PlayerSnapshot) || out.size() == sizeof(MidnaSnapshot) ||
+           out.size() == sizeof(HorseSnapshot)) {
+        out.push_back(std::byte{0});
+    }
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (!g_links[i].used || !g_links[i].haveUdp) continue;
+        udp_send(g_links[i].udpEndpoint, out);
+    }
+}
+
+namespace {
+
+void send_midna_datagram(const MidnaSnapshot& snap) {
+    global_send_midna(snap);
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (!g_links[i].used || !g_links[i].haveUdp) continue;
+        if (!worth_sending(g_localId, i, snap.seq)) continue;
+        udp_send(g_links[i].udpEndpoint,
+            {reinterpret_cast<const std::byte*>(&snap), sizeof(snap)});
+    }
+}
+
+void send_local_midna() {
+    if (!g_udp || g_localId == kCoopNoPlayer) return;
+
+    if (g_tickCounter % send_every_n_ticks() != 0) return;
+
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    daMidna_c* midna = daPy_py_c::getMidnaActor();
+    uint8_t mode = kMidnaModeNone;
+
+    if (!local_models_are_unsafe()) mode = local_midna_mode(alink, midna);
+
+    J3DModel* body = (alink != nullptr && alink->mpLinkModel != nullptr &&
+                      midna_ptr_live(alink->mpLinkModel))
+                         ? alink->mpLinkModel
+                         : nullptr;
+    if (body == nullptr) mode = kMidnaModeNone;
+
+    J3DModel* skel = (mode != kMidnaModeNone) ? midna->mpShadowModel : nullptr;
+    if (skel != nullptr &&
+        (skel->getModelData() == nullptr || skel->getModelData()->getJointNum() != kMidnaJoints))
+    {
+
+        mode = kMidnaModeNone;
+    }
+
+    if (mode == kMidnaModeNone) {
+        if (g_midnaNoneToSend <= 0) return;
+        --g_midnaNoneToSend;
+        MidnaSnapshot gone{};
+        gone.magic = kMidnaSnapshotMagic;
+        gone.seq = ++g_midnaSeq;
+        gone.playerId = g_localId;
+        gone.mode = kMidnaModeNone;
+        send_midna_datagram(gone);
+        return;
+    }
+    g_midnaNoneToSend = kMidnaNoneRepeats;
+
+    MidnaSnapshot snap{};
+    snap.magic = kMidnaSnapshotMagic;
+    snap.seq = ++g_midnaSeq;
+    snap.playerId = g_localId;
+    snap.mode = mode;
+
+    const bool maskUp = !midna->checkStateFlg1(daMidna_c::FLG1_NO_MASK_DRAW);
+    const bool hairUp =
+        mode == kMidnaModeSolid
+            ? (midna->mpHairhandBmd != nullptr &&
+                  !midna->checkStateFlg1(static_cast<daMidna_c::daMidna_FLG1>(
+                      daMidna_c::FLG1_UNK_40 | daMidna_c::FLG1_UNK_10)))
+            : !midna->checkStateFlg1(daMidna_c::FLG1_UNK_40);
+    if (maskUp) snap.flags |= kMidnaFlagMask;
+    if (hairUp) snap.flags |= kMidnaFlagHairhand;
+
+    if (midna->field_0x668 != nullptr) snap.flags |= kMidnaFlagTevColor;
+    if ((daMidna_c::checkMidnaTired() || midna->checkForceTiredColor()) &&
+        !midna->checkForceNormalColor()) {
+        snap.flags |= kMidnaFlagTired;
+    }
+    snap.hairShape = local_midna_hair_shape(midna);
+    snap.leftHand = midna->mLeftHandShapeIdx == 0xFD ? 0xFE : midna->mLeftHandShapeIdx;
+    snap.rightHand = midna->mRightHandShapeIdx == 0xFD ? 0xFE : midna->mRightHandShapeIdx;
+    snap.baseScale = skel->getBaseScale()->x;
+
+    Mtx rel;
+    const bool riding =
+        alink->checkWolf() && !midna->checkStateFlg0(daMidna_c::FLG0_WOLF_NO_POS);
+    if (riding) {
+        Mtx invBody;
+        mDoMtx_inverse(body->getBaseTRMtx(), invBody);
+        mDoMtx_concat(invBody, skel->getBaseTRMtx(), rel);
+    } else {
+        mDoMtx_copy(skel->getBaseTRMtx(), rel);
+        snap.flags |= kMidnaFlagWorldBase;
+    }
+    fill_mtx12(snap.baseMtx, rel);
+
+    Mtx invBase;
+    mDoMtx_inverse(skel->getBaseTRMtx(), invBase);
+    if (midna->mpShadowHairhandBmd != nullptr) {
+        mDoMtx_concat(invBase, midna->mpShadowHairhandBmd->getBaseTRMtx(), rel);
+        fill_mtx12(snap.hairMtx, rel);
+    } else {
+        snap.flags &= ~kMidnaFlagHairhand;
+    }
+
+    for (int j = 0; j < kMidnaJoints; ++j) {
+        mDoMtx_concat(invBase, skel->getAnmMtx(j), rel);
+        MidnaJointSnapshot& out = snap.joints[j];
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) out.rot[r * 3 + c] = to_fixed_rot(rel[r][c]);
+            out.pos[r] = rel[r][3];
+        }
+    }
+
+    const GXColorS10& tc = midna->tevStr.TevColor;
+    snap.tevColor[0] = tc.r;
+    snap.tevColor[1] = tc.g;
+    snap.tevColor[2] = tc.b;
+    snap.tevColor[3] = tc.a;
+    snap.hairColor[0] = midna->field_0x6e0.r;
+    snap.hairColor[1] = midna->field_0x6e0.g;
+    snap.hairColor[2] = midna->field_0x6e0.b;
+    snap.hairColor[3] = midna->field_0x6e0.a;
+    snap.hairK1[0] = midna->field_0x6e8.r;
+    snap.hairK1[1] = midna->field_0x6e8.g;
+    snap.hairK1[2] = midna->field_0x6e8.b;
+    snap.hairK1[3] = midna->field_0x6e8.a;
+    snap.hairK2[0] = midna->field_0x6ec.r;
+    snap.hairK2[1] = midna->field_0x6ec.g;
+    snap.hairK2[2] = midna->field_0x6ec.b;
+    snap.hairK2[3] = midna->field_0x6ec.a;
+
+    send_midna_datagram(snap);
+}
+
+uint32_t g_horseSeq = 0;
+int g_horseNoneToSend = 0;
+
+void quat_from_mtx(const Mtx m, f32* q) {
+    const f32 tr = m[0][0] + m[1][1] + m[2][2];
+    if (tr > 0.0f) {
+        const f32 s = std::sqrt(tr + 1.0f) * 2.0f;
+        q[3] = 0.25f * s;
+        q[0] = (m[2][1] - m[1][2]) / s;
+        q[1] = (m[0][2] - m[2][0]) / s;
+        q[2] = (m[1][0] - m[0][1]) / s;
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        const f32 s = std::sqrt(1.0f + m[0][0] - m[1][1] - m[2][2]) * 2.0f;
+        q[3] = (m[2][1] - m[1][2]) / s;
+        q[0] = 0.25f * s;
+        q[1] = (m[0][1] + m[1][0]) / s;
+        q[2] = (m[0][2] + m[2][0]) / s;
+    } else if (m[1][1] > m[2][2]) {
+        const f32 s = std::sqrt(1.0f + m[1][1] - m[0][0] - m[2][2]) * 2.0f;
+        q[3] = (m[0][2] - m[2][0]) / s;
+        q[0] = (m[0][1] + m[1][0]) / s;
+        q[1] = 0.25f * s;
+        q[2] = (m[1][2] + m[2][1]) / s;
+    } else {
+        const f32 s = std::sqrt(1.0f + m[2][2] - m[0][0] - m[1][1]) * 2.0f;
+        q[3] = (m[1][0] - m[0][1]) / s;
+        q[0] = (m[0][2] + m[2][0]) / s;
+        q[1] = (m[1][2] + m[2][1]) / s;
+        q[2] = 0.25f * s;
+    }
+}
+
+int16_t to_fixed(f32 v, f32 scale) {
+    const f32 x = v * scale;
+    return static_cast<int16_t>(x > 32767.0f ? 32767.0f : (x < -32767.0f ? -32767.0f : x));
+}
+
+void send_horse_datagram(const HorseSnapshot& snap) {
+    global_send_horse(snap);
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (!g_links[i].used || !g_links[i].haveUdp) continue;
+        if (!worth_sending(g_localId, i, snap.seq)) continue;
+        udp_send(g_links[i].udpEndpoint,
+            {reinterpret_cast<const std::byte*>(&snap), sizeof(snap)});
+    }
+}
+
+void send_local_horse() {
+    if (!g_udp || g_localId == kCoopNoPlayer) return;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    auto* horse = static_cast<daHorse_c*>(dComIfGp_getHorseActor());
+    const bool riding = alink != nullptr && alink->checkHorseRide() != 0;
+    J3DModel* model = horse != nullptr ? horse->m_model : nullptr;
+
+    const bool hidden = horse != nullptr &&
+                        (horse->checkHorseCallWait() ||
+                            (horse->actor_status & fopAcStts_NODRAW_e) != 0);
+    const bool show = model != nullptr && model->getModelData() != nullptr && alink != nullptr &&
+                      !hidden && !coop_local_models_unsafe() && alink->mpLinkModel != nullptr;
+
+    if (!show) {
+        if (g_horseNoneToSend <= 0) return;
+        --g_horseNoneToSend;
+        HorseSnapshot none{};
+        none.magic = kHorseSnapshotMagic;
+        none.seq = ++g_horseSeq;
+        none.tick = coop_local_world_frames();
+        none.playerId = g_localId;
+        send_horse_datagram(none);
+        return;
+    }
+
+    const bool moving = riding || std::fabs(horse->speedF) > 0.5f;
+    const bool idle = !riding && !moving;
+
+    static s16 s_lastHorseYaw = 0;
+    const s16 yawStep = static_cast<s16>(horse->shape_angle.y - s_lastHorseYaw);
+    s_lastHorseYaw = horse->shape_angle.y;
+    const bool turning = yawStep > 0x40 || yawStep < -0x40;
+    const bool often = moving || turning;
+    if (!often && g_tickCounter % 10 != 0) return;
+
+    if (often && g_tickCounter % (send_every_n_ticks() * 2) != 0) return;
+    g_horseNoneToSend = 5;
+
+    HorseSnapshot snap{};
+    snap.magic = kHorseSnapshotMagic;
+    snap.seq = ++g_horseSeq;
+    snap.tick = coop_local_world_frames();
+    snap.playerId = g_localId;
+    snap.room = static_cast<int8_t>(fopAcM_GetRoomNo(horse));
+    MtxP base = model->getBaseTRMtx();
+    Mtx rel;
+    if (riding) {
+        Mtx invBody;
+        mDoMtx_inverse(alink->mpLinkModel->getBaseTRMtx(), invBody);
+        mDoMtx_concat(invBody, base, rel);
+        snap.flags |= kHorseFlagRiding;
+    } else {
+        mDoMtx_copy(base, rel);
+        if (idle) {
+            snap.flags |= kHorseFlagIdle;
+            const u16 anm = horse->getAnmIdx(0);
+
+            const bool own = anm < 0x100;
+            snap.idleAnm = own ? anm : 27;
+            snap.idleFrame = own ? horse->m_frameCtrl[0].getFrame() : 0.0f;
+            snap.idleRate = own ? horse->m_frameCtrl[0].getRate() : 1.0f;
+        }
+    }
+    fill_mtx12(snap.baseMtx, rel);
+
+    Mtx invBase;
+    mDoMtx_inverse(base, invBase);
+    J3DModelData* horseData = model->getModelData();
+    if (horseData == nullptr) return;
+    const u16 joints = horseData->getJointNum();
+    const int n = joints < kHorseJoints ? joints : kHorseJoints;
+    static bool s_loggedJoints = false;
+    if (!s_loggedJoints) {
+        s_loggedJoints = true;
+        coop_log::info("coop_mod: [HORSE] local horse joints={} datagram={}", joints,
+            kHorseJoints);
+    }
+    snap.jointCount = static_cast<uint8_t>(n);
+    for (int j = 0; j < n; ++j) {
+        Mtx m;
+        mDoMtx_concat(invBase, model->getAnmMtx(j), m);
+        f32 q[4];
+        quat_from_mtx(m, q);
+        HorseJointSnapshot& out = snap.joints[j];
+        for (int k = 0; k < 4; ++k) out.q[k] = to_fixed(q[k], kHorseQuatScale);
+        for (int r = 0; r < 3; ++r) out.p[r] = to_fixed(m[r][3], kHorsePosScale);
+    }
+
+    const int hand = riding ? alink->getReinHandType() : 0;
+    snap.reinHand = hand >= 0 && hand <= 3 ? static_cast<uint8_t>(hand) : kHorseReinHold;
+    snap.reinSteer = horse->field_0x1712;
+    send_horse_datagram(snap);
+}
+
+void run_pending_auto_connect() {
+    int64_t delayTicks = 600;
+    svc_config->get_int(mod_ctx, g_autoConnectDelayTicksVar, &delayTicks);
+    if (++g_autoConnectTicksWaited < static_cast<uint32_t>(delayTicks)) {
+        return;
+    }
+    g_autoConnectPending = false;
+
+    const std::string mode = cfg_string(g_modeVar, "host");
+    if (mode == "join") {
+        start_joining(cfg_string(g_joinAddressVar, "127.0.0.1:27716"));
+    } else if (mode == "join_code") {
+        start_joining_code(cfg_string(g_roomCodeVar, ""));
+    } else {
+        int64_t port = 27716;
+        svc_config->get_int(mod_ctx, g_bindPortVar, &port);
+        start_hosting(port);
+    }
+    coop_log::info("coop_mod: auto-connected as {} after {} ticks", mode, g_autoConnectTicksWaited);
+}
+
+}
+
+bool coop_net_connected() {
+
+    return g_peerConnected || (g_isHost && g_fakeMask != 0);
+}
+
+uint32_t coop_net_ticks_since_player(uint8_t playerId) {
+    if (playerId == g_localId) return 0;
+    if (playerId >= kCoopMaxPlayers) return 0xFFFFFFFFu;
+    return g_playerQuiet[playerId];
+}
+
+CoopNetTraffic coop_net_traffic() {
+    return g_traffic;
+}
+
+void coop_net_snapshot_counts(uint8_t playerId, uint32_t* in, uint32_t* stale, uint32_t* unknown) {
+    const bool ok = playerId < kCoopMaxPlayers;
+    if (in != nullptr) *in = ok ? g_snapIn[playerId] : 0;
+    if (stale != nullptr) *stale = ok ? g_snapStale[playerId] : 0;
+    if (unknown != nullptr) *unknown = g_snapUnknown;
+}
+
+bool coop_net_link_info(uint8_t playerId, CoopLinkInfo* out) {
+    if (playerId >= kCoopMaxPlayers || out == nullptr) return false;
+    const PeerLink& link = g_links[playerId];
+    if (!link.used) return false;
+    *out = CoopLinkInfo{};
+    out->udp = link.viaUdp;
+    if (link.viaUdp) {
+        out->rttMs = link.rel.smoothed_rtt_ms();
+        out->resends = link.rel.resends();
+        out->queuedBytes = link.rel.queued_bytes();
+    }
+    return true;
+}
+
+int32_t coop_net_ping_ms(uint8_t playerId) {
+    if (playerId >= kCoopMaxPlayers || !g_haveRttMs[playerId]) return -1;
+    return static_cast<int32_t>(g_rttMs[playerId]);
+}
+
+uint32_t coop_net_rtt_ticks(uint8_t playerId) {
+    if (playerId >= kCoopMaxPlayers) return 0;
+    return g_rttTicks[playerId];
+}
+
+void update_pings() {
+    ++g_pingTick;
+    if (!coop_net_connected() || g_localId == kCoopNoPlayer) return;
+    if (g_pingTick % 60 != 0) return;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (i == g_localId || !coop_net_player_present(static_cast<uint8_t>(i))) continue;
+        MsgPing msg{};
+        msg.token = (static_cast<uint32_t>(i) << 24) | (g_pingTick & 0x00FFFFFF);
+        g_pingToken[i] = msg.token;
+        g_pingSentTick[i] = g_pingTick;
+        g_pingSentAt[i] = std::chrono::steady_clock::now();
+        coop_net_send_to(static_cast<uint8_t>(i), kMsgPing, &msg, sizeof(msg));
+    }
+}
+
+uint32_t coop_ticks_since_world(uint8_t playerId) {
+    if (playerId >= kCoopMaxPlayers) return 0xFFFFFFFFu;
+    if (!g_playerWorldSeen[playerId]) return 0;
+    return g_playerWorldStill[playerId];
+}
+
+const uint32_t kWorldStallTicks = 20;
+
+bool g_localPausedSent = false;
+uint32_t g_pauseResendTicks = 0;
+
+bool coop_local_paused() {
+
+    return daAlink_getAlinkActorClass() != nullptr && dComIfGp_isPauseFlag() != 0;
+}
+
+void coop_net_set_player_paused(uint8_t playerId, bool paused) {
+    if (playerId >= kCoopMaxPlayers || playerId == g_localId) return;
+    if (g_playerPaused[playerId] != paused) {
+        coop_log::info("coop_mod: [PAUSE] player {} {}", playerId,
+            paused ? "opened a menu - handing over what they own" : "is back");
+    }
+    g_playerPaused[playerId] = paused;
+}
+
+bool coop_player_paused(uint8_t playerId) {
+    if (playerId >= kCoopMaxPlayers) return false;
+    if (playerId == g_localId) return coop_local_paused() || coop_world_stalled(playerId);
+    return g_playerPaused[playerId] || coop_world_stalled(playerId);
+}
+
+void announce_local_pause() {
+    if (!coop_net_connected() || g_localId == kCoopNoPlayer) {
+        g_localPausedSent = false;
+        return;
+    }
+    const bool paused = coop_local_paused();
+    const bool edge = paused != g_localPausedSent;
+    if (!edge && (!paused || ++g_pauseResendTicks < 60)) return;
+    g_pauseResendTicks = 0;
+    g_localPausedSent = paused;
+    MsgPause msg{};
+    msg.paused = paused ? 1 : 0;
+    coop_net_send(kMsgPause, &msg, sizeof(msg));
+    if (edge) {
+        coop_log::info("coop_mod: [PAUSE] local {}", paused ? "opened a menu - handing over"
+                                                          : "closed the menu");
+
+        if (!paused) enemies_on_local_unpause();
+    }
+}
+
+bool coop_world_stalled(uint8_t playerId) {
+    return coop_ticks_since_world(playerId) >= kWorldStallTicks;
+}
+
+bool coop_player_unheard(uint8_t playerId) {
+    if (playerId >= kCoopMaxPlayers || playerId == g_localId || g_playerPaused[playerId]) return false;
+    return coop_world_stalled(playerId) && g_tickCounter - g_playerSnapTick[playerId] > 60;
+}
+
+uint32_t coop_net_ticks_since_rx() {
+    return g_ticksSinceRx;
+}
+
+bool coop_net_connecting() {
+    return g_connecting;
+}
+
+uint8_t coop_net_local_id() {
+    return g_localId;
+}
+
+uint16_t coop_net_roster() {
+    return g_roster;
+}
+
+bool coop_net_player_present(uint8_t playerId) {
+    return playerId < kCoopMaxPlayers && ((g_roster | g_fakeMask) & (1u << playerId)) != 0;
+}
+
+bool coop_global_udp_open(int* port) {
+    if (g_peerConnected || g_connecting) return false;
+    if (!g_udp) {
+        mods::net::BindOutcome outcome;
+        g_udp = mods::net::open_datagram("udp://0.0.0.0:0", &outcome);
+        if (!g_udp) return false;
+        remember_udp_port(outcome.local);
+        coop_log::info("coop_mod: [GLOBAL] udp {}", outcome.local);
+    }
+    *port = g_udpPort;
+    return true;
+}
+
+void coop_global_udp_close() {
+    if (g_peerConnected || g_connecting) return;
+    g_udp.close();
+}
+
+void coop_accept_global_snapshot(uint8_t slot, const PlayerSnapshot& incoming) {
+    if (slot == 0 || slot >= kCoopMaxPlayers) return;
+    PlayerSnapshot snapshot = incoming;
+    snapshot.playerId = slot;
+    g_playerQuiet[slot] = 0;
+    if (!g_playerWorldSeen[slot] || g_playerWorldTick[slot] != snapshot.worldTick) {
+        g_playerWorldTick[slot] = snapshot.worldTick;
+        g_playerWorldSeen[slot] = true;
+        g_playerWorldStill[slot] = 0;
+    }
+    ++g_snapIn[slot];
+    g_playerSnapTick[slot] = g_tickCounter;
+    puppet_hook_on_network_snapshot(slot, snapshot.posX, snapshot.posY, snapshot.posZ,
+        snapshot.angleX, snapshot.angleY, snapshot.angleZ, snapshot.roomNo, snapshot.outfit,
+        snapshot.under, snapshot.upper, snapshot.handL, snapshot.handR, snapshot);
+}
+
+void coop_net_set_local_id(uint8_t playerId, uint8_t hostMaxPlayers) {
+    if (g_isHost) return;
+    if (playerId >= kCoopMaxPlayers) {
+
+        mods::log::error("coop_mod: host assigned us player {} but this build only supports {} - "
+                         "disconnecting", playerId, kCoopMaxPlayers);
+        coop_net_disconnect();
+        return;
+    }
+    g_localId = playerId;
+    coop_log::info("coop_mod: local player id {} of {}", playerId, hostMaxPlayers);
+}
+
+void coop_net_set_roster(uint16_t roster) {
+    if (g_isHost) return;
+    const uint16_t was = g_roster;
+    const uint16_t before2 = g_roster;
+    g_roster = static_cast<CoopRoster>(roster | (1u << kCoopHostId));
+    if (g_roster != before2) features_on_roster_changed();
+
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        const bool before = (was & (1u << i)) != 0;
+        const bool now = (g_roster & (1u << i)) != 0;
+        if (before && !now) puppet_hook_release_player(static_cast<uint8_t>(i));
+    }
+}
+
+bool coop_net_is_host() {
+    return g_isHost;
+}
+
+const char* coop_net_status() {
+
+    static std::string online;
+    if (!g_isHost && g_connecting && !g_peerConnected && online_active()) {
+        online = online_status();
+        if (!online.empty()) return online.c_str();
+    }
+    return g_statusText.c_str();
+}
+
+ConfigVarHandle coop_net_port_var() {
+    return g_bindPortVar;
+}
+
+ConfigVarHandle coop_net_address_var() {
+    return g_joinAddressVar;
+}
+
+ConfigVarHandle coop_net_join_port_var() {
+    return g_joinPortVar;
+}
+
+std::string coop_net_join_address() {
+    if (cfg_string(g_modeVar, "") == "join_code") {
+        return "room " + normalize_room_code(cfg_string(g_roomCodeVar, ""));
+    }
+    return cfg_string(g_joinAddressVar, "");
+}
+
+ConfigVarHandle coop_net_autoconnect_var() {
+    return g_autoConnectVar;
+}
+
+ConfigVarHandle coop_net_upnp_var() {
+    return g_upnpVar;
+}
+
+ConfigVarHandle coop_net_room_code_var() {
+    return g_roomCodeVar;
+}
+
+ConfigVarHandle coop_net_room_server_var() {
+    return g_roomServerVar;
+}
+
+ConfigVarHandle coop_net_rooms_var() {
+    return g_roomsVar;
+}
+
+ConfigVarHandle coop_net_host_key_var() {
+    return g_hostKeyVar;
+}
+
+std::string normalize_room_code(const std::string& typed) {
+    std::string code;
+    for (const char c : typed) {
+        if (c >= 'a' && c <= 'z') code += static_cast<char>(c - 'a' + 'A');
+        else if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) code += c;
+    }
+    return code;
+}
+
+void coop_net_join_code() {
+    if (g_peerConnected || g_connecting) return;
+    svc_config->set_string(mod_ctx, g_modeVar, "join_code");
+    g_autoConnectPending = false;
+    start_joining_code(cfg_string(g_roomCodeVar, ""));
+}
+
+void coop_udp_send_raw(const std::string& endpoint, const void* data, size_t size) {
+    if (!g_udp) return;
+    udp_send_plain(endpoint, {static_cast<const std::byte*>(data), size});
+}
+
+void coop_online_punched(const std::string& endpoint, uint64_t token, const uint8_t* key) {
+    if (g_isHost || g_peerConnected) return;
+    const uint64_t now = steady_ms();
+    PeerLink& link = g_links[kCoopHostId];
+    link = PeerLink{};
+    link.used = true;
+    link.viaUdp = true;
+    link.udpEndpoint = endpoint;
+    link.haveUdp = true;
+    link.token = token;
+    if (key != nullptr) {
+        link.sealed = true;
+        std::memcpy(link.key, key, sizeof(link.key));
+        link.keyId = static_cast<uint32_t>(token);
+    }
+    link.createdMs = now;
+
+    uint32_t conn = 0;
+    for (uint32_t salt = 0; conn == 0; ++salt) {
+        conn = static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+               static_cast<uint32_t>(token) ^ static_cast<uint32_t>(token >> 32) ^ salt;
+    }
+    link.rel.start(conn, now);
+    g_statusText = "Found the host. Connecting...";
+}
+
+void coop_online_failed(const std::string& why, const std::string& upnpFallback) {
+    if (g_isHost || g_peerConnected) return;
+    if (!upnpFallback.empty()) {
+
+        coop_log::info("coop_mod: room punch failed, trying host address {}",
+            upnpFallback);
+
+        online_stop();
+        if (start_joining(upnpFallback) == MOD_OK) {
+            g_statusText = "Trying the host's address directly...";
+            return;
+        }
+    }
+    g_udp.close();
+    for (int i = 0; i < kCoopMaxPlayers; ++i) g_links[i] = PeerLink{};
+    g_connecting = false;
+    g_localId = kCoopHostId;
+    g_statusText = why;
+}
+
+void coop_net_host() {
+    if (g_peerConnected || g_connecting) return;
+    int64_t port = 27716;
+    svc_config->get_int(mod_ctx, g_bindPortVar, &port);
+
+    svc_config->set_string(mod_ctx, g_modeVar, "host");
+    g_autoConnectPending = false;
+    start_hosting(port);
+}
+
+void coop_net_join() {
+    if (g_peerConnected || g_connecting) return;
+    svc_config->set_string(mod_ctx, g_modeVar, "join");
+    g_autoConnectPending = false;
+    g_sessionCode.clear();
+    start_joining(cfg_string(g_joinAddressVar, "127.0.0.1:27716"));
+}
+
+void coop_net_disconnect() {
+
+    g_migr = Migration{};
+    g_rejoinIsMigration = false;
+    g_sessionCode.clear();
+    disconnect_quietly();
+}
+
+bool coop_net_migrating() {
+    return g_rejoinIsMigration;
+}
+
+ConfigVarHandle coop_net_migrate_var() {
+    return g_migrateVar;
+}
+
+namespace {
+
+void disconnect_quietly() {
+    upnp_release();
+    online_stop();
+    for (int i = 0; i < kCoopMaxPlayers; ++i) send_bye(g_links[i]);
+    const bool wasConnected = g_peerConnected;
+    g_peerConnected = false;
+    g_connecting = false;
+    g_autoConnectPending = false;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (g_links[i].used) puppet_hook_release_player(static_cast<uint8_t>(i));
+        g_links[i].sock.close();
+        g_links[i] = PeerLink{};
+    }
+    g_localId = kCoopHostId;
+    g_roster = 1u << kCoopHostId;
+    g_listener.close();
+    g_udp.close();
+    g_statusText = "Not connected";
+    if (wasConnected) features_on_disconnected();
+    puppet_hook_request_release();
+    coop_log::info("coop_mod: disconnected");
+}
+}
+
+void coop_net_send(uint8_t type, const void* payload, size_t size) {
+    if (size > kCoopMaxMessagePayload) return;
+    const bool local = stage_local_message(type);
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (local && !worth_sending(g_localId, i, 0)) continue;
+        send_frame_to(g_links[i], type, g_localId, payload, size);
+    }
+}
+
+void coop_net_send_to(uint8_t playerId, uint8_t type, const void* payload, size_t size) {
+    if (playerId >= kCoopMaxPlayers || size > kCoopMaxMessagePayload) return;
+
+    PeerLink& link = g_isHost ? g_links[playerId] : g_links[kCoopHostId];
+    send_frame_to(link, type, g_localId, payload, size);
+}
+
+void coop_debug_spawn_puppet() {
+    puppet_hook_trigger_spawn();
+}
+
+void coop_debug_force_transform() {
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == nullptr) {
+        coop_log::info("coop_mod: transform requested without player actor");
+        return;
+    }
+
+    if (alink->mEquipItem == dItemNo_IRONBALL_e) {
+        coop_log::info("coop_mod: transform refused, Ball and Chain out");
+        return;
+    }
+    const u16 before = alink->mProcID;
+    const bool wasWolf = alink->checkWolf();
+    alink->procCoMetamorphoseInit();
+    coop_log::info("coop_mod: transform requested: wasWolf={} proc {} -> {}",
+        static_cast<int>(wasWolf), before, alink->mProcID);
+}
+
+void coop_debug_give_midna() {
+    dComIfGs_onEventBit(dSv_event_flag_c::M_067);
+    dComIfGs_onEventBit(0xD04);
+
+    dComIfGs_onTransformLV(3);
+    coop_log::info("coop_mod: [DEBUG] Midna flags set");
+}
+
+extern "C" {
+
+MOD_EXPORT ModResult mod_initialize(ModError*) {
+    ConfigVarDesc modeDesc = CONFIG_VAR_DESC_INIT;
+    modeDesc.name = "mode";
+    modeDesc.type = CONFIG_VAR_STRING;
+    modeDesc.default_string = "host";
+    svc_config->register_var(mod_ctx, &modeDesc, &g_modeVar);
+
+    ConfigVarDesc portDesc = CONFIG_VAR_DESC_INIT;
+    portDesc.name = "bind_port";
+    portDesc.type = CONFIG_VAR_INT;
+    portDesc.default_int = 27716;
+    svc_config->register_var(mod_ctx, &portDesc, &g_bindPortVar);
+
+    ConfigVarDesc joinDesc = CONFIG_VAR_DESC_INIT;
+    joinDesc.name = "join_address";
+    joinDesc.type = CONFIG_VAR_STRING;
+
+    joinDesc.default_string = "127.0.0.1";
+    svc_config->register_var(mod_ctx, &joinDesc, &g_joinAddressVar);
+
+    ConfigVarDesc joinPortDesc = CONFIG_VAR_DESC_INIT;
+    joinPortDesc.name = "join_port";
+    joinPortDesc.type = CONFIG_VAR_INT;
+    joinPortDesc.default_int = 27716;
+    svc_config->register_var(mod_ctx, &joinPortDesc, &g_joinPortVar);
+
+    ConfigVarDesc upnpDesc = CONFIG_VAR_DESC_INIT;
+    upnpDesc.name = "open_port_automatically";
+    upnpDesc.type = CONFIG_VAR_BOOL;
+    upnpDesc.default_bool = true;
+    svc_config->register_var(mod_ctx, &upnpDesc, &g_upnpVar);
+
+    ConfigVarDesc migrateDesc = CONFIG_VAR_DESC_INIT;
+    migrateDesc.name = "keep_playing_if_host_leaves";
+    migrateDesc.type = CONFIG_VAR_BOOL;
+    migrateDesc.default_bool = true;
+    svc_config->register_var(mod_ctx, &migrateDesc, &g_migrateVar);
+
+    ConfigVarDesc roomCodeDesc = CONFIG_VAR_DESC_INIT;
+    roomCodeDesc.name = "room_code";
+    roomCodeDesc.type = CONFIG_VAR_STRING;
+    roomCodeDesc.default_string = "";
+    svc_config->register_var(mod_ctx, &roomCodeDesc, &g_roomCodeVar);
+
+    ConfigVarDesc roomServerDesc = CONFIG_VAR_DESC_INIT;
+    roomServerDesc.name = "room_server";
+    roomServerDesc.type = CONFIG_VAR_STRING;
+    roomServerDesc.default_string = "";
+    svc_config->register_var(mod_ctx, &roomServerDesc, &g_roomServerVar);
+
+    ConfigVarDesc fakeDesc = CONFIG_VAR_DESC_INIT;
+    fakeDesc.name = "debug_fake_players";
+    fakeDesc.type = CONFIG_VAR_INT;
+    fakeDesc.default_int = 0;
+    svc_config->register_var(mod_ctx, &fakeDesc, &g_fakePlayersVar);
+
+    ConfigVarDesc hostKeyDesc = CONFIG_VAR_DESC_INIT;
+    hostKeyDesc.name = "room_host_key";
+    hostKeyDesc.type = CONFIG_VAR_STRING;
+    hostKeyDesc.default_string = "";
+    svc_config->register_var(mod_ctx, &hostKeyDesc, &g_hostKeyVar);
+
+    ConfigVarDesc roomsDesc = CONFIG_VAR_DESC_INIT;
+    roomsDesc.name = "room_codes";
+    roomsDesc.type = CONFIG_VAR_BOOL;
+    roomsDesc.default_bool = true;
+    svc_config->register_var(mod_ctx, &roomsDesc, &g_roomsVar);
+
+    ConfigVarDesc autoDesc = CONFIG_VAR_DESC_INIT;
+    autoDesc.name = "auto_connect";
+    autoDesc.type = CONFIG_VAR_BOOL;
+    autoDesc.default_bool = false;
+    svc_config->register_var(mod_ctx, &autoDesc, &g_autoConnectVar);
+
+    ConfigVarDesc autoDelayDesc = CONFIG_VAR_DESC_INIT;
+    autoDelayDesc.name = "auto_connect_delay_ticks";
+    autoDelayDesc.type = CONFIG_VAR_INT;
+    autoDelayDesc.default_int = 600;
+    svc_config->register_var(mod_ctx, &autoDelayDesc, &g_autoConnectDelayTicksVar);
+
+    bool autoConnect = false;
+    svc_config->get_bool(mod_ctx, g_autoConnectVar, &autoConnect);
+    if (autoConnect) {
+        g_autoConnectPending = true;
+        g_autoConnectTicksWaited = 0;
+        coop_log::info("coop_mod: auto_connect requested, deferring connect");
+    }
+
+    report_register_vars();
+    global_register_vars();
+    chat_register_vars();
+    voice_init();
+    report_init();
+    crash_guard_init();
+    features_register_vars();
+    features_init();
+    skins_init();
+    voices_init();
+    game_mode_init();
+    puppet_register_vars();
+    horses_init();
+    ui_init();
+    puppet_hook_init();
+    ganon_init();
+    sumo_init();
+    rival_init();
+    skipvote_init();
+    skills_init();
+    rando_init();
+    checks_init();
+    map_markers_init();
+    selftest_init();
+    drops_init();
+
+    return MOD_OK;
+}
+
+bool poll_net_event(mods::net::Event& out) {
+    static NetEvent raw;
+    out = {};
+    if (svc_net == nullptr) return false;
+    raw = NET_EVENT_INIT;
+    if (svc_net->poll_event(mod_ctx, &raw) != MOD_OK || raw.type == NET_EVENT_NONE) return false;
+    raw.endpoint.text[sizeof(raw.endpoint.text) - 1] = '\0';
+    out.type = raw.type;
+    out.handle = raw.handle;
+    out.userData = raw.user_data;
+    out.accepted = raw.accepted;
+    out.endpoint = raw.endpoint.text;
+    if (raw.data != nullptr && raw.size != 0) {
+        out.data = {static_cast<const std::byte*>(raw.data), raw.size};
+    }
+    out.dropped = raw.dropped;
+    out.error = raw.error;
+    out.message = raw.error_message != nullptr ? raw.error_message : "";
+    return true;
+}
+
+void update_backup_route(int i, bool expect) {
+    if (!coop_net_connected()) return;
+    g_expectTicks[i] = expect ? g_expectTicks[i] + 1 : 0;
+    bool want = g_wantStream[i];
+    if (!expect) {
+        want = false;
+    } else if (!want) {
+        want = g_expectTicks[i] > kStarvedTicks && g_tickCounter - g_udpSnapTick[i] > kStarvedTicks;
+    } else {
+        want = g_tickCounter - g_udpSnapTick[i] > 30;
+    }
+    const bool refresh = want && g_tickCounter - g_wantSentTick[i] > 300;
+    if (want == g_wantStream[i] && !refresh) return;
+    if (want != g_wantStream[i]) {
+        uint32_t in = 0, stale = 0, unknown = 0;
+        coop_net_snapshot_counts(static_cast<uint8_t>(i), &in, &stale, &unknown);
+        coop_log::warn("coop_mod: [NET] {} player {} by UDP: {} (udp in={} old={} unknownAddr={} link={})", want ? "no positions from" : "positions back from", i,
+                       want ? "asking for the backup route" : "backup route off", in, stale, unknown,
+                       g_links[g_isHost ? i : kCoopHostId].viaUdp ? "room code" : "direct");
+    }
+    g_wantStream[i] = want;
+    g_wantSentTick[i] = g_tickCounter;
+    MsgSnapWant w{};
+    w.target = static_cast<uint8_t>(i);
+    w.want = want ? 1 : 0;
+    coop_net_send_to(static_cast<uint8_t>(i), kMsgSnapWant, &w, sizeof(w));
+}
+
+MOD_EXPORT ModResult mod_update(ModError*) {
+    features_leave_after_state_load();
+    if (g_autoConnectPending) {
+        run_pending_auto_connect();
+    }
+
+    if (g_ticksSinceRx < 0xFFFFFFFFu) ++g_ticksSinceRx;
+
+    const char* hereStage = dComIfGp_getStartStageName();
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (g_playerQuiet[i] < 0xFFFFFFFFu) ++g_playerQuiet[i];
+        bool expectSnapshots = true;
+        if (i != g_localId) {
+            const CoopPeer& them = features_peer_of(static_cast<uint8_t>(i));
+            expectSnapshots = them.present && them.inGame && hereStage != nullptr &&
+                              them.stage[0] != 0 &&
+                              std::strncmp(them.stage, hereStage, 8) == 0;
+        }
+        if (i != g_localId) update_backup_route(i, expectSnapshots);
+        if (!expectSnapshots) {
+            g_playerWorldStill[i] = 0;
+            continue;
+        }
+        if (g_playerWorldStill[i] < 0xFFFFFFFFu) ++g_playerWorldStill[i];
+    }
+
+    {
+        const uint32_t mine = coop_local_world_frames();
+        const uint8_t me = g_localId;
+        if (me < kCoopMaxPlayers) {
+            if (!g_playerWorldSeen[me] || g_playerWorldTick[me] != mine) {
+                g_playerWorldTick[me] = mine;
+                g_playerWorldSeen[me] = true;
+                g_playerWorldStill[me] = 0;
+            }
+        }
+    }
+
+    coop_stage("net");
+    mods::net::Event event;
+    while (poll_net_event(event)) {
+        if (event.handle == g_udp.handle()) {
+            handle_udp_event(event);
+        } else if (upnp_owns(event.handle)) {
+            upnp_on_net_event(event);
+        } else {
+            handle_tcp_event(event);
+        }
+    }
+
+    upnp_update();
+    online_update();
+    migration_update();
+    coop_stage("global");
+    global_update();
+    coop_stage("chat");
+    chat_update();
+    coop_stage("voice");
+    voice_update();
+    coop_stage("ui");
+    ui_update();
+    update_pings();
+    announce_local_pause();
+    coop_stage("features");
+    features_update();
+    coop_stage("report");
+    report_update();
+    report_hint_update();
+
+    coop_stage("rando");
+    rando_update();
+    checks_update();
+    selftest_update();
+
+    coop_stage("send");
+    send_local_snapshot();
+    send_local_midna();
+    send_local_horse();
+
+    flush_udp_links();
+    coop_stage("");
+
+    return MOD_OK;
+}
+
+MOD_EXPORT ModResult mod_shutdown(ModError*) {
+    global_shutdown();
+    voice_shutdown();
+    chat_keys_block(false);
+    online_stop();
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        send_bye(g_links[i]);
+        g_links[i].sock.close();
+    }
+    g_listener.close();
+    g_udp.close();
+    coop_log::info("coop_mod shut down");
+    return MOD_OK;
+}
+}
+
+uint32_t coop_udp_reopen_count() {
+    return g_udpReopens;
+}

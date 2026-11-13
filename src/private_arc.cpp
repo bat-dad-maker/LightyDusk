@@ -1,0 +1,419 @@
+
+
+#include "mod.hpp"
+#include "models.hpp"
+#include "print.hpp"
+
+#include "d/d_resorce.h"
+#include "d/d_com_inf_game.h"
+#include "m_Do/m_Do_dvd_thread.h"
+#include "m_Do/m_Do_ext.h"
+#include "JSystem/JKernel/JKRArchive.h"
+#include "JSystem/JKernel/JKRExpHeap.h"
+#include "JSystem/JKernel/JKRMemArchive.h"
+
+#include <algorithm>
+#include <chrono>
+#include "JSystem/JKernel/JKRSolidHeap.h"
+#include "JSystem/J3DGraphAnimator/J3DModelData.h"
+#include "JSystem/J3DGraphLoader/J3DAnmLoader.h"
+
+#include <cstring>
+
+namespace {
+
+const int kMaxPrivateArcs = 12;
+
+struct PrivateArc {
+    char name[16] = {};
+    mDoDvdThd_mountArchive_c* job = nullptr;
+    JKRArchive* archive = nullptr;
+    int users = 0;
+    bool failed = false;
+    std::chrono::steady_clock::time_point failedAt{};
+};
+
+const auto kArcRetryAfter = std::chrono::seconds(3);
+
+void mark_failed(PrivateArc& a) {
+    a.failed = true;
+    a.failedAt = std::chrono::steady_clock::now();
+}
+
+PrivateArc s_arcs[kMaxPrivateArcs];
+
+JKRExpHeap* s_arcHeap = nullptr;
+const u32 kArcHeapWanted = 40u * 1024u * 1024u;
+const u32 kArcHeapMin = 8u * 1024u * 1024u;
+
+std::chrono::steady_clock::time_point s_arcHeapNextTry{};
+bool s_arcHeapLowLogged = false;
+
+JKRHeap* arc_heap() {
+    if (s_arcHeap != nullptr) return s_arcHeap;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < s_arcHeapNextTry) return nullptr;
+    s_arcHeapNextTry = now + std::chrono::seconds(5);
+    JKRHeap* root = JKRHeap::getRootHeap();
+    if (root == nullptr) return nullptr;
+    const u32 rootFree = root->getFreeSize();
+
+    u32 size = 0;
+    for (u32 reserve : {32u * 1024u * 1024u, 16u * 1024u * 1024u}) {
+        if (rootFree <= reserve) continue;
+        size = std::min(kArcHeapWanted, rootFree - reserve);
+        if (size >= kArcHeapMin) break;
+        size = 0;
+    }
+
+    JKRHeap* parent = root;
+    if (size < kArcHeapMin) {
+        JKRHeap* game = mDoExt_getGameHeap();
+        const u32 gameFree = game != nullptr ? game->getFreeSize() : 0;
+        const u32 kGameReserve = 40u * 1024u * 1024u;
+        if (gameFree > kGameReserve + kArcHeapMin) {
+            size = std::min(24u * 1024u * 1024u, gameFree - kGameReserve);
+            parent = game;
+        }
+    }
+    if (size < kArcHeapMin) {
+        if (!s_arcHeapLowLogged) {
+            s_arcHeapLowLogged = true;
+            coop_log::warn("coop_mod: [ARC] root heap low ({} KB), using game archive heap", rootFree / 1024);
+        }
+        return nullptr;
+    }
+    s_arcHeap = JKRExpHeap::create(size, parent, false);
+    if (s_arcHeap != nullptr) {
+        s_arcHeap->setName("CoopArcHeap");
+        coop_log::info("coop_mod: [ARC] {} MB reserved for peer archives from {} heap ({} KB free in root)", size >> 20,
+            parent == root ? "root" : "game", rootFree / 1024);
+    }
+    return s_arcHeap;
+}
+
+void unmount(PrivateArc& a) {
+    if (a.job != nullptr) {
+        if (!a.job->sync()) return;
+        a.archive = static_cast<JKRArchive*>(a.job->getArchive());
+        a.job->destroy();
+        a.job = nullptr;
+    }
+    if (a.archive != nullptr) {
+        a.archive->unmount();
+        coop_log::info("coop_mod: [ARC] unmounted private '{}'", a.name);
+    }
+    a = PrivateArc{};
+}
+
+PrivateArc* free_slot() {
+    for (PrivateArc& a : s_arcs) {
+        if (a.name[0] == '\0') return &a;
+    }
+    for (PrivateArc& a : s_arcs) {
+        if (a.users == 0 && a.job == nullptr) {
+            unmount(a);
+            return &a;
+        }
+    }
+    return nullptr;
+}
+
+void make_room() {
+    JKRHeap* heap = arc_heap();
+    if (heap == nullptr) return;
+    for (PrivateArc& a : s_arcs) {
+        if (heap->getFreeSize() > 4u * 1024u * 1024u) return;
+        if (a.name[0] != '\0' && a.users == 0 && a.job == nullptr) unmount(a);
+    }
+}
+
+PrivateArc* find_arc(const char* name) {
+    for (PrivateArc& a : s_arcs) {
+        if (a.name[0] != '\0' && std::strcmp(a.name, name) == 0) return &a;
+    }
+    return nullptr;
+}
+
+u32 node_type_for_index(JKRArchive* archive, u32 index) {
+    for (int i = 0; i < archive->countDirectory(); ++i) {
+        const JKRArchive::SDIDirEntry& dir = archive->mNodes[i];
+        if (index >= dir.first_file_index &&
+            index < dir.first_file_index + dir.num_entries) {
+            return dir.type;
+        }
+    }
+    return 0;
+}
+
+}
+
+namespace {
+J3DModelData* private_arc_build(JKRArchive* archive, const char* name, u32 index, void* raw);
+}
+
+JKRHeap* private_arc_heap_peek() {
+    return s_arcHeap;
+}
+
+JKRHeap* private_arc_heap() {
+    return arc_heap();
+}
+
+bool private_arc_request(const char* name) {
+    if (name == nullptr || name[0] == '\0') return false;
+    int keepUsers = 0;
+    PrivateArc* slot = find_arc(name);
+    if (slot != nullptr) {
+        if (!slot->failed) {
+            ++slot->users;
+            return true;
+        }
+
+        if (slot->job != nullptr ||
+            std::chrono::steady_clock::now() - slot->failedAt < kArcRetryAfter) {
+            return false;
+        }
+
+        keepUsers = slot->users;
+        make_room();
+    } else {
+        make_room();
+        slot = free_slot();
+    }
+    if (slot == nullptr) {
+        coop_log::warn("coop_mod: [ARC] no free slot for a private mount of '{}'", name);
+        return false;
+    }
+
+    if (JKRHeap* heap = arc_heap(); heap != nullptr && heap->getFreeSize() < 4u * 1024u * 1024u) {
+        static int s_mapFullLogged = 0;
+        if (s_mapFullLogged++ % 60 == 0) {
+            coop_log::warn("coop_mod: [ARC] mount '{}' deferred, {} KB left", name,
+                heap->getFreeSize() / 1024);
+        }
+        if (slot != nullptr && slot->failed) slot->failedAt = std::chrono::steady_clock::now();
+        return false;
+    }
+    PrivateArc& a = *slot;
+    a = PrivateArc{};
+    std::strncpy(a.name, name, sizeof(a.name) - 1);
+    a.name[sizeof(a.name) - 1] = '\0';
+    a.users = keepUsers + 1;
+    char path[64];
+    std::snprintf(path, sizeof(path), "/res/Object/%s.arc", a.name);
+
+    a.job = mDoDvdThd_mountArchive_c::create(path, mDoDvd_MOUNT_DIRECTION_HEAD, arc_heap());
+    if (a.job == nullptr) {
+        mark_failed(a);
+        a.users = keepUsers;
+        coop_log::warn("coop_mod: [ARC] could not start a private mount of '{}'", a.name);
+        return false;
+    }
+    coop_log::info("coop_mod: [ARC] mounting private '{}'", a.name);
+    return true;
+}
+
+int private_arc_poll(const char* name) {
+    PrivateArc* a = find_arc(name);
+    if (a == nullptr) return -1;
+    if (a->failed) return -1;
+    if (a->job != nullptr) {
+
+        if (!a->job->sync()) return 0;
+        a->archive = static_cast<JKRArchive*>(a->job->getArchive());
+        a->job->destroy();
+        a->job = nullptr;
+        if (a->archive == nullptr) {
+            mark_failed(*a);
+            coop_log::warn("coop_mod: [ARC] private mount of '{}' produced no archive", a->name);
+            return -1;
+        }
+        coop_log::info("coop_mod: [ARC] '{}' private, {} files", a->name,
+            static_cast<int>(a->archive->countFile()));
+    }
+    return a->archive != nullptr ? 1 : -1;
+}
+
+void private_arc_release(const char* name) {
+    PrivateArc* a = find_arc(name);
+    if (a == nullptr) return;
+    if (a->users > 0) --a->users;
+    if (a->users > 0) return;
+
+}
+
+J3DModelData* private_arc_load_idx(const char* name, u32 index) {
+    PrivateArc* a = find_arc(name);
+    if (a == nullptr || a->archive == nullptr) return nullptr;
+    JKRArchive* archive = a->archive;
+    void* raw = archive->getIdxResource(index);
+    if (raw == nullptr) return nullptr;
+    return private_arc_build(archive, name, index, raw);
+}
+
+const char* private_arc_file_name(const char* name, u32 index) {
+    PrivateArc* a = find_arc(name);
+    if (a == nullptr || a->archive == nullptr) return nullptr;
+    JKRArchive* archive = a->archive;
+    if (index >= archive->countFile() || archive->mStringTable == nullptr) return nullptr;
+    return archive->mStringTable + archive->mFiles[index].getNameOffset();
+}
+
+J3DModelData* private_arc_load(const char* name, const char* file) {
+    PrivateArc* a = find_arc(name);
+    if (a == nullptr || a->archive == nullptr || file == nullptr) return nullptr;
+    JKRArchive* archive = a->archive;
+    JKRArchive::SDIFileEntry* entry = archive->findNameResource(file);
+    if (entry == nullptr) {
+        coop_log::warn("coop_mod: [ARC] '{}' has no '{}'", name, file);
+        return nullptr;
+    }
+    const u32 index = static_cast<u32>(entry - archive->mFiles);
+    void* raw = archive->getIdxResource(index);
+    if (raw == nullptr) return nullptr;
+    return private_arc_build(archive, name, index, raw);
+}
+
+void* private_arc_load_anm_idx(const char* name, uint32_t index) {
+    PrivateArc* a = find_arc(name);
+    if (a == nullptr || a->archive == nullptr) return nullptr;
+    JKRArchive* archive = a->archive;
+    if (index >= archive->countFile() || !archive->isFileEntry(index)) return nullptr;
+    void* raw = archive->getIdxResource(index);
+    if (raw == nullptr) return nullptr;
+    const u32 size = archive->getExpandedResSize(raw);
+    JKRHeap* heap = arc_heap();
+    if (size < 32 || size > 1024u * 1024u || heap == nullptr ||
+        heap->getFreeSize() < size * 2u + 2u * 1024u * 1024u) {
+        return nullptr;
+    }
+    JKRHeap* previous = heap->becomeCurrentHeap();
+    u8* copy = JKR_NEW_ARRAY_ARGS(u8, size, 32);
+    void* anm = nullptr;
+    if (copy != nullptr) {
+        std::memcpy(copy, raw, size);
+        anm = J3DAnmLoaderDataBase::load(copy);
+    }
+    if (previous != nullptr) previous->becomeCurrentHeap();
+    return anm;
+}
+
+void* private_arc_load_anm(const char* name, const char* file) {
+    PrivateArc* a = find_arc(name);
+    if (a == nullptr || a->archive == nullptr || file == nullptr) return nullptr;
+    JKRArchive* archive = a->archive;
+    JKRArchive::SDIFileEntry* entry = archive->findNameResource(file);
+    if (entry == nullptr) {
+        coop_log::warn("coop_mod: [ARC] '{}' has no '{}'", name, file);
+        return nullptr;
+    }
+    void* raw = archive->getIdxResource(static_cast<u32>(entry - archive->mFiles));
+    if (raw == nullptr) return nullptr;
+    const u32 size = archive->getExpandedResSize(raw);
+    JKRHeap* heap = arc_heap();
+    if (size < 32 || size > 1024u * 1024u || heap == nullptr ||
+        heap->getFreeSize() < size * 2u + 2u * 1024u * 1024u) {
+        return nullptr;
+    }
+    JKRHeap* previous = heap->becomeCurrentHeap();
+    u8* copy = JKR_NEW_ARRAY_ARGS(u8, size, 32);
+    void* anm = nullptr;
+    if (copy != nullptr) {
+        std::memcpy(copy, raw, size);
+        anm = J3DAnmLoaderDataBase::load(copy);
+    }
+    if (previous != nullptr) previous->becomeCurrentHeap();
+    return anm;
+}
+
+namespace {
+
+struct PartHeap {
+    J3DModelData* data = nullptr;
+    JKRSolidHeap* heap = nullptr;
+};
+const int kPartHeapMax = 512;
+PartHeap s_partHeaps[kPartHeapMax];
+
+bool remember_part_heap(J3DModelData* data, JKRSolidHeap* heap) {
+    for (PartHeap& p : s_partHeaps) {
+        if (p.data != nullptr) continue;
+        p.data = data;
+        p.heap = heap;
+        return true;
+    }
+    return false;
+}
+
+J3DModelData* private_arc_build(JKRArchive* archive, const char* name, u32 index, void* raw) {
+    const u32 size = archive->getExpandedResSize(raw);
+    if (size < 32 || size > 16u * 1024u * 1024u) {
+        coop_log::warn("coop_mod: [ARC] '{}' idx {} has an implausible size {}", name, index, size);
+        return nullptr;
+    }
+    const u32 type = node_type_for_index(archive, index);
+    if (type != 'BMDR' && type != 'BMWR' && type != 'BMDE' && type != 'BMWE' && type != 'BMDV') {
+        coop_log::warn("coop_mod: [ARC] '{}' idx {} is not a model node ({:#x})", name, index, type);
+        return nullptr;
+    }
+
+    JKRHeap* parent = arc_heap();
+    if (parent == nullptr) return nullptr;
+
+    const u32 want = size * 4u + 1024u * 1024u;
+    const u32 kMountReserve = 2u * 1024u * 1024u;
+    if (parent->getFreeSize() < want + kMountReserve) {
+        static int s_noRoomLogged = 0;
+        if (s_noRoomLogged++ < 8) {
+            coop_log::warn("coop_mod: [ARC] no room for '{}' idx={} ({} KB wanted, {} KB free), using game part", name, index, want / 1024,
+                parent->getFreeSize() / 1024);
+        }
+        return nullptr;
+    }
+    JKRSolidHeap* heap = JKRSolidHeap::create(want, parent, false);
+    if (heap == nullptr) return nullptr;
+    JKRHeap* previous = heap->becomeCurrentHeap();
+    u8* copy = JKR_NEW_ARRAY_ARGS(u8, size, 32);
+    J3DModelData* data = nullptr;
+    if (copy != nullptr) {
+        std::memcpy(copy, raw, size);
+        data = dRes_info_c::loaderBasicBmd(type, copy);
+    }
+    if (data == nullptr) {
+        if (previous != nullptr) previous->becomeCurrentHeap();
+        heap->destroy();
+        return nullptr;
+    }
+    if (type == 'BMWR' || type == 'BMWE') {
+
+        dRes_info_c::offWarpMaterial(data);
+        data->simpleCalcMaterial(const_cast<MtxP>(j3dDefaultMtx));
+        data->makeSharedDL();
+    }
+
+    if (previous != nullptr) previous->becomeCurrentHeap();
+    heap->adjustSize();
+    if (!remember_part_heap(data, heap)) {
+
+        coop_log::warn("coop_mod: [ARC] {} parts loading, deferred '{}' idx={}",
+            kPartHeapMax, name, index);
+        heap->destroy();
+        return nullptr;
+    }
+    return data;
+}
+}
+
+void private_arc_free_data(J3DModelData* data) {
+    if (data == nullptr) return;
+    for (PartHeap& p : s_partHeaps) {
+        if (p.data != data) continue;
+
+        p.heap->destroy();
+        p = PartHeap{};
+        return;
+    }
+
+    JKR_DELETE_ARRAY(reinterpret_cast<u8*>(data));
+}

@@ -1,0 +1,2894 @@
+
+
+#include "mod.hpp"
+#include "net/messages.hpp"
+
+#include "mods/service.hpp"
+#include "mods/svc/config.h"
+#include "mods/svc/log.hpp"
+#include "print.hpp"
+
+#include "d/actor/d_a_alink.h"
+#include "d/d_com_inf_game.h"
+#include "d/d_save.h"
+#include "d/actor/d_a_obj_drop.h"
+#include "d/actor/d_a_obj_smallkey.h"
+#include "d/actor/d_a_tbox.h"
+#include "d/actor/d_a_tbox2.h"
+#include "d/d_tresure.h"
+#include "d/d_bg_w.h"
+#include "d/d_stage.h"
+#include "d/d_kankyo.h"
+#include "d/d_shop_system.h"
+#include "d/actor/d_a_bg_obj.h"
+#include "d/actor/d_a_grass.h"
+#include "d/actor/d_a_suspend.h"
+#include "d/d_s_room.h"
+#include "f_op/f_op_scene_mng.h"
+#include "f_pc/f_pc_create_iter.h"
+#include "f_pc/f_pc_create_req.h"
+#include "f_pc/f_pc_create_tag.h"
+#include "f_pc/f_pc_manager.h"
+#include "f_op/f_op_actor_iter.h"
+#include "mods/service.hpp"
+#include "mods/svc/hook.hpp"
+#include "mods/svc/save.h"
+#include "f_op/f_op_actor_mng.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdio>
+#include <cstring>
+#include <iterator>
+#include <string>
+
+DEFINE_HOOK(&daTbox_c::actionOpenWait, TboxOpenWaitHook);
+
+DEFINE_HOOK_SYMBOL("src/d/d_s_play.cpp#phase_1", int(void*), StoryStageLoadHook);
+
+DEFINE_HOOK(&dShopSystem_c::setSoldOut, ShopSoldOutHook);
+
+extern const SaveService* svc_save;
+
+namespace {
+
+ConfigVarHandle s_dungeonVar = 0;
+ConfigVarHandle s_storyVar = 0;
+
+const int kMemSize = 0x20;
+const int kKeyOffset = 0x1C;
+const int kDanOffset = 0x04;
+const int kDanSize = 0x18;
+const int kZoneBitSize = 0x0E;
+const int kZoneActorSize = 0x10;
+const int kEventSize = 256;
+const int16_t kProcTbox = 0x0FB;
+
+const int16_t kProcObjDrop = 0x21F;
+const int16_t kProcSmallKey = 0x219;
+const int kRooms = 64;
+const int kZones = 32;
+
+enum WorldRegion : uint8_t {
+    kRegionMemory = 0,
+    kRegionDan = 1,
+    kRegionZone = 2,
+    kRegionEvent = 3,
+    kRegionKeys = 4,
+    kRegionZoneActor = 5,
+
+    kRegionTmp = 6,
+
+    kRegionVisited = 7,
+
+    kRegionLightDrop = 8,
+
+    kRegionCollect = 9,
+
+    kRegionStatusB = 10,
+};
+
+const int kStatusBSize = 2;
+
+const int kCollectSize = 16;
+const int kCollectPohIndex = 12;
+
+const int kLightDropSize = 8;
+const int kLightDropCounts = 4;
+
+const int kMaps = 64;
+const int kVisitedSize = 8;
+
+struct VisitedBaseline {
+    bool have = false;
+    uint8_t maps[kMaps][kVisitedSize] = {};
+};
+VisitedBaseline s_visited;
+
+struct LightDropBaseline {
+    bool have = false;
+    uint8_t bytes[kLightDropSize] = {};
+};
+LightDropBaseline s_lightDrop;
+
+void lift_light_drop_baseline(int i, int by) {
+    if (!s_lightDrop.have || by <= 0) return;
+    const int v = s_lightDrop.bytes[i] + by;
+    s_lightDrop.bytes[i] = static_cast<uint8_t>(v > 255 ? 255 : v);
+}
+struct CollectBaseline {
+    bool have = false;
+    uint8_t bytes[kCollectSize] = {};
+};
+CollectBaseline s_collect;
+struct StatusBBaseline {
+    bool have = false;
+    uint8_t bytes[kStatusBSize] = {};
+};
+StatusBBaseline s_statusB;
+
+bool s_visitedShareDue = false;
+
+int s_storyDiffFor = 0;
+bool s_storyWarned = false;
+const int kStoryWarnDigests = 12;
+
+struct Baseline {
+    bool have = false;
+    char stage[8] = {};
+    int saveNo = -1;
+    uint8_t mem[kMemSize] = {};
+    bool haveDan = false;
+    int8_t danStage = -1;
+    uint8_t dan[kDanSize] = {};
+    bool haveZone[kRooms] = {};
+    uint8_t zone[kRooms][kZoneBitSize] = {};
+    uint8_t zoneActor[kRooms][kZoneActorSize] = {};
+    bool haveEvent = false;
+    uint8_t event[kEventSize] = {};
+    bool haveTmp = false;
+    uint8_t tmp[kEventSize] = {};
+};
+Baseline s_base;
+uint32_t s_tick = 0;
+
+bool s_askedRoom[kRooms] = {};
+bool s_askedStage = false;
+
+ConfigVarHandle s_selfTestVar = 0;
+uint32_t s_selfTestTicks = 0;
+bool s_selfTestDone = false;
+
+const int kSelfTestSwitch = 0x3F;
+const int kSelfTestZoneSwitch = 0x1F;
+
+static_assert(sizeof(dSv_memBit_c) == kMemSize, "dSv_memBit_c size moved - kMemSize is a memcpy length");
+static_assert(sizeof(dSv_zoneBit_c) == kZoneBitSize, "dSv_zoneBit_c size moved - kZoneBitSize is a memcpy length");
+static_assert(sizeof(dSv_zoneActor_c) == kZoneActorSize, "dSv_zoneActor_c size moved - kZoneActorSize is a memcpy length");
+
+bool current_stage(char out[8], int& saveNo) {
+    if (daAlink_getAlinkActorClass() == nullptr) return false;
+    const char* name = dComIfGp_getStartStageName();
+    stage_stag_info_class* info = dComIfGp_getStageStagInfo();
+    if (name == nullptr || info == nullptr) return false;
+    saveNo = dStage_stagInfo_GetSaveTbl(info);
+    if (saveNo < 0 || saveNo >= dSv_save_c::STAGE_MAX) return false;
+    std::memset(out, 0, 8);
+    std::strncpy(out, name, 8);
+    return true;
+}
+
+uint8_t* mem_bytes(dSv_memory_c& memory) {
+    return reinterpret_cast<uint8_t*>(&memory.getBit());
+}
+
+struct LocalSwitch {
+    int8_t room;
+    uint8_t sw;
+};
+const int kLocalSwitchMax = 48;
+LocalSwitch s_localSw[kLocalSwitchMax];
+int s_localSwCount = 0;
+
+void add_local_switch(int8_t room, int sw) {
+    if (sw < 0 || sw >= 0xF0 || s_localSwCount >= kLocalSwitchMax) return;
+    for (int i = 0; i < s_localSwCount; ++i) {
+        if (s_localSw[i].sw == sw && s_localSw[i].room == room) return;
+    }
+    s_localSw[s_localSwCount++] = {room, static_cast<uint8_t>(sw)};
+}
+
+void* collect_local_switch(void* proc, void*) {
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr || !fopAcM_IsActor(actor)) return nullptr;
+    const s16 name = fopAcM_GetName(actor);
+    const int8_t room = static_cast<int8_t>(fopAcM_GetRoomNo(actor));
+    const u32 param = fopAcM_GetParam(actor);
+    if (name == fpcNm_SWC00_e) {
+        const int type = (actor->shape_angle.x & 0xF00) >> 8;
+        if ((type == 0 || type == 4) && (param & 0xFF) != 0xFF) add_local_switch(room, param & 0xFF);
+    } else if (name == fpcNm_E_YMB_e) {
+        add_local_switch(room, 5);
+    } else if (name == fpcNm_Tag_Mist_e) {
+        const int top = param & 0xFF;
+        const int count = (param >> 16) & 0xFF;
+        for (int i = 0; i < count && top + i < 0xFF; ++i) add_local_switch(room, top + i);
+    } else if (name == fpcNm_Tag_Spinner_e) {
+        if ((param & 0xFF) != 0xFF) add_local_switch(room, param & 0xFF);
+    } else if (name == fpcNm_Obj_Swpropeller_e) {
+
+        if ((param & 0xFF) != 0xFF) add_local_switch(room, param & 0xFF);
+    }
+    return nullptr;
+}
+
+void refresh_local_switches() {
+    s_localSwCount = 0;
+    fpcM_Search(collect_local_switch, nullptr);
+}
+
+bool dungeon_stage(const char* stage);
+
+const int kMemSwitchFirst = 0x08;
+const int kMemSwitchEnd = 0x18;
+
+bool overworld_switch_byte(const char* stage, int byte) {
+    if (coop_session(kSessStory, cfg_bool(s_storyVar, false))) return false;
+    return byte >= kMemSwitchFirst && byte < kMemSwitchEnd && !dungeon_stage(stage);
+}
+
+const int kKakarikoSlot = 3;
+const int kBombHouseGoneSw = 65;
+int bomb_house_byte() { return 0x08 + 4 * (kBombHouseGoneSw >> 5) + (3 - ((kBombHouseGoneSw & 31) >> 3)); }
+uint8_t bomb_house_bit() { return static_cast<uint8_t>(1 << (kBombHouseGoneSw & 7)); }
+bool in_kakariko_slot() {
+    stage_stag_info_class* info = dComIfGp_getStageStagInfo();
+    return info != nullptr && dStage_stagInfo_GetSaveTbl(info) == kKakarikoSlot;
+}
+
+uint8_t mem_local_mask(const char* stage, int byte) {
+    if (overworld_switch_byte(stage, byte)) return 0xFF;
+    uint8_t mask = 0;
+    if (byte == bomb_house_byte() && in_kakariko_slot()) mask |= bomb_house_bit();
+    for (int i = 0; i < s_localSwCount; ++i) {
+        const int sw = s_localSw[i].sw;
+        if (sw >= 0x80) continue;
+        if (byte == 0x08 + 4 * (sw >> 5) + (3 - ((sw & 31) >> 3))) mask |= static_cast<uint8_t>(1 << (sw & 7));
+    }
+    return mask;
+}
+
+uint8_t dan_local_mask(int byte) {
+    uint8_t mask = 0;
+    for (int i = 0; i < s_localSwCount; ++i) {
+        const int sw = s_localSw[i].sw - 0x80;
+        if (sw < 0 || sw >= 0x40) continue;
+        if (byte == 4 * (sw >> 5) + ((sw & 31) >> 3)) mask |= static_cast<uint8_t>(1 << (sw & 7));
+    }
+    return mask;
+}
+
+uint8_t zone_local_mask(int room, int byte) {
+    uint8_t mask = 0;
+    for (int i = 0; i < s_localSwCount; ++i) {
+        if (s_localSw[i].room != room) continue;
+        const int sw = s_localSw[i].sw;
+        int at = -1;
+        int bit = 0;
+        if (sw >= 0xC0 && sw < 0xE0) {
+            const int n = sw - 0xC0;
+            at = 2 * (n >> 4) + (1 - ((n & 15) >> 3));
+            bit = n & 7;
+        } else if (sw >= 0xE0 && sw < 0xF0) {
+            const int n = sw - 0xE0;
+            at = 0x04 + (1 - (n >> 3));
+            bit = n & 7;
+        }
+        if (byte == at) mask |= static_cast<uint8_t>(1 << bit);
+    }
+    return mask;
+}
+
+template <typename Mask>
+void keep_local_bits(uint8_t* bytes, const uint8_t* before, int size, Mask mask_of) {
+    for (int b = 0; b < size; ++b) {
+        const uint8_t m = mask_of(b);
+        if (m != 0) bytes[b] = static_cast<uint8_t>((bytes[b] & ~m) | (before[b] & m));
+    }
+}
+
+void keep_bomb_house(int saveNo, uint8_t* mem, const uint8_t* before) {
+    if (saveNo != kKakarikoSlot) return;
+    const int byte = bomb_house_byte();
+    mem[byte] = static_cast<uint8_t>((mem[byte] & ~bomb_house_bit()) | (before[byte] & bomb_house_bit()));
+}
+
+void keep_mem_local(const char* stage, uint8_t* mem, const uint8_t* before) {
+    keep_local_bits(mem, before, kMemSize, [stage](int b) { return mem_local_mask(stage, b); });
+}
+
+void keep_dan_local(uint8_t* dan, const uint8_t* before) {
+    keep_local_bits(dan, before, kDanSize, [](int b) { return dan_local_mask(b); });
+}
+
+void keep_zone_local(int room, uint8_t* zone, const uint8_t* before) {
+    keep_local_bits(zone, before, kZoneBitSize, [room](int b) { return zone_local_mask(room, b); });
+}
+
+uint32_t hash_bytes(const uint8_t* data, int size, int skipByte);
+
+uint32_t memory_hash(const char* stage, const uint8_t* mem) {
+    uint8_t copy[kMemSize];
+    std::memcpy(copy, mem, kMemSize);
+    for (int b = 0; b < kMemSize; ++b) copy[b] = static_cast<uint8_t>(copy[b] & ~mem_local_mask(stage, b));
+    return hash_bytes(copy, kMemSize, kKeyOffset);
+}
+
+uint32_t dan_hash(const uint8_t* dan) {
+    uint8_t copy[kDanSize];
+    std::memcpy(copy, dan, kDanSize);
+    for (int b = 0; b < kDanSize; ++b) copy[b] = static_cast<uint8_t>(copy[b] & ~dan_local_mask(b));
+    return hash_bytes(copy, kDanSize, -1);
+}
+
+uint32_t zone_hash(int room, const uint8_t* zone) {
+    uint8_t copy[kZoneBitSize];
+    std::memcpy(copy, zone, kZoneBitSize);
+    for (int b = 0; b < kZoneBitSize; ++b) copy[b] = static_cast<uint8_t>(copy[b] & ~zone_local_mask(room, b));
+    return hash_bytes(copy, kZoneBitSize, -1);
+}
+
+void send_delta(const Baseline& b, WorldRegion region, int8_t room, int offset, int size,
+    const uint8_t* set, const uint8_t* clr) {
+    MsgWorldDelta msg{};
+    std::memcpy(msg.stage, b.stage, 8);
+    msg.saveNo = static_cast<int8_t>(b.saveNo);
+    msg.region = region;
+    msg.room = room;
+    msg.offset = static_cast<uint8_t>(offset);
+    msg.size = static_cast<uint8_t>(size);
+    std::memcpy(msg.set, set, size);
+    std::memcpy(msg.clr, clr, size);
+    coop_net_send(kMsgWorldDelta, &msg, sizeof(msg));
+}
+
+void send_sync_request(const char stage[8], int saveNo, int room) {
+    MsgWorldSyncRequest req{};
+    std::memcpy(req.stage, stage, 8);
+    req.saveNo = static_cast<int8_t>(saveNo);
+    req.room = static_cast<int8_t>(room);
+    coop_net_send(kMsgWorldSyncRequest, &req, sizeof(req));
+    coop_log::info("coop_mod: [WORLD] requesting {:.8s} {}", stage,
+        room < 0 ? "stage memory" : "room bits");
+}
+
+void send_full(const char stage[8], int saveNo, WorldRegion region, int room, const uint8_t* data,
+    int size) {
+    MsgWorldFull msg{};
+    std::memcpy(msg.stage, stage, 8);
+    msg.saveNo = static_cast<int8_t>(saveNo);
+    msg.region = region;
+    msg.room = static_cast<int8_t>(room);
+    msg.size = static_cast<uint8_t>(size);
+    std::memcpy(msg.data, data, size);
+    coop_net_send(kMsgWorldFull, &msg, sizeof(msg));
+}
+
+void keep_private(uint8_t* bytes, const uint8_t* before, uint8_t (*mask_of)(int)) {
+    for (int b = 0; b < kEventSize; ++b) {
+        const uint8_t mask = mask_of(b);
+        if (mask != 0) bytes[b] = static_cast<uint8_t>((bytes[b] & ~mask) | (before[b] & mask));
+    }
+}
+
+const uint16_t kTmpPrivateFlags[] = {
+    0x0004, 0x0002, 0x0001, 0x0180, 0x0140,
+    0x0508, 0x0504, 0x0502, 0x0501, 0x0680,
+    0x0908,
+    0x0E10,
+};
+
+uint8_t tmp_private(int byte) {
+    static uint8_t mask[kEventSize] = {};
+    static bool built = false;
+    if (!built) {
+        for (uint16_t flag : kTmpPrivateFlags) mask[flag >> 8] |= static_cast<uint8_t>(flag);
+        built = true;
+    }
+    return static_cast<uint8_t>(mask[byte] | skills_tmp_private(byte));
+}
+
+void keep_private_tmp(uint8_t* tmp, const uint8_t* before) {
+    keep_private(tmp, before, tmp_private);
+}
+
+const uint16_t kStoryPrivateFlags[] = {
+    0x1D01,
+    0x1B20, 0x1B10,
+    0x1F80, 0x1F40, 0x1F20, 0x1F10,
+    0x5220, 0x5210, 0x5208, 0x5204,
+    0x2640, 0x2620, 0x2610, 0x2608, 0x2604, 0x2602, 0x2601, 0x2780, 0x2740, 0x2720,
+    0x2F04,
+    0x3920,
+    0x6110,
+    0x3801, 0x3980,
+    0x1D40,
+    0x0902, 0x0B80, 0x4501,
+    0x1201,
+    0x1540,
+    0x1510,
+    0x2520,
+    0x3002,
+    0x3E20, 0x4508, 0x4504,
+    0x4004,
+    0x4710,
+    0x5C04, 0x5D08, 0x5D04, 0x5D02,
+    0x6140,
+};
+const int kStoryRegistersFrom = 0xF1;
+
+enum StoryPolicy : uint8_t { kStoryShare, kStoryLocal, kStoryLayer };
+struct StoryFlagInfo {
+    uint16_t flag;
+    StoryPolicy policy;
+    const char* name;
+};
+const StoryFlagInfo kStoryFlags[] = {
+#include "story_flags.inc"
+};
+const int kStoryFlagCount = static_cast<int>(sizeof(kStoryFlags) / sizeof(kStoryFlags[0]));
+
+const StoryFlagInfo* story_flag_info(uint16_t flag) {
+    int lo = 0;
+    int hi = kStoryFlagCount - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) / 2;
+        if (kStoryFlags[mid].flag == flag) return &kStoryFlags[mid];
+        if (kStoryFlags[mid].flag < flag) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return nullptr;
+}
+
+struct StoryCompanion {
+    uint16_t flag;
+    uint16_t with;
+};
+const StoryCompanion kStoryCompanions[] = {
+#include "story_companions.inc"
+};
+
+const char* story_flag_name(uint16_t flag) {
+    const StoryFlagInfo* info = story_flag_info(flag);
+    return info != nullptr ? info->name : "?";
+}
+
+uint8_t story_private(int byte) {
+    static uint8_t mask[kEventSize] = {};
+    static bool built = false;
+    if (!built) {
+        for (uint16_t flag : kStoryPrivateFlags) mask[flag >> 8] |= static_cast<uint8_t>(flag);
+        for (const StoryFlagInfo& f : kStoryFlags) {
+            if (f.policy == kStoryLocal) mask[f.flag >> 8] |= static_cast<uint8_t>(f.flag);
+        }
+        for (int b = kStoryRegistersFrom; b < kEventSize; ++b) mask[b] = 0xFF;
+        built = true;
+    }
+    return static_cast<uint8_t>(mask[byte] | skills_event_private(byte));
+}
+
+void keep_private_event(uint8_t* ev, const uint8_t* before) {
+    keep_private(ev, before, story_private);
+}
+
+uint32_t hash_bytes(const uint8_t* data, int size, int skipByte);
+
+uint32_t hash_shared(const uint8_t* bytes, uint8_t (*mask_of)(int)) {
+    uint8_t copy[kEventSize];
+    std::memcpy(copy, bytes, kEventSize);
+    for (int b = 0; b < kEventSize; ++b) copy[b] = static_cast<uint8_t>(copy[b] & ~mask_of(b));
+    return hash_bytes(copy, kEventSize, -1);
+}
+
+uint8_t s_storyPending[kEventSize] = {};
+int s_storyPendingBits = 0;
+
+int bit_count(uint8_t v) {
+    int n = 0;
+    for (; v != 0; v = static_cast<uint8_t>(v & (v - 1))) ++n;
+    return n;
+}
+
+int story_hold(dSv_info_c* info, const uint8_t* set, int offset, int size) {
+    const uint8_t* have = info->getSavedata().getEvent().mEvent;
+    int added = 0;
+    for (int i = 0; i < size; ++i) {
+        const int b = offset + i;
+        if (b < 0 || b >= kEventSize) continue;
+        const uint8_t fresh =
+            static_cast<uint8_t>(set[i] & ~story_private(b) & ~have[b] & ~s_storyPending[b]);
+        if (fresh == 0) continue;
+        s_storyPending[b] = static_cast<uint8_t>(s_storyPending[b] | fresh);
+        added += bit_count(fresh);
+
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((fresh & (1u << bit)) != 0) {
+                const uint16_t flag = static_cast<uint16_t>((b << 8) | (1u << bit));
+                coop_log::info("coop_mod: [STORY] waiting to take flag {:#06x} {}", flag, story_flag_name(flag));
+            }
+        }
+    }
+    s_storyPendingBits += added;
+    return added;
+}
+
+uint32_t story_hash(dSv_info_c* info) {
+    uint8_t ev[kEventSize];
+    const uint8_t* cur = info->getSavedata().getEvent().mEvent;
+    for (int b = 0; b < kEventSize; ++b) ev[b] = static_cast<uint8_t>(cur[b] | s_storyPending[b]);
+    return hash_shared(ev, story_private);
+}
+
+void diff_story(uint8_t* cur, uint8_t* base) {
+    for (int start = 0; start < kEventSize; start += 32) {
+        uint8_t set[32] = {};
+        const uint8_t clr[32] = {};
+        bool any = false;
+        for (int i = 0; i < 32; ++i) {
+            set[i] = static_cast<uint8_t>(cur[start + i] & ~base[start + i]);
+            if (set[i] != 0) any = true;
+        }
+        if (any) send_delta(s_base, kRegionEvent, -1, start, 32, set, clr);
+    }
+    std::memcpy(base, cur, kEventSize);
+}
+
+void diff_region(WorldRegion region, int8_t room, uint8_t* cur, uint8_t* base, int size,
+    int skipByte = -1) {
+    for (int start = 0; start < size; start += 32) {
+        const int n = (size - start) < 32 ? (size - start) : 32;
+        uint8_t set[32] = {};
+        uint8_t clr[32] = {};
+        bool any = false;
+        for (int i = 0; i < n; ++i) {
+            if (start + i == skipByte) continue;
+            set[i] = static_cast<uint8_t>(cur[start + i] & ~base[start + i]);
+            clr[i] = static_cast<uint8_t>(base[start + i] & ~cur[start + i]);
+            if (set[i] != 0 || clr[i] != 0) any = true;
+        }
+        if (any) send_delta(s_base, region, room, start, n, set, clr);
+    }
+    for (int i = 0; i < size; ++i) {
+        if (i != skipByte) base[i] = cur[i];
+    }
+}
+
+void take_baseline(dSv_info_c* info, const char stage[8], int saveNo) {
+    s_base = Baseline{};
+    refresh_local_switches();
+    for (int i = 0; i < kRooms; ++i) s_askedRoom[i] = false;
+    s_askedStage = false;
+    s_base.have = true;
+    std::memcpy(s_base.stage, stage, 8);
+    s_base.saveNo = saveNo;
+    std::memcpy(s_base.mem, mem_bytes(info->getMemory()), kMemSize);
+    dSv_danBit_c& dan = info->getDan();
+    if (dan.mStageNo == saveNo) {
+        s_base.haveDan = true;
+        s_base.danStage = dan.mStageNo;
+        std::memcpy(s_base.dan, reinterpret_cast<uint8_t*>(&dan) + kDanOffset, kDanSize);
+    }
+    for (int i = 0; i < kZones; ++i) {
+        dSv_zone_c& zone = info->getZone(i);
+        const int room = zone.getRoomNo();
+        if (room < 0 || room >= kRooms) continue;
+        s_base.haveZone[room] = true;
+        std::memcpy(s_base.zone[room], &zone.getBit(), kZoneBitSize);
+        std::memcpy(s_base.zoneActor[room], &zone.getActor(), kZoneActorSize);
+    }
+    s_base.haveEvent = true;
+    std::memcpy(s_base.event, info->getSavedata().getEvent().mEvent, kEventSize);
+    s_base.haveTmp = true;
+    std::memcpy(s_base.tmp, info->getTmp().mEvent, kEventSize);
+}
+
+bool peer_on_stage(const char stage[8]) {
+
+    return features_any_peer_on_stage(stage);
+}
+
+void request_new_regions(dSv_info_c* info, const char stage[8], int saveNo) {
+    if (!peer_on_stage(stage)) {
+
+        s_askedStage = false;
+        for (int i = 0; i < kRooms; ++i) s_askedRoom[i] = false;
+        return;
+    }
+    if (!s_askedStage) {
+        s_askedStage = true;
+
+        if (!coop_net_is_host()) send_sync_request(stage, saveNo, -1);
+    }
+    for (int i = 0; i < kZones; ++i) {
+        const int room = info->getZone(i).getRoomNo();
+        if (room < 0 || room >= kRooms || s_askedRoom[room]) continue;
+        s_askedRoom[room] = true;
+
+        send_sync_request(stage, saveNo, room);
+    }
+}
+
+void diff_visited(dSv_info_c* info) {
+    dSv_save_c& save = info->getSavedata();
+    if (!s_visited.have) {
+        s_visited.have = true;
+        int shared = 0;
+        for (int m = 0; m < kMaps; ++m) {
+            auto* cur = reinterpret_cast<uint8_t*>(save.getSave2(m));
+            std::memcpy(s_visited.maps[m], cur, kVisitedSize);
+            if (!s_visitedShareDue) continue;
+            bool any = false;
+            for (int i = 0; i < kVisitedSize; ++i) {
+                if (cur[i] != 0) { any = true; break; }
+            }
+            if (!any) continue;
+            uint8_t set[32] = {};
+            uint8_t clr[32] = {};
+            std::memcpy(set, cur, kVisitedSize);
+            send_delta(s_base, kRegionVisited, static_cast<int8_t>(m), 0, kVisitedSize, set, clr);
+            ++shared;
+        }
+        if (s_visitedShareDue) {
+            s_visitedShareDue = false;
+            coop_log::info("coop_mod: [WORLD] shared {} explored maps",
+                shared);
+        }
+        return;
+    }
+    for (int m = 0; m < kMaps; ++m) {
+        auto* cur = reinterpret_cast<uint8_t*>(save.getSave2(m));
+        uint8_t set[32] = {};
+        uint8_t clr[32] = {};
+        bool any = false;
+        for (int i = 0; i < kVisitedSize; ++i) {
+            set[i] = static_cast<uint8_t>(cur[i] & ~s_visited.maps[m][i]);
+
+            if (set[i] != 0) any = true;
+        }
+        if (any) {
+            send_delta(s_base, kRegionVisited, static_cast<int8_t>(m), 0, kVisitedSize, set, clr);
+        }
+        std::memcpy(s_visited.maps[m], cur, kVisitedSize);
+    }
+}
+
+void diff_light_drop(dSv_info_c* info) {
+    auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getLightDrop());
+    if (!s_lightDrop.have) {
+        s_lightDrop.have = true;
+        std::memcpy(s_lightDrop.bytes, cur, kLightDropSize);
+        return;
+    }
+    if (std::memcmp(cur, s_lightDrop.bytes, kLightDropSize) == 0) return;
+    uint8_t set[32] = {};
+    uint8_t clr[32] = {};
+
+    set[4] = cur[4];
+    send_delta(s_base, kRegionLightDrop, -1, 0, kLightDropSize, set, clr);
+    std::memcpy(s_lightDrop.bytes, cur, kLightDropSize);
+    coop_log::info("coop_mod: [WORLD] tears {}/{}/{}/{} flags={:#04x}",
+        cur[0], cur[1], cur[2], cur[3], cur[4]);
+}
+
+bool collect_item_only(int i) {
+    if (i == kCollectPohIndex) return true;
+
+    return rando_active() && (i == COLLECT_SWORD || i == 9   || i == 10  );
+}
+
+void diff_collect(dSv_info_c* info) {
+    auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getCollect());
+    if (!s_collect.have) {
+        s_collect.have = true;
+        std::memcpy(s_collect.bytes, cur, kCollectSize);
+        return;
+    }
+    if (std::memcmp(cur, s_collect.bytes, kCollectSize) == 0) return;
+    uint8_t set[32] = {};
+    uint8_t clr[32] = {};
+    std::memcpy(set, cur, kCollectSize);
+    send_delta(s_base, kRegionCollect, -1, 0, kCollectSize, set, clr);
+    std::memcpy(s_collect.bytes, cur, kCollectSize);
+    coop_log::info("coop_mod: [WORLD] collectibles changed (poe souls {})",
+        cur[kCollectPohIndex]);
+}
+
+uint8_t* status_b_flags(dSv_info_c* info) {
+    return &info->getSavedata().getPlayer().mPlayerStatusB.mTransformLevelFlag;
+}
+
+uint8_t s_statusBPending[kStatusBSize] = {};
+
+void hold_status_b(dSv_info_c* info, const uint8_t* set) {
+    const uint8_t* cur = status_b_flags(info);
+    bool any = false;
+    for (int i = 0; i < kStatusBSize; ++i) {
+        const uint8_t fresh = static_cast<uint8_t>(set[i] & ~cur[i] & ~s_statusBPending[i]);
+        if (fresh == 0) continue;
+        s_statusBPending[i] = static_cast<uint8_t>(s_statusBPending[i] | fresh);
+        any = true;
+    }
+    if (any) {
+        coop_log::info("coop_mod: [WORLD] transform/twilight flags {:#04x}/{:#04x} (remote), deferred to stage load", s_statusBPending[0],
+            s_statusBPending[1]);
+    }
+}
+
+void diff_status_b(dSv_info_c* info) {
+    uint8_t* cur = status_b_flags(info);
+    if (!s_statusB.have) {
+        s_statusB.have = true;
+        std::memcpy(s_statusB.bytes, cur, kStatusBSize);
+        return;
+    }
+    uint8_t set[32] = {};
+    uint8_t clr[32] = {};
+    bool any = false;
+    for (int i = 0; i < kStatusBSize; ++i) {
+        set[i] = static_cast<uint8_t>(cur[i] & ~s_statusB.bytes[i]);
+        if (set[i] != 0) any = true;
+    }
+    if (any) {
+        send_delta(s_base, kRegionStatusB, -1, 0, kStatusBSize, set, clr);
+        coop_log::info("coop_mod: [WORLD] transform/twilight flags {:#04x}/{:#04x}",
+            cur[0], cur[1]);
+    }
+    std::memcpy(s_statusB.bytes, cur, kStatusBSize);
+}
+
+bool local_mid_sequence() {
+    return dComIfGp_event_runCheck() != 0;
+}
+
+bool dungeon_stage(const char* stage) {
+    return stage != nullptr && stage[0] == 'D' && stage[1] == '_';
+}
+
+struct HeldWorldMsg {
+    uint8_t type;
+    uint8_t from;
+    uint16_t size;
+    uint8_t bytes[sizeof(MsgWorldFull) > sizeof(MsgWorldDelta) ? sizeof(MsgWorldFull)
+                                                                : sizeof(MsgWorldDelta)];
+};
+const int kHeldWorldMax = 512;
+HeldWorldMsg* s_heldWorld = nullptr;
+int s_heldWorldCount = 0;
+bool s_replayingWorld = false;
+
+uint32_t s_heldSequenceTicks = 0;
+
+void scan() {
+
+    if (local_mid_sequence()) {
+        if (s_heldSequenceTicks == 0) {
+            coop_log::info("coop_mod: [WORLD] holding world state during local sequence");
+        }
+        ++s_heldSequenceTicks;
+        return;
+    }
+    if (s_heldSequenceTicks != 0) {
+        coop_log::info("coop_mod: [WORLD] sequence over after {} ticks, publishing", s_heldSequenceTicks);
+        s_heldSequenceTicks = 0;
+    }
+    char stage[8];
+    int saveNo = -1;
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr || !current_stage(stage, saveNo)) {
+        s_base.have = false;
+        return;
+    }
+    if (!s_base.have || std::memcmp(stage, s_base.stage, 8) != 0 || saveNo != s_base.saveNo) {
+
+        take_baseline(info, stage, saveNo);
+        return;
+    }
+    const bool dungeon = coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true));
+    const bool story = coop_session(kSessStory, cfg_bool(s_storyVar, false));
+    refresh_local_switches();
+    if (dungeon) request_new_regions(info, stage, saveNo);
+
+    uint8_t* mem = mem_bytes(info->getMemory());
+    if (dungeon) {
+        if (mem[kKeyOffset] != s_base.mem[kKeyOffset]) {
+            uint8_t value[1] = {mem[kKeyOffset]};
+            uint8_t zero[1] = {0};
+            send_delta(s_base, kRegionKeys, -1, 0, 1, value, zero);
+            coop_log::info("coop_mod: [WORLD] small keys now {}", mem[kKeyOffset]);
+        }
+
+        keep_mem_local(stage, s_base.mem, mem);
+        diff_region(kRegionMemory, -1, mem, s_base.mem, kMemSize, kKeyOffset);
+    }
+    s_base.mem[kKeyOffset] = mem[kKeyOffset];
+    if (!dungeon) std::memcpy(s_base.mem, mem, kMemSize);
+
+    dSv_danBit_c& dan = info->getDan();
+    uint8_t* danBytes = reinterpret_cast<uint8_t*>(&dan) + kDanOffset;
+    if (dan.mStageNo != saveNo) {
+        s_base.haveDan = false;
+    } else if (!s_base.haveDan || s_base.danStage != dan.mStageNo || !dungeon) {
+        s_base.haveDan = true;
+        s_base.danStage = dan.mStageNo;
+        std::memcpy(s_base.dan, danBytes, kDanSize);
+    } else {
+        keep_dan_local(s_base.dan, danBytes);
+        diff_region(kRegionDan, -1, danBytes, s_base.dan, kDanSize);
+    }
+
+    bool seen[kRooms] = {};
+    for (int i = 0; i < kZones; ++i) {
+        dSv_zone_c& zone = info->getZone(i);
+        const int room = zone.getRoomNo();
+        if (room < 0 || room >= kRooms) continue;
+        seen[room] = true;
+        uint8_t* bits = reinterpret_cast<uint8_t*>(&zone.getBit());
+        uint8_t* actorBits = reinterpret_cast<uint8_t*>(&zone.getActor());
+        if (!s_base.haveZone[room] || !dungeon) {
+            s_base.haveZone[room] = true;
+            std::memcpy(s_base.zone[room], bits, kZoneBitSize);
+            std::memcpy(s_base.zoneActor[room], actorBits, kZoneActorSize);
+        } else {
+
+            if (dungeon_stage(stage)) {
+                keep_zone_local(room, s_base.zone[room], bits);
+                diff_region(kRegionZone, static_cast<int8_t>(room), bits, s_base.zone[room],
+                    kZoneBitSize);
+            } else {
+                std::memcpy(s_base.zone[room], bits, kZoneBitSize);
+            }
+            diff_region(kRegionZoneActor, static_cast<int8_t>(room), actorBits,
+                s_base.zoneActor[room], kZoneActorSize);
+        }
+    }
+    for (int r = 0; r < kRooms; ++r) {
+        if (!seen[r]) s_base.haveZone[r] = false;
+    }
+
+    uint8_t* tmp = info->getTmp().mEvent;
+    if (dungeon && dungeon_stage(stage) && s_base.haveTmp) {
+        uint8_t view[kEventSize];
+        std::memcpy(view, tmp, kEventSize);
+        keep_private_tmp(view, s_base.tmp);
+        diff_region(kRegionTmp, -1, view, s_base.tmp, kEventSize);
+    } else {
+        s_base.haveTmp = true;
+        std::memcpy(s_base.tmp, tmp, kEventSize);
+    }
+
+    if (dungeon) diff_visited(info);
+    if (dungeon) diff_light_drop(info);
+    if (dungeon) diff_collect(info);
+    if (dungeon) diff_status_b(info);
+
+    uint8_t* events = info->getSavedata().getEvent().mEvent;
+    if (story && s_base.haveEvent) {
+        uint8_t view[kEventSize];
+        std::memcpy(view, events, kEventSize);
+        keep_private_event(view, s_base.event);
+        diff_story(view, s_base.event);
+    } else {
+        s_base.haveEvent = true;
+        std::memcpy(s_base.event, events, kEventSize);
+    }
+}
+
+struct ChestSweep {
+    const uint8_t* wantedBits;
+    int count;
+};
+
+bool tbox_bit_set(const uint8_t* bytes, int no) {
+    if (bytes == nullptr || no < 0 || no >= 64) return false;
+    const int word = no >> 5;
+    const int bitInWord = no & 0x1F;
+
+    const int byteIndex = word * 4 + (3 - (bitInWord >> 3));
+    return (bytes[byteIndex] & (1 << (no & 7))) != 0;
+}
+
+bool s_scrubbedByRemote[64] = {};
+
+uint8_t s_pendingChestBits[8] = {};
+char s_pendingChestStage[8] = {};
+
+void clear_tbox_bit(uint8_t* bytes, int no) {
+    if (bytes == nullptr || no < 0 || no >= 64) return;
+    const int word = no >> 5;
+    const int bitInWord = no & 0x1F;
+    const int byteIndex = word * 4 + (3 - (bitInWord >> 3));
+    bytes[byteIndex] = static_cast<uint8_t>(bytes[byteIndex] & ~(1 << (no & 7)));
+}
+
+void* open_matching_chest(void* proc, void* data) {
+    auto* sweep = static_cast<ChestSweep*>(data);
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr || fopAcM_GetName(actor) != kProcTbox) return nullptr;
+    auto* chest = reinterpret_cast<daTbox_c*>(actor);
+    const int no = chest->getTboxNo();
+    if (no < 0 || no >= 64) return nullptr;
+    if (!tbox_bit_set(sweep->wantedBits, no)) return nullptr;
+
+    if (chest->mpAnm == nullptr) return nullptr;
+
+    if (chest->mpAnm->getFrame() > 0.0f && !s_scrubbedByRemote[no]) return nullptr;
+    if (dComIfGp_event_runCheck()) return nullptr;
+    s_scrubbedByRemote[no] = false;
+
+    if (chest->mpAnm != nullptr) chest->mpAnm->setFrame(chest->mpAnm->getEndFrame());
+
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        daTbox_actionFn ours = &daTbox_c::actionWait;
+        unsigned char oursBytes[sizeof(daTbox_actionFn)];
+        unsigned char theirs[sizeof(daTbox_actionFn)];
+        std::memcpy(oursBytes, &ours, sizeof(oursBytes));
+        std::memcpy(theirs, &chest->mpActionFn, sizeof(theirs));
+        char a[96] = {};
+        char b[96] = {};
+        int ai = 0, bi = 0;
+        for (size_t i = 0; i < sizeof(oursBytes) && ai < 80; ++i) {
+            ai += std::snprintf(a + ai, sizeof(a) - ai, "%02x", oursBytes[i]);
+            bi += std::snprintf(b + bi, sizeof(b) - bi, "%02x", theirs[i]);
+        }
+        coop_log::info("coop_mod: [CHEST] pmf size={} local(actionWait)={} remote(current)={}",
+            static_cast<int>(sizeof(daTbox_actionFn)), a, b);
+    }
+
+    chest->setAction(&daTbox_c::actionWait);
+
+    coop_log::info("coop_mod: [CHEST] closing {} remotely: isTbox={}", no,
+        dComIfGs_isTbox(no) ? 1 : 0);
+    if (!dComIfGs_isTbox(no)) dComIfGs_onTbox(no);
+    dTres_c::offStatus(0, no, 1);
+
+    chest->setDzb();
+    if (chest->mpBgCollision != nullptr) chest->mpBgCollision->Move();
+    clear_tbox_bit(s_pendingChestBits, no);
+    ++sweep->count;
+    return nullptr;
+}
+
+void retry_pending_chests() {
+    bool any = false;
+    for (int i = 0; i < 8; ++i) any = any || s_pendingChestBits[i] != 0;
+    if (!any) return;
+    const char* here = dComIfGp_getStartStageName();
+    if (here == nullptr || std::strncmp(here, s_pendingChestStage, 8) != 0) {
+        std::memset(s_pendingChestBits, 0, sizeof(s_pendingChestBits));
+        return;
+    }
+    uint8_t wanted[8];
+    std::memcpy(wanted, s_pendingChestBits, sizeof(wanted));
+    ChestSweep sweep;
+    sweep.wantedBits = wanted;
+    sweep.count = 0;
+    fopAcM_Search(open_matching_chest, &sweep);
+    if (sweep.count > 0) {
+        coop_log::info("coop_mod: [WORLD] {} remotely emptied chests shown open",
+            sweep.count);
+    }
+}
+
+const int kChestAnmSlots = 3;
+u16 s_chestOpenRes[kChestAnmSlots] = {0xFFFF, 0xFFFF, 0xFFFF};
+bool s_chestOpenResReady = false;
+
+void resolve_chest_open_res() {
+    if (s_chestOpenResReady) return;
+    daAlink_c* alink = daAlink_getAlinkActorClass();
+    if (alink == nullptr) return;
+    const daAlink_BckData* a = alink->getMainBckData(daAlink_c::ANM_TRES_OPEN_SMALL);
+    const daAlink_BckData* b = alink->getMainBckData(daAlink_c::ANM_TRES_OPEN_KICK);
+    const daAlink_BckData* c = alink->getMainBckData(daAlink_c::ANM_TRES_OPEN_BIG);
+    if (a == nullptr || b == nullptr || c == nullptr) return;
+    s_chestOpenRes[0] = a->m_underID;
+    s_chestOpenRes[1] = b->m_underID;
+    s_chestOpenRes[2] = c->m_underID;
+    s_chestOpenResReady = true;
+    coop_log::info("coop_mod: [WORLD] chest-open clips are res {} / {} / {}", s_chestOpenRes[0],
+        s_chestOpenRes[1], s_chestOpenRes[2]);
+}
+
+bool is_chest_open_clip(u16 resIdx) {
+    if (!s_chestOpenResReady || resIdx == 0xFFFF) return false;
+    for (int i = 0; i < kChestAnmSlots; ++i) {
+        if (s_chestOpenRes[i] == resIdx) return true;
+    }
+    return false;
+}
+
+struct ChestPick {
+    cXyz at;
+    daTbox_c* best;
+    f32 bestDistSq;
+};
+
+void* pick_closed_chest(void* proc, void* data) {
+    auto* pick = static_cast<ChestPick*>(data);
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr || fopAcM_GetName(actor) != kProcTbox) return nullptr;
+    auto* chest = reinterpret_cast<daTbox_c*>(actor);
+
+    if (chest->mpAnm == nullptr) return nullptr;
+    if (chest->mpAnm->getFrame() >= chest->mpAnm->getEndFrame()) return nullptr;
+    const f32 dx = actor->current.pos.x - pick->at.x;
+    const f32 dy = actor->current.pos.y - pick->at.y;
+    const f32 dz = actor->current.pos.z - pick->at.z;
+    const f32 d = dx * dx + dy * dy + dz * dz;
+    if (pick->best == nullptr || d < pick->bestDistSq) {
+        pick->best = chest;
+        pick->bestDistSq = d;
+    }
+    return nullptr;
+}
+
+const f32 kChestReach = 180.0f;
+
+void drive_remote_chest_lids() {
+    if (!coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true)) || !coop_net_connected()) return;
+    resolve_chest_open_res();
+    if (!s_chestOpenResReady) return;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        const uint8_t id = static_cast<uint8_t>(i);
+        if (id == coop_net_local_id()) continue;
+        u16 res = 0xFFFF;
+        f32 frame = 0.0f;
+        if (!puppet_hook_get_anim(id, &res, &frame)) continue;
+        if (!is_chest_open_clip(res)) continue;
+        f32 px = 0.0f, py = 0.0f, pz = 0.0f;
+        if (!puppet_hook_get_pose_of(id, &px, &py, &pz, nullptr, nullptr, nullptr)) continue;
+
+        ChestPick pick;
+        pick.at.set(px, py, pz);
+        pick.best = nullptr;
+        pick.bestDistSq = 0.0f;
+        fopAcM_Search(pick_closed_chest, &pick);
+        if (pick.best == nullptr || pick.bestDistSq > kChestReach * kChestReach) continue;
+
+        const f32 end = pick.best->mpAnm->getEndFrame();
+        pick.best->mpAnm->setFrame(frame > end ? end : frame);
+        pick.best->mpAnm->play();
+        const int no = pick.best->getTboxNo();
+        if (no >= 0 && no < 64) s_scrubbedByRemote[no] = true;
+    }
+}
+
+struct ChestCensus { int total; int inRoom; };
+
+void* census_chest(void* proc, void* data) {
+    auto* c = static_cast<ChestCensus*>(data);
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr || fopAcM_GetName(actor) != kProcTbox) return nullptr;
+    ++c->total;
+    auto* chest = reinterpret_cast<daTbox_c*>(actor);
+    coop_log::info("coop_mod: [CHEST] present: no={} frame={} end={}",
+        chest->getTboxNo(),
+        chest->mpAnm != nullptr ? chest->mpAnm->getFrame() : -1.0f,
+        chest->mpAnm != nullptr ? chest->mpAnm->getEndFrame() : -1.0f);
+    return nullptr;
+}
+
+void open_chests_from_bits(const uint8_t* newlySet) {
+    bool any = false;
+    for (int i = 0; i < 8; ++i) {
+        if (newlySet[i] != 0) { any = true; break; }
+    }
+    if (!any) return;
+
+    const char* here = dComIfGp_getStartStageName();
+    if (here != nullptr && std::strncmp(here, s_pendingChestStage, 8) != 0) {
+        std::memset(s_pendingChestBits, 0, sizeof(s_pendingChestBits));
+        std::strncpy(s_pendingChestStage, here, sizeof(s_pendingChestStage));
+    }
+    for (int i = 0; i < 8; ++i) s_pendingChestBits[i] |= newlySet[i];
+    ChestSweep sweep;
+    sweep.wantedBits = newlySet;
+    sweep.count = 0;
+    fopAcM_Search(open_matching_chest, &sweep);
+    if (sweep.count > 0) {
+        coop_log::info("coop_mod: [WORLD] {} remotely emptied chests shown open",
+            sweep.count);
+        return;
+    }
+
+    char wanted[128];
+    int at = 0;
+    for (int no = 0; no < 64 && at < 100; ++no) {
+        if (!tbox_bit_set(newlySet, no)) continue;
+        at += std::snprintf(wanted + at, sizeof(wanted) - at, "%d ", no);
+    }
+    if (at == 0) std::snprintf(wanted, sizeof(wanted), "(none decoded)");
+    coop_log::warn("coop_mod: [CHEST] treasure bit unmatched raw={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} wanted={}",
+        newlySet[0], newlySet[1], newlySet[2], newlySet[3], newlySet[4], newlySet[5], newlySet[6],
+        newlySet[7], wanted);
+    ChestCensus census{0, 0};
+    fopAcM_Search(census_chest, &census);
+    coop_log::warn("coop_mod: [CHEST] {} chest actor(s) loaded here", census.total);
+}
+
+struct DropSweep {
+    const uint8_t* wantedBits;
+    int count;
+};
+
+void* remove_matching_drop(void* proc, void* data) {
+    auto* sweep = static_cast<DropSweep*>(data);
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr) return nullptr;
+    const s16 name = fopAcM_GetName(actor);
+
+    int no = -1;
+    if (name == kProcObjDrop) {
+        auto* drop = reinterpret_cast<daObjDrop_c*>(actor);
+
+        if (drop->mSetCollectDrop == 0) return nullptr;
+        no = drop->getSave();
+    } else if (name == kProcSmallKey) {
+
+        no = reinterpret_cast<daKey_c*>(actor)->getSaveBitNo();
+    } else {
+        return nullptr;
+    }
+
+    if (no < 0 || no >= 64) return nullptr;
+    if (!tbox_bit_set(sweep->wantedBits, no)) return nullptr;
+    fopAcM_delete(actor);
+    ++sweep->count;
+    return nullptr;
+}
+
+void remove_collected_from_bits(const uint8_t* newlySet) {
+    bool any = false;
+    for (int i = 0; i < 8; ++i) {
+        if (newlySet[i] != 0) { any = true; break; }
+    }
+    if (!any) return;
+    DropSweep sweep;
+    sweep.wantedBits = newlySet;
+    sweep.count = 0;
+    fopAcM_Search(remove_matching_drop, &sweep);
+    if (sweep.count > 0) {
+        coop_log::info("coop_mod: [WORLD] removed {} collectibles taken remotely", sweep.count);
+    }
+}
+
+void apply_bytes(uint8_t* data, uint8_t* base, const MsgWorldDelta& msg, int skipIndex = -1) {
+    for (int i = 0; i < msg.size; ++i) {
+        const int at = msg.offset + i;
+        if (at == skipIndex) continue;
+        data[at] = static_cast<uint8_t>((data[at] | msg.set[i]) & ~msg.clr[i]);
+        if (base != nullptr) base[at] = static_cast<uint8_t>((base[at] | msg.set[i]) & ~msg.clr[i]);
+    }
+}
+
+const int kDigestEveryTicks = 60 * 5;
+
+uint32_t hash_bytes(const uint8_t* data, int size, int skipByte = -1) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < size; ++i) {
+        if (i == skipByte) continue;
+        h ^= data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+uint32_t visited_hash(dSv_info_c* info) {
+    uint32_t h = 2166136261u;
+    dSv_save_c& save = info->getSavedata();
+    for (int m = 0; m < kMaps; ++m) {
+        auto* cur = reinterpret_cast<uint8_t*>(save.getSave2(m));
+        for (int i = 0; i < kVisitedSize; ++i) {
+            h ^= cur[i];
+            h *= 16777619u;
+        }
+    }
+    return h;
+}
+
+uint32_t collect_hash(dSv_info_c* info) {
+    auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getCollect());
+    return hash_bytes(cur, kCollectPohIndex);
+}
+
+uint32_t status_b_hash(dSv_info_c* info) {
+    uint8_t bytes[kStatusBSize];
+    const uint8_t* cur = status_b_flags(info);
+    for (int i = 0; i < kStatusBSize; ++i) bytes[i] = static_cast<uint8_t>(cur[i] | s_statusBPending[i]);
+    return hash_bytes(bytes, kStatusBSize);
+}
+
+uint32_t light_drop_hash(dSv_info_c* info) {
+    auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getLightDrop());
+    return hash_bytes(cur, kLightDropCounts + 1);
+}
+
+void republish_globals(dSv_info_c* info) {
+    s_visited.have = false;
+    s_visitedShareDue = true;
+    auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getLightDrop());
+    uint8_t set[32] = {};
+    uint8_t clr[32] = {};
+
+    set[4] = cur[4];
+    send_delta(s_base, kRegionLightDrop, -1, 0, kLightDropSize, set, clr);
+    std::memcpy(s_lightDrop.bytes, cur, kLightDropSize);
+    s_lightDrop.have = true;
+
+    {
+        char stage[8];
+        int saveNo = -1;
+        if (current_stage(stage, saveNo)) {
+            send_full(stage, saveNo, kRegionLightDrop, -1, cur, kLightDropSize);
+        }
+    }
+
+    auto* col = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getCollect());
+    uint8_t colSet[32] = {};
+    std::memcpy(colSet, col, kCollectSize);
+    send_delta(s_base, kRegionCollect, -1, 0, kCollectSize, colSet, clr);
+    std::memcpy(s_collect.bytes, col, kCollectSize);
+    s_collect.have = true;
+
+    uint8_t* sb = status_b_flags(info);
+    uint8_t sbSet[32] = {};
+    std::memcpy(sbSet, sb, kStatusBSize);
+    send_delta(s_base, kRegionStatusB, -1, 0, kStatusBSize, sbSet, clr);
+    std::memcpy(s_statusB.bytes, sb, kStatusBSize);
+    s_statusB.have = true;
+}
+
+void send_digest(dSv_info_c* info, const char stage[8], int saveNo) {
+    MsgWorldDigest msg{};
+    std::memcpy(msg.stage, stage, 8);
+    msg.saveNo = static_cast<int8_t>(saveNo);
+
+    msg.memoryHash = memory_hash(msg.stage, mem_bytes(info->getMemory()));
+    dSv_danBit_c& dan = info->getDan();
+    msg.danHash = dan.mStageNo == saveNo ? dan_hash(reinterpret_cast<uint8_t*>(&dan) + kDanOffset) : 0u;
+    msg.tmpHash = hash_shared(info->getTmp().mEvent, tmp_private);
+    const int here = dComIfGp_roomControl_getStayNo();
+    msg.room = static_cast<int8_t>(here);
+    msg.zoneHash = 0;
+    for (int i = 0; i < kZones; ++i) {
+        dSv_zone_c& zone = info->getZone(i);
+        if (zone.getRoomNo() != here) continue;
+        msg.zoneHash = zone_hash(here, reinterpret_cast<uint8_t*>(&zone.getBit()));
+        break;
+    }
+    msg.visitedHash = visited_hash(info);
+    msg.lightDropHash = light_drop_hash(info);
+    msg.collectHash = collect_hash(info);
+    msg.eventHash = story_hash(info);
+    msg.storyRules = kStoryRules;
+    msg.statusBHash = status_b_hash(info);
+    coop_net_send(kMsgWorldDigest, &msg, sizeof(msg));
+}
+
+void handle_digest(const MsgWorldDigest& msg, uint8_t from) {
+    if (!coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) return;
+
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return;
+    char stage[8];
+    int saveNo = -1;
+    if (!current_stage(stage, saveNo)) return;
+
+    if (visited_hash(info) != msg.visitedHash || light_drop_hash(info) != msg.lightDropHash ||
+        collect_hash(info) != msg.collectHash || status_b_hash(info) != msg.statusBHash) {
+        coop_log::info("coop_mod: [WORLD] global state mismatch maps {:#010x}/{:#010x} tears {:#010x}/{:#010x} collect {:#010x}/{:#010x}, republishing",
+            visited_hash(info), msg.visitedHash, light_drop_hash(info), msg.lightDropHash,
+            collect_hash(info), msg.collectHash);
+        republish_globals(info);
+    }
+
+    if (!coop_session(kSessStory, cfg_bool(s_storyVar, false))) {
+        const uint32_t mine = story_hash(info);
+        if (mine == msg.eventHash) {
+            s_storyDiffFor = 0;
+            s_storyWarned = false;
+        } else if (!s_storyWarned && ++s_storyDiffFor >= kStoryWarnDigests) {
+            s_storyWarned = true;
+            coop_log::warn("coop_mod: [WORLD] story flags differ for {}s ({:#010x} vs {:#010x}), story sharing off",
+                kStoryWarnDigests * kDigestEveryTicks / 60, mine, msg.eventHash);
+            features_toast("Story progress doesn't match",
+                "If you get stuck, the host can turn on \"Share story progress\".");
+        }
+    } else {
+        s_storyDiffFor = 0;
+        s_storyWarned = false;
+    }
+
+    if (coop_net_is_host()) return;
+
+    if (from != kCoopHostId) return;
+
+    if (std::memcmp(stage, msg.stage, 8) != 0 || saveNo != msg.saveNo) return;
+
+    const uint32_t mine = memory_hash(stage, mem_bytes(info->getMemory()));
+    dSv_danBit_c& dan = info->getDan();
+    const uint32_t myDan = dan.mStageNo == saveNo ? dan_hash(reinterpret_cast<uint8_t*>(&dan) + kDanOffset) : 0u;
+    const uint32_t myTmp = hash_shared(info->getTmp().mEvent, tmp_private);
+
+    bool zoneDiffers = false;
+    const int here = dComIfGp_roomControl_getStayNo();
+    if (msg.room == here) {
+        uint32_t myZone = 0;
+        for (int i = 0; i < kZones; ++i) {
+            dSv_zone_c& zone = info->getZone(i);
+            if (zone.getRoomNo() != here) continue;
+            myZone = zone_hash(here, reinterpret_cast<uint8_t*>(&zone.getBit()));
+            break;
+        }
+        if (myZone != msg.zoneHash) {
+            zoneDiffers = true;
+            coop_log::info("coop_mod: [WORLD] room {} mismatch {:#010x}/{:#010x}", here,
+                myZone, msg.zoneHash);
+            send_sync_request(stage, saveNo, static_cast<int8_t>(here));
+        }
+    }
+
+    const uint32_t myStatusB = status_b_hash(info);
+    const uint32_t myCollect = collect_hash(info);
+    const uint32_t myLightDrop = light_drop_hash(info);
+
+    const bool storyOn = coop_session(kSessStory, cfg_bool(s_storyVar, false));
+    const uint32_t myEvent = story_hash(info);
+
+    const bool eventOk = !storyOn || myEvent == msg.eventHash || msg.storyRules != kStoryRules;
+
+    const bool tmpOk = !dungeon_stage(stage) || myTmp == msg.tmpHash || msg.storyRules != kStoryRules;
+    if (mine == msg.memoryHash && myDan == msg.danHash && tmpOk &&
+        myStatusB == msg.statusBHash && myCollect == msg.collectHash &&
+        myLightDrop == msg.lightDropHash && eventOk) {
+        return;
+    }
+    (void)zoneDiffers;
+
+    coop_log::info("coop_mod: [WORLD] {:.8s} mismatch memory {:#010x}/{:#010x} dungeon {:#010x}/{:#010x} temp {:#010x}/{:#010x} statusB {:#010x}/{:#010x} collect {:#010x}/{:#010x} lightDrop {:#010x}/{:#010x} event {:#010x}/{:#010x} | visited {:#010x}/{:#010x}, requesting",
+        stage, mine, msg.memoryHash, myDan, msg.danHash, myTmp, msg.tmpHash,
+        myStatusB, msg.statusBHash, myCollect, msg.collectHash,
+        myLightDrop, msg.lightDropHash,
+        myEvent, msg.eventHash, visited_hash(info), msg.visitedHash);
+
+    send_sync_request(stage, saveNo, -1);
+}
+
+void answer_sync_request(const MsgWorldSyncRequest& req) {
+
+    if (!coop_net_is_host()) return;
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return;
+    char stage[8];
+    int saveNo = -1;
+    if (!current_stage(stage, saveNo)) return;
+    if (std::memcmp(stage, req.stage, 8) != 0 || saveNo != req.saveNo) return;
+
+    if (req.room < 0) {
+        send_full(stage, saveNo, kRegionMemory, -1, mem_bytes(info->getMemory()), kMemSize);
+        dSv_danBit_c& dan = info->getDan();
+        if (dan.mStageNo == saveNo) {
+            send_full(stage, saveNo, kRegionDan, -1,
+                reinterpret_cast<uint8_t*>(&dan) + kDanOffset, kDanSize);
+        }
+
+        uint8_t* tmp = info->getTmp().mEvent;
+        for (int off = 0; off < kEventSize; off += 32) {
+            send_full(stage, saveNo, kRegionTmp, static_cast<int8_t>(off / 32), tmp + off, 32);
+        }
+
+        send_full(stage, saveNo, kRegionStatusB, -1, status_b_flags(info), kStatusBSize);
+        send_full(stage, saveNo, kRegionCollect, -1,
+            reinterpret_cast<const uint8_t*>(&info->getSavedata().getPlayer().getCollect()),
+            kCollectSize);
+        send_full(stage, saveNo, kRegionLightDrop, -1,
+            reinterpret_cast<const uint8_t*>(&info->getSavedata().getPlayer().getLightDrop()),
+            kLightDropSize);
+
+        if (coop_session(kSessStory, cfg_bool(s_storyVar, false))) {
+            const uint8_t* ev = info->getSavedata().getEvent().mEvent;
+            for (int off = 0; off < kEventSize; off += 32) {
+                uint8_t shared[32];
+                for (int i = 0; i < 32; ++i) {
+                    shared[i] = static_cast<uint8_t>(ev[off + i] & ~story_private(off + i));
+                }
+                send_full(stage, saveNo, kRegionEvent, static_cast<int8_t>(off / 32), shared, 32);
+            }
+        }
+        coop_log::info("coop_mod: [WORLD] answering stage memory request {:.8s}", stage);
+        return;
+    }
+    for (int i = 0; i < kZones; ++i) {
+        dSv_zone_c& zone = info->getZone(i);
+        if (zone.getRoomNo() != req.room) continue;
+        send_full(stage, saveNo, kRegionZone, req.room,
+            reinterpret_cast<uint8_t*>(&zone.getBit()), kZoneBitSize);
+        send_full(stage, saveNo, kRegionZoneActor, req.room,
+            reinterpret_cast<uint8_t*>(&zone.getActor()), kZoneActorSize);
+        coop_log::info("coop_mod: [WORLD] answering room {} request for {:.8s}",
+            static_cast<int>(req.room), stage);
+        return;
+    }
+}
+
+void merge_full(uint8_t* target, uint8_t* base, const uint8_t* data, int size, bool adopt) {
+    for (int i = 0; i < size; ++i) {
+        if (adopt && base != nullptr) {
+
+            const uint8_t pendingSet = static_cast<uint8_t>(target[i] & ~base[i]);
+            const uint8_t pendingClear = static_cast<uint8_t>(base[i] & ~target[i]);
+            target[i] = static_cast<uint8_t>((data[i] | pendingSet) & ~pendingClear);
+        } else {
+            target[i] = adopt ? data[i] : static_cast<uint8_t>(target[i] | data[i]);
+        }
+
+        if (base != nullptr) base[i] = data[i];
+    }
+}
+
+void handle_full(const MsgWorldFull& msg) {
+    if (msg.size > 32) return;
+
+    if ((msg.region == kRegionZone || msg.region == kRegionTmp) && !dungeon_stage(msg.stage)) {
+        return;
+    }
+
+    if (msg.region == kRegionEvent) {
+        if (!coop_session(kSessStory, cfg_bool(s_storyVar, false))) return;
+    } else if (!coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) {
+        return;
+    }
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return;
+    char stage[8];
+    int saveNo = -1;
+    if (!current_stage(stage, saveNo)) return;
+
+    const bool global = msg.region == kRegionLightDrop || msg.region == kRegionCollect ||
+                        msg.region == kRegionStatusB;
+    if (!global && (std::memcmp(stage, msg.stage, 8) != 0 || saveNo != msg.saveNo)) return;
+    const bool baselineValid = s_base.have && std::memcmp(s_base.stage, stage, 8) == 0 &&
+                               s_base.saveNo == saveNo;
+
+    switch (msg.region) {
+    case kRegionMemory: {
+        if (msg.size != kMemSize) return;
+        uint8_t* mem = mem_bytes(info->getMemory());
+        uint8_t newlySet[8] = {};
+        for (int i = 0; i < 8; ++i) newlySet[i] = static_cast<uint8_t>(msg.data[i] & ~mem[i]);
+        uint8_t memBefore[kMemSize];
+        std::memcpy(memBefore, mem, kMemSize);
+
+        const bool keyPending = baselineValid && mem[kKeyOffset] != s_base.mem[kKeyOffset];
+        const uint8_t localKeys = mem[kKeyOffset];
+
+        merge_full(mem, baselineValid ? s_base.mem : nullptr, msg.data, kMemSize,
+            dungeon_stage(stage));
+        mem[kKeyOffset] = keyPending ? localKeys : msg.data[kKeyOffset];
+        keep_mem_local(stage, mem, memBefore);
+        keep_bomb_house(saveNo, mem, memBefore);
+        if (baselineValid) keep_mem_local(stage, s_base.mem, memBefore);
+        open_chests_from_bits(newlySet);
+        remove_collected_from_bits(newlySet);
+        break;
+    }
+    case kRegionDan: {
+        dSv_danBit_c& dan = info->getDan();
+        if (msg.size != kDanSize || dan.mStageNo != saveNo) return;
+        uint8_t* danBytes = reinterpret_cast<uint8_t*>(&dan) + kDanOffset;
+        uint8_t danBefore[kDanSize];
+        std::memcpy(danBefore, danBytes, kDanSize);
+        merge_full(danBytes, (baselineValid && s_base.haveDan) ? s_base.dan : nullptr, msg.data,
+            kDanSize, false);
+        keep_dan_local(danBytes, danBefore);
+        if (baselineValid && s_base.haveDan) keep_dan_local(s_base.dan, danBefore);
+        break;
+    }
+    case kRegionTmp: {
+
+        const int off = static_cast<int>(msg.room) * 32;
+        if (msg.size != 32 || off < 0 || off + 32 > kEventSize) return;
+
+        uint8_t before[kEventSize];
+        std::memcpy(before, info->getTmp().mEvent, kEventSize);
+        merge_full(info->getTmp().mEvent + off,
+            (baselineValid && s_base.haveTmp) ? s_base.tmp + off : nullptr, msg.data, 32, false);
+        keep_private_tmp(info->getTmp().mEvent, before);
+        break;
+    }
+
+    case kRegionStatusB: {
+        if (msg.size != kStatusBSize) return;
+        hold_status_b(info, msg.data);
+        break;
+    }
+    case kRegionCollect: {
+        if (msg.size != kCollectSize) return;
+        auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getCollect());
+        for (int i = 0; i < kCollectSize; ++i) {
+            if (collect_item_only(i)) continue;
+            cur[i] = static_cast<uint8_t>(cur[i] | msg.data[i]);
+
+            if (s_collect.have) s_collect.bytes[i] = static_cast<uint8_t>(s_collect.bytes[i] | msg.data[i]);
+        }
+        break;
+    }
+    case kRegionLightDrop: {
+        if (msg.size != kLightDropSize) return;
+        auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getLightDrop());
+        for (int i = 0; i < kLightDropCounts; ++i) {
+            if (msg.data[i] <= cur[i]) continue;
+            lift_light_drop_baseline(i, msg.data[i] - cur[i]);
+            cur[i] = msg.data[i];
+        }
+        cur[4] = static_cast<uint8_t>(cur[4] | msg.data[4]);
+        if (s_lightDrop.have) s_lightDrop.bytes[4] = static_cast<uint8_t>(s_lightDrop.bytes[4] | msg.data[4]);
+        break;
+    }
+    case kRegionEvent: {
+
+        if (!coop_session(kSessStory, cfg_bool(s_storyVar, false))) return;
+        const int off = static_cast<int>(msg.room) * 32;
+        if (msg.size != 32 || off < 0 || off + 32 > kEventSize) return;
+        const int added = story_hold(info, msg.data, off, 32);
+        if (added > 0) {
+            coop_log::info("coop_mod: [STORY] {} remote flags deferred to stage load ({} waiting)", added, s_storyPendingBits);
+        }
+
+        if (baselineValid && s_base.haveEvent) {
+            for (int i = 0; i < 32; ++i) {
+                const uint8_t mine = story_private(off + i);
+                s_base.event[off + i] = static_cast<uint8_t>((msg.data[i] & ~mine) |
+                                                              (s_base.event[off + i] & mine));
+            }
+        }
+        break;
+    }
+    case kRegionZone:
+    case kRegionZoneActor: {
+        const bool actors = msg.region == kRegionZoneActor;
+        const int expect = actors ? kZoneActorSize : kZoneBitSize;
+        if (msg.size != expect || msg.room < 0 || msg.room >= kRooms) return;
+        for (int i = 0; i < kZones; ++i) {
+            dSv_zone_c& zone = info->getZone(i);
+            if (zone.getRoomNo() != msg.room) continue;
+            uint8_t* target = actors ? reinterpret_cast<uint8_t*>(&zone.getActor())
+                                     : reinterpret_cast<uint8_t*>(&zone.getBit());
+            uint8_t* base = nullptr;
+            if (baselineValid && s_base.haveZone[msg.room]) {
+                base = actors ? s_base.zoneActor[msg.room] : s_base.zone[msg.room];
+            }
+            uint8_t zoneBefore[kZoneActorSize > kZoneBitSize ? kZoneActorSize : kZoneBitSize];
+            std::memcpy(zoneBefore, target, expect);
+            merge_full(target, base, msg.data, expect, false);
+            if (!actors) {
+                keep_zone_local(msg.room, target, zoneBefore);
+                if (base != nullptr) keep_zone_local(msg.room, base, zoneBefore);
+            }
+            break;
+        }
+        break;
+    }
+    default:
+        return;
+    }
+    coop_log::info("coop_mod: [WORLD] merged full region={} stage={:.8s} room={} ({} bytes)",
+        static_cast<int>(msg.region), msg.stage, static_cast<int>(msg.room),
+        static_cast<int>(msg.size));
+}
+
+void run_self_test() {
+    int64_t after = 0;
+    if (s_selfTestVar != 0) svc_config->get_int(mod_ctx, s_selfTestVar, &after);
+
+    if (after == 0) return;
+    const bool reportOnly = after < 0;
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    char stage[8];
+    int saveNo = -1;
+    if (info == nullptr || !current_stage(stage, saveNo)) return;
+
+    if (!reportOnly && !s_selfTestDone && ++s_selfTestTicks >= static_cast<uint32_t>(after)) {
+        s_selfTestDone = true;
+        info->getMemory().getBit().onSwitch(kSelfTestSwitch);
+        const int room = dComIfGp_roomControl_getStayNo();
+        for (int i = 0; i < kZones; ++i) {
+            if (info->getZone(i).getRoomNo() != room) continue;
+            info->getZone(i).getBit().onSwitch(kSelfTestZoneSwitch);
+            break;
+        }
+        coop_log::warn(
+            "coop_mod: [WORLD-SELFTEST] set memory switch {} room {} zone switch {}",
+            kSelfTestSwitch, room, kSelfTestZoneSwitch);
+    }
+
+    if (s_tick % 300 != 0) return;
+    const int room = dComIfGp_roomControl_getStayNo();
+    int zoneBit = -1;
+    for (int i = 0; i < kZones; ++i) {
+        if (info->getZone(i).getRoomNo() != room) continue;
+        zoneBit = info->getZone(i).getBit().isSwitch(kSelfTestZoneSwitch) ? 1 : 0;
+        break;
+    }
+    coop_log::info("coop_mod: [WORLD-CHECK] stage={:.8s} room={} memSwitch={} zoneSwitch={}", stage,
+        room, info->getMemory().getBit().isSwitch(kSelfTestSwitch) ? 1 : 0, zoneBit);
+}
+
+const int16_t kProcTbox2 = 0x0FC;
+const int kMaxTbox2 = 32;
+
+uint32_t tbox2_key(fopAc_ac_c* actor) {
+    uint32_t h = 2166136261u;
+    const int16_t name = fopAcM_GetName(actor);
+    const uint16_t setID = actor->setID;
+    auto mix = [&h](const void* p, size_t n) {
+        const auto* b = static_cast<const uint8_t*>(p);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= b[i];
+            h *= 16777619u;
+        }
+    };
+    mix(&name, sizeof(name));
+    mix(&setID, sizeof(setID));
+    if (setID == 0xFFFF) {
+
+        const int32_t x = static_cast<int32_t>(actor->home.pos.x);
+        const int32_t y = static_cast<int32_t>(actor->home.pos.y);
+        const int32_t z = static_cast<int32_t>(actor->home.pos.z);
+        const uint32_t param = fopAcM_GetParam(actor);
+        mix(&param, sizeof(param));
+        mix(&x, sizeof(x));
+        mix(&y, sizeof(y));
+        mix(&z, sizeof(z));
+    }
+    return h != 0 ? h : 1u;
+}
+
+uint32_t s_tbox2Sent[kMaxTbox2] = {};
+char s_tbox2Stage[8] = {};
+
+struct Tbox2Find {
+    uint32_t key;
+    cXyz home;
+    daTbox2_c* found;
+    f32 bestDistSq;
+};
+
+void* collect_open_tbox2(void* proc, void* data) {
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr || fopAcM_GetName(actor) != kProcTbox2) return nullptr;
+    auto* chest = static_cast<daTbox2_c*>(actor);
+
+    if (chest->mAction == daTbox2_c::ACTION_OPEN_WAIT_e) return nullptr;
+    const uint32_t key = tbox2_key(actor);
+    for (uint32_t& sent : s_tbox2Sent) {
+        if (sent == key) return nullptr;
+    }
+    for (uint32_t& sent : s_tbox2Sent) {
+        if (sent != 0) continue;
+        sent = key;
+        MsgTbox2 msg{};
+        msg.key = key;
+        msg.room = static_cast<int8_t>(fopAcM_GetRoomNo(actor));
+        msg.procName = fopAcM_GetName(actor);
+        msg.home[0] = actor->home.pos.x;
+        msg.home[1] = actor->home.pos.y;
+        msg.home[2] = actor->home.pos.z;
+        coop_net_send(kMsgTbox2, &msg, sizeof(msg));
+        coop_log::info("coop_mod: [CHEST] sent no-save chest {:#x}", key);
+        break;
+    }
+    return nullptr;
+}
+
+void* match_open_tbox2(void* proc, void* data) {
+    auto* find = static_cast<Tbox2Find*>(data);
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr || fopAcM_GetName(actor) != kProcTbox2) return nullptr;
+    auto* chest = static_cast<daTbox2_c*>(actor);
+    if (tbox2_key(actor) == find->key) {
+        find->found = chest;
+        find->bestDistSq = 0.0f;
+        return nullptr;
+    }
+
+    const f32 dx = actor->home.pos.x - find->home.x;
+    const f32 dy = actor->home.pos.y - find->home.y;
+    const f32 dz = actor->home.pos.z - find->home.z;
+    const f32 d = dx * dx + dy * dy + dz * dz;
+    if (find->found == nullptr || d < find->bestDistSq) {
+        if (d < 100.0f * 100.0f) {
+            find->found = chest;
+            find->bestDistSq = d;
+        }
+    }
+    return nullptr;
+}
+
+void open_tbox2_from_message(const MsgTbox2& msg) {
+    if (!coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) return;
+    Tbox2Find find{msg.key, cXyz(msg.home[0], msg.home[1], msg.home[2]), nullptr, 0.0f};
+    fopAcM_Search(match_open_tbox2, &find);
+    if (find.found == nullptr) return;
+    daTbox2_c* chest = find.found;
+    if (chest->mAction != daTbox2_c::ACTION_OPEN_WAIT_e) return;
+
+    chest->mAction = daTbox2_c::ACTION_WAIT_e;
+    chest->openInit();
+    if (chest->mpBck != nullptr) {
+        chest->mpBck->setFrame(chest->mpBck->getEndFrame());
+        chest->mpBck->setPlaySpeed(0.0f);
+    }
+    coop_log::info("coop_mod: [CHEST] no-save chest {:#x} emptied remotely, closing",
+        msg.key);
+}
+
+void tbox2_update() {
+    if (!coop_net_connected() || !coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) return;
+    const char* here = dComIfGp_getStartStageName();
+    if (here == nullptr) return;
+    if (std::strncmp(here, s_tbox2Stage, sizeof(s_tbox2Stage) - 1) != 0) {
+        std::strncpy(s_tbox2Stage, here, sizeof(s_tbox2Stage) - 1);
+        s_tbox2Stage[sizeof(s_tbox2Stage) - 1] = 0;
+        for (uint32_t& sent : s_tbox2Sent) sent = 0;
+    }
+    fopAcM_Search(collect_open_tbox2, nullptr);
+}
+
+struct BundleTrack {
+    bool have = false;
+    char stage[8] = {};
+    int saveNo = -1;
+    uint8_t ev[kEventSize] = {};
+    uint8_t sw[kMemSwitchEnd - kMemSwitchFirst] = {};
+    uint8_t newEv[kEventSize] = {};
+    uint8_t newSw[kMemSwitchEnd - kMemSwitchFirst] = {};
+
+    uint8_t offEv[kEventSize] = {};
+    uint8_t offSw[kMemSwitchEnd - kMemSwitchFirst] = {};
+    bool open = false;
+
+    uint8_t keys = 0;
+    uint32_t keySpentTick = 0;
+    const char* lockWhy = "key lock";
+    uint8_t recentSw[kMemSwitchEnd - kMemSwitchFirst] = {};
+    uint32_t recentSwTick = 0;
+};
+BundleTrack s_bundle;
+const uint32_t kKeyLockTicks = 180;
+
+void send_save_switch(const char stage[8], int saveNo, int sw, const char* why) {
+    MsgShopSoldOut msg{};
+    std::memcpy(msg.stage, stage, sizeof(msg.stage));
+    msg.saveNo = static_cast<int8_t>(saveNo);
+    msg.sw = static_cast<uint8_t>(sw);
+    coop_net_send(kMsgShopSoldOut, &msg, sizeof(msg));
+    coop_log::info("coop_mod: [SWITCH] {} sw={} on, sent", why, sw);
+}
+
+void send_switch_bits(const char stage[8], int saveNo, const uint8_t* bits, const char* why) {
+    for (int i = 0; i < kMemSwitchEnd - kMemSwitchFirst; ++i) {
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((bits[i] & (1u << bit)) == 0) continue;
+            send_save_switch(stage, saveNo, (i / 4) * 32 + (3 - i % 4) * 8 + bit, why);
+        }
+    }
+}
+
+struct PendingBundle {
+    bool used = false;
+    MsgStoryBundle msg{};
+    int heldLoads = 0;
+};
+const int kPendingBundles = 64;
+PendingBundle s_pendingBundles[kPendingBundles];
+int s_pendingBundleNext = 0;
+
+void bundle_reset() {
+    s_bundle = BundleTrack{};
+    for (PendingBundle& p : s_pendingBundles) p = PendingBundle{};
+}
+
+void bundle_close() {
+    if (!s_bundle.open) return;
+    s_bundle.open = false;
+    MsgStoryBundle msg{};
+    std::memcpy(msg.stage, s_bundle.stage, sizeof(msg.stage));
+    msg.saveNo = static_cast<int8_t>(s_bundle.saveNo);
+
+    int flags = 0;
+    int switches = 0;
+    for (int b = 0; b < kEventSize; ++b) {
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((s_bundle.newEv[b] & (1u << bit)) == 0) continue;
+            if (flags < kBundleFlags) msg.flags[flags] = static_cast<uint16_t>((b << 8) | (1u << bit));
+            ++flags;
+        }
+    }
+    for (int i = 0; i < kMemSwitchEnd - kMemSwitchFirst; ++i) {
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((s_bundle.newSw[i] & (1u << bit)) == 0) continue;
+            if (switches < kBundleSwitches) {
+                msg.sw[switches] = static_cast<uint8_t>((i / 4) * 32 + (3 - i % 4) * 8 + bit);
+            }
+            ++switches;
+        }
+    }
+
+    int offs = 0;
+    int swOffs = 0;
+    for (int b = 0; b < kEventSize; ++b) {
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((s_bundle.offEv[b] & (1u << bit)) == 0) continue;
+            const uint16_t flag = static_cast<uint16_t>((b << 8) | (1u << bit));
+            const StoryFlagInfo* f = story_flag_info(flag);
+            if (f == nullptr || (f->policy != kStoryShare && f->policy != kStoryLayer)) continue;
+            if (offs < kBundleOff) msg.off[offs] = flag;
+            ++offs;
+        }
+    }
+    for (int i = 0; i < kMemSwitchEnd - kMemSwitchFirst; ++i) {
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((s_bundle.offSw[i] & (1u << bit)) == 0) continue;
+            if (swOffs < kBundleOff) msg.swOff[swOffs] = static_cast<uint8_t>((i / 4) * 32 + (3 - i % 4) * 8 + bit);
+            ++swOffs;
+        }
+    }
+    std::memset(s_bundle.newEv, 0, sizeof(s_bundle.newEv));
+    std::memset(s_bundle.newSw, 0, sizeof(s_bundle.newSw));
+    std::memset(s_bundle.offEv, 0, sizeof(s_bundle.offEv));
+    std::memset(s_bundle.offSw, 0, sizeof(s_bundle.offSw));
+
+    if (flags == 0 || flags > kBundleFlags || switches > kBundleSwitches || offs > kBundleOff ||
+        swOffs > kBundleOff) {
+        return;
+    }
+    msg.flagCount = static_cast<uint8_t>(flags);
+    msg.swCount = static_cast<uint8_t>(switches);
+    msg.offCount = static_cast<uint8_t>(offs);
+    msg.swOffCount = static_cast<uint8_t>(swOffs);
+    coop_net_send(kMsgStoryBundle, &msg, sizeof(msg));
+    char name[9] = {};
+    std::memcpy(name, s_bundle.stage, 8);
+    coop_log::info("coop_mod: [STORY] scene sent stage={} flags={} first={:#06x} {} off={} switches={}/{}",
+        name, msg.flagCount, msg.flags[0], story_flag_name(msg.flags[0]), msg.offCount, msg.swCount,
+        msg.swOffCount);
+}
+
+void bundle_track() {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    char stage[8];
+    int saveNo = -1;
+    if (info == nullptr || !current_stage(stage, saveNo)) return;
+    const uint8_t* ev = info->getSavedata().getEvent().mEvent;
+    const uint8_t* sw = mem_bytes(info->getMemory()) + kMemSwitchFirst;
+    if (!s_bundle.have || saveNo != s_bundle.saveNo || std::memcmp(stage, s_bundle.stage, 8) != 0) {
+        bundle_close();
+        s_bundle.have = true;
+        std::memcpy(s_bundle.stage, stage, 8);
+        s_bundle.saveNo = saveNo;
+        std::memcpy(s_bundle.ev, ev, kEventSize);
+        std::memcpy(s_bundle.sw, sw, sizeof(s_bundle.sw));
+        s_bundle.keys = mem_bytes(info->getMemory())[kKeyOffset];
+        s_bundle.keySpentTick = 0;
+        s_bundle.recentSwTick = 0;
+        return;
+    }
+    const bool overworld = !dungeon_stage(stage);
+    const uint8_t keys = mem_bytes(info->getMemory())[kKeyOffset];
+
+    if (s_bundle.keySpentTick != 0 && local_mid_sequence()) s_bundle.keySpentTick = s_tick != 0 ? s_tick : 1;
+    if (overworld && keys < s_bundle.keys) {
+        s_bundle.keySpentTick = s_tick != 0 ? s_tick : 1;
+        s_bundle.lockWhy = "key lock";
+
+        if (s_bundle.recentSwTick != 0 && s_tick - s_bundle.recentSwTick < kKeyLockTicks) {
+            send_switch_bits(stage, saveNo, s_bundle.recentSw, "key lock");
+        }
+        s_bundle.recentSwTick = 0;
+    }
+    s_bundle.keys = keys;
+    const bool keyJustSpent =
+        s_bundle.keySpentTick != 0 && s_tick - s_bundle.keySpentTick < kKeyLockTicks;
+    bool fresh = false;
+    for (int b = 0; b < kEventSize; ++b) {
+        const uint8_t on = static_cast<uint8_t>(ev[b] & ~s_bundle.ev[b] & ~story_private(b));
+        if (on != 0) {
+            s_bundle.newEv[b] = static_cast<uint8_t>(s_bundle.newEv[b] | on);
+            s_bundle.offEv[b] = static_cast<uint8_t>(s_bundle.offEv[b] & ~on);
+            fresh = true;
+        }
+
+        const uint8_t off = static_cast<uint8_t>(s_bundle.ev[b] & ~ev[b] & ~story_private(b));
+        if (off != 0 && (s_bundle.open || local_mid_sequence())) {
+            s_bundle.offEv[b] = static_cast<uint8_t>(s_bundle.offEv[b] | off);
+            s_bundle.newEv[b] = static_cast<uint8_t>(s_bundle.newEv[b] & ~off);
+        }
+        s_bundle.ev[b] = ev[b];
+    }
+    for (int i = 0; i < kMemSwitchEnd - kMemSwitchFirst; ++i) {
+        const uint8_t swOff = static_cast<uint8_t>(s_bundle.sw[i] & ~sw[i]);
+        if (swOff != 0 && (s_bundle.open || local_mid_sequence()) && overworld_switch_byte(stage, kMemSwitchFirst + i)) {
+            s_bundle.offSw[i] = static_cast<uint8_t>(s_bundle.offSw[i] | swOff);
+            s_bundle.newSw[i] = static_cast<uint8_t>(s_bundle.newSw[i] & ~swOff);
+        }
+        const uint8_t on = static_cast<uint8_t>(sw[i] & ~s_bundle.sw[i]);
+        if (on != 0 && overworld_switch_byte(stage, kMemSwitchFirst + i)) {
+            s_bundle.offSw[i] = static_cast<uint8_t>(s_bundle.offSw[i] & ~on);
+            s_bundle.newSw[i] = static_cast<uint8_t>(s_bundle.newSw[i] | on);
+            fresh = true;
+            if (keyJustSpent) {
+                uint8_t one[kMemSwitchEnd - kMemSwitchFirst] = {};
+                one[i] = on;
+                send_switch_bits(stage, saveNo, one, s_bundle.lockWhy);
+            } else {
+                if (s_bundle.recentSwTick == 0 || s_tick - s_bundle.recentSwTick >= kKeyLockTicks) {
+                    std::memset(s_bundle.recentSw, 0, sizeof(s_bundle.recentSw));
+                }
+                s_bundle.recentSw[i] = static_cast<uint8_t>(s_bundle.recentSw[i] | on);
+                s_bundle.recentSwTick = s_tick != 0 ? s_tick : 1;
+            }
+        }
+        s_bundle.sw[i] = sw[i];
+    }
+    if (fresh) s_bundle.open = true;
+    if (s_bundle.open && !local_mid_sequence()) bundle_close();
+}
+
+void bundle_on_message(const MsgStoryBundle& msg) {
+    if (msg.saveNo < 0 || msg.saveNo >= dSv_save_c::STAGE_MAX) return;
+    if (msg.flagCount == 0 || msg.flagCount > kBundleFlags || msg.swCount > kBundleSwitches ||
+        msg.offCount > kBundleOff || msg.swOffCount > kBundleOff) {
+        return;
+    }
+
+    bool ours = true;
+    for (int i = 0; i < msg.flagCount && ours; ++i) ours = dComIfGs_isEventBit(msg.flags[i]) != 0;
+    if (ours) {
+        coop_log::info("coop_mod: [STORY] scene from {:.8} already played here, left alone", msg.stage);
+        return;
+    }
+    PendingBundle& p = s_pendingBundles[s_pendingBundleNext];
+    s_pendingBundleNext = (s_pendingBundleNext + 1) % kPendingBundles;
+    p.used = true;
+    p.msg = msg;
+    coop_log::info("coop_mod: [STORY] bundle held flags={} first={:#06x} {} switches={}", msg.flagCount,
+        msg.flags[0], story_flag_name(msg.flags[0]), msg.swCount);
+}
+
+void bundle_apply_ready() {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    char stage[8];
+    int saveNo = -1;
+    if (info == nullptr || !current_stage(stage, saveNo) || local_mid_sequence()) return;
+    for (PendingBundle& p : s_pendingBundles) {
+        if (!p.used) continue;
+        bool ready = true;
+        for (int i = 0; i < p.msg.flagCount && ready; ++i) {
+            ready = dComIfGs_isEventBit(p.msg.flags[i]) != 0;
+        }
+        if (!ready) continue;
+        char name[9] = {};
+        std::memcpy(name, p.msg.stage, 8);
+        const bool sameSlot = saveNo == p.msg.saveNo;
+        uint8_t* target = sameSlot ? mem_bytes(info->getMemory())
+                                   : mem_bytes(info->getSavedata().getSave(p.msg.saveNo));
+        int turned = 0;
+        for (int i = 0; i < p.msg.swCount; ++i) {
+            const uint8_t sw = p.msg.sw[i];
+            if (sw >= 0x80) continue;
+            if (p.msg.saveNo == kKakarikoSlot && sw == kBombHouseGoneSw) continue;
+            const int byte = kMemSwitchFirst + 4 * (sw >> 5) + (3 - ((sw & 31) >> 3));
+            if (!overworld_switch_byte(name, byte)) continue;
+            const uint8_t bit = static_cast<uint8_t>(1u << (sw & 7));
+            if ((target[byte] & bit) != 0) continue;
+            target[byte] = static_cast<uint8_t>(target[byte] | bit);
+
+            if (sameSlot && s_bundle.have) {
+                s_bundle.sw[byte - kMemSwitchFirst] =
+                    static_cast<uint8_t>(s_bundle.sw[byte - kMemSwitchFirst] | bit);
+            }
+            ++turned;
+        }
+        for (int i = 0; i < p.msg.swOffCount; ++i) {
+            const uint8_t sw = p.msg.swOff[i];
+            if (sw >= 0x80) continue;
+            const int byte = kMemSwitchFirst + 4 * (sw >> 5) + (3 - ((sw & 31) >> 3));
+            if (!overworld_switch_byte(name, byte)) continue;
+            const uint8_t bit = static_cast<uint8_t>(1u << (sw & 7));
+            if ((target[byte] & bit) == 0) continue;
+            target[byte] = static_cast<uint8_t>(target[byte] & ~bit);
+            if (sameSlot && s_bundle.have) {
+                s_bundle.sw[byte - kMemSwitchFirst] = static_cast<uint8_t>(s_bundle.sw[byte - kMemSwitchFirst] & ~bit);
+            }
+            ++turned;
+        }
+
+        uint8_t* ev = info->getSavedata().getEvent().mEvent;
+        int cleared = 0;
+        for (int i = 0; i < p.msg.offCount; ++i) {
+            const uint16_t flag = p.msg.off[i];
+            const StoryFlagInfo* f = story_flag_info(flag);
+            if (f == nullptr || (f->policy != kStoryShare && f->policy != kStoryLayer)) continue;
+            const int b = flag >> 8;
+            const uint8_t bit = static_cast<uint8_t>(flag & 0xFF);
+            if (b >= kEventSize || (story_private(b) & bit) != 0 || (ev[b] & bit) == 0) continue;
+            ev[b] = static_cast<uint8_t>(ev[b] & ~bit);
+            if (s_bundle.have) s_bundle.ev[b] = static_cast<uint8_t>(s_bundle.ev[b] & ~bit);
+            ++cleared;
+        }
+        coop_log::info("coop_mod: [STORY] scene applied stage={} flag={:#06x} {} switches={} flags off={} live={}",
+            name, p.msg.flags[0], story_flag_name(p.msg.flags[0]), turned, cleared, sameSlot);
+        p = PendingBundle{};
+    }
+}
+
+void story_repair_companions(uint8_t* ev) {
+    for (const StoryCompanion& c : kStoryCompanions) {
+        const int a = c.flag >> 8;
+        const int b = c.with >> 8;
+        const uint8_t abit = static_cast<uint8_t>(c.flag & 0xFF);
+        const uint8_t bbit = static_cast<uint8_t>(c.with & 0xFF);
+
+        if ((story_private(a) & abit) != 0 || (story_private(b) & bbit) != 0) continue;
+        if ((ev[b] & bbit) == 0 || (ev[a] & abit) != 0) continue;
+        ev[a] = static_cast<uint8_t>(ev[a] | abit);
+        coop_log::info("coop_mod: [STORY] repair: {:#06x} {} set, it comes with {:#06x} {}", c.flag,
+            story_flag_name(c.flag), c.with, story_flag_name(c.with));
+    }
+}
+
+void story_apply_pending(dSv_info_c* info);
+
+HookAction on_stage_load_pre(ModContext*, void*, void*, void*) {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return HOOK_CONTINUE;
+
+    if (s_statusBPending[0] != 0 || s_statusBPending[1] != 0) {
+        uint8_t* cur = status_b_flags(info);
+        for (int i = 0; i < kStatusBSize; ++i) {
+            cur[i] = static_cast<uint8_t>(cur[i] | s_statusBPending[i]);
+            if (s_statusB.have) s_statusB.bytes[i] = static_cast<uint8_t>(s_statusB.bytes[i] | s_statusBPending[i]);
+        }
+        coop_log::info("coop_mod: [WORLD] stage load, transform/twilight flags {:#04x}/{:#04x}", cur[0], cur[1]);
+        std::memset(s_statusBPending, 0, sizeof(s_statusBPending));
+    }
+    if (features_load_is_cutscene() && s_storyPendingBits != 0) {
+        coop_log::info("coop_mod: [STORY] {} remote flags kept for the next load: this one is part of a scene",
+            s_storyPendingBits);
+        story_repair_companions(info->getSavedata().getEvent().mEvent);
+        return HOOK_CONTINUE;
+    }
+    story_apply_pending(info);
+    return HOOK_CONTINUE;
+}
+
+struct OwnScene {
+    uint16_t flag;
+    const char* stage;
+};
+const OwnScene kOwnScene[] = {
+    {dSv_event_flag_c::M_009, "R_SP107"},
+    {dSv_event_flag_c::M_014, "R_SP107"},
+
+    {dSv_event_flag_c::M_010, "R_SP107"},
+    {dSv_event_flag_c::M_011, "R_SP107"},
+    {dSv_event_flag_c::M_012, "R_SP107"},
+    {dSv_event_flag_c::M_016, "F_SP104"},
+    {dSv_event_flag_c::M_017, "F_SP108"},
+    {dSv_event_flag_c::M_019, "F_SP108"},
+};
+
+const int kMaxHeldLoads = 3;
+int s_ownSceneHeld[sizeof(kOwnScene) / sizeof(kOwnScene[0])] = {};
+
+void story_apply_pending(dSv_info_c* info) {
+    uint8_t* ev = info->getSavedata().getEvent().mEvent;
+    if (s_storyPendingBits == 0) {
+        story_repair_companions(ev);
+        return;
+    }
+    uint8_t later[kEventSize] = {};
+    const char* here = dComIfGp_getStartStageName();
+
+    for (PendingBundle& p : s_pendingBundles) {
+        if (!p.used || here == nullptr || std::strncmp(here, p.msg.stage, 8) != 0) continue;
+        if (p.heldLoads >= kMaxHeldLoads) continue;
+        bool layer = false;
+        for (int i = 0; i < p.msg.flagCount && !layer; ++i) {
+            const StoryFlagInfo* f = story_flag_info(p.msg.flags[i]);
+            layer = f != nullptr && f->policy == kStoryLayer;
+        }
+        if (!layer) continue;
+        ++p.heldLoads;
+        for (int i = 0; i < p.msg.flagCount; ++i) {
+            const int b = p.msg.flags[i] >> 8;
+            const uint8_t bit = static_cast<uint8_t>(p.msg.flags[i] & 0xFF);
+            if (b >= kEventSize || (s_storyPending[b] & bit) == 0) continue;
+            later[b] = static_cast<uint8_t>(later[b] | bit);
+            s_storyPending[b] = static_cast<uint8_t>(s_storyPending[b] & ~bit);
+        }
+        coop_log::info("coop_mod: [STORY] scene from {:.8} kept for later: it changes this stage", here);
+    }
+    for (size_t k = 0; k < sizeof(kOwnScene) / sizeof(kOwnScene[0]); ++k) {
+        const OwnScene& o = kOwnScene[k];
+        const int b = o.flag >> 8;
+        const uint8_t bit = static_cast<uint8_t>(o.flag & 0xFF);
+        if (here == nullptr || std::strncmp(here, o.stage, 8) != 0 || (s_storyPending[b] & bit) == 0) {
+            s_ownSceneHeld[k] = 0;
+            continue;
+        }
+        if (++s_ownSceneHeld[k] > kMaxHeldLoads) {
+            s_ownSceneHeld[k] = 0;
+            coop_log::info("coop_mod: [STORY] flag {:#06x} {} held {} loads, taken now", o.flag,
+                story_flag_name(o.flag), kMaxHeldLoads);
+            continue;
+        }
+        later[b] = static_cast<uint8_t>(later[b] | bit);
+        s_storyPending[b] = static_cast<uint8_t>(s_storyPending[b] & ~bit);
+        coop_log::info("coop_mod: [STORY] flag {:#06x} {} kept for later, its own scene is in {:.8}", o.flag,
+            story_flag_name(o.flag), here);
+    }
+
+    for (int b = 0; b < kEventSize; ++b) {
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint8_t m = static_cast<uint8_t>(1u << bit);
+            if ((s_storyPending[b] & m) == 0) continue;
+            const uint16_t flag = static_cast<uint16_t>((b << 8) | m);
+            if (features_story_flag_applies_now(flag)) continue;
+            later[b] = static_cast<uint8_t>(later[b] | m);
+            s_storyPending[b] = static_cast<uint8_t>(s_storyPending[b] & ~m);
+            coop_log::info("coop_mod: [STORY] flag {:#06x} {} kept, too early here", flag, story_flag_name(flag));
+        }
+    }
+
+    for (int b = 0; b < kEventSize; ++b) {
+        const uint8_t fresh = static_cast<uint8_t>(s_storyPending[b] & ~ev[b]);
+        for (int bit = 0; bit < 8 && fresh != 0; ++bit) {
+            if ((fresh & (1u << bit)) == 0) continue;
+            const uint16_t flag = static_cast<uint16_t>((b << 8) | (1u << bit));
+            const StoryFlagInfo* f = story_flag_info(flag);
+            if (f != nullptr && f->policy == kStoryLayer) {
+                coop_log::info("coop_mod: [STORY] layer flag {:#06x} {} taken", flag, f->name);
+            }
+        }
+    }
+    for (int b = 0; b < kEventSize; ++b) {
+        ev[b] = static_cast<uint8_t>(ev[b] | s_storyPending[b]);
+
+        if (s_base.haveEvent) s_base.event[b] = static_cast<uint8_t>(s_base.event[b] | s_storyPending[b]);
+        if (s_bundle.have) s_bundle.ev[b] = static_cast<uint8_t>(s_bundle.ev[b] | s_storyPending[b]);
+    }
+    coop_log::info("coop_mod: [STORY] stage load, applying {} remote flags", s_storyPendingBits);
+
+    for (PendingBundle& p : s_pendingBundles) {
+        if (!p.used || p.msg.offCount == 0) continue;
+        bool all = true;
+        for (int i = 0; i < p.msg.flagCount && all; ++i) {
+            const int b = p.msg.flags[i] >> 8;
+            all = b < kEventSize && (ev[b] & (p.msg.flags[i] & 0xFF)) != 0;
+        }
+        if (!all) continue;
+        for (int i = 0; i < p.msg.offCount; ++i) {
+            const uint16_t flag = p.msg.off[i];
+            const StoryFlagInfo* f = story_flag_info(flag);
+            if (f == nullptr || (f->policy != kStoryShare && f->policy != kStoryLayer)) continue;
+            const int b = flag >> 8;
+            const uint8_t bit = static_cast<uint8_t>(flag & 0xFF);
+            if (b >= kEventSize || (story_private(b) & bit) != 0) continue;
+            ev[b] = static_cast<uint8_t>(ev[b] & ~bit);
+            if (s_bundle.have) s_bundle.ev[b] = static_cast<uint8_t>(s_bundle.ev[b] & ~bit);
+            if (s_base.haveEvent) s_base.event[b] = static_cast<uint8_t>(s_base.event[b] & ~bit);
+        }
+        coop_log::info("coop_mod: [STORY] scene offs applied at the load ({} flags)", p.msg.offCount);
+        p.msg.offCount = 0;
+    }
+    std::memset(s_storyPending, 0, sizeof(s_storyPending));
+    s_storyPendingBits = 0;
+    for (int b = 0; b < kEventSize; ++b) {
+        s_storyPending[b] = later[b];
+        s_storyPendingBits += bit_count(later[b]);
+    }
+    story_repair_companions(ev);
+}
+
+struct RoomRebuild {
+    bool active = false;
+    uint32_t at = 0;
+    bool rooms[kRooms] = {};
+};
+RoomRebuild s_rebuild;
+
+room_of_scene_class* loaded_room_scene(int room) {
+    if (dComIfGp_roomControl_checkStatusFlag(room, 8)) return nullptr;
+    const fpc_ProcID id = dStage_roomControl_c::getStatusProcID(room);
+    if (id == fpcM_ERROR_PROCESS_ID_e) return nullptr;
+    auto* scene = static_cast<room_of_scene_class*>(fopScnM_SearchByID(id));
+    if (scene == nullptr || static_cast<int>(fopScnM_GetParam(scene)) != room) return nullptr;
+    if (scene->roomInfo == nullptr || scene->roomDt == nullptr) return nullptr;
+    return scene;
+}
+
+void* delete_room_object(void* proc, void*) {
+    if (fpcM_GetProfName(proc) != fpcNm_BG_e) fpcM_Delete(proc);
+    return nullptr;
+}
+
+void* creating_in_layer(void* tag, void* layerId) {
+    auto* request = static_cast<create_request*>(static_cast<create_tag*>(tag)->base.mpTagData);
+    return request->layer->layer_id == *static_cast<fpc_ProcID*>(layerId) ? request : nullptr;
+}
+
+bool room_is_creating(room_of_scene_class* scene) {
+    fpc_ProcID layer = fpcM_LayerID(scene);
+    return fpcCtIt_Judge(creating_in_layer, &layer) != nullptr;
+}
+
+void room_rebuild_update() {
+    if (!s_rebuild.active || static_cast<int32_t>(s_tick - s_rebuild.at) < 0) return;
+    s_rebuild.active = false;
+    for (int r = 0; r < kRooms; ++r) {
+        if (!s_rebuild.rooms[r]) continue;
+        s_rebuild.rooms[r] = false;
+        room_of_scene_class* scene = loaded_room_scene(r);
+        if (scene == nullptr) continue;
+        dStage_dt_c_roomReLoader(scene->roomInfo, scene->roomDt, r);
+        scene->field_0x1d5 = 1;
+        enemies_room_rebuilt(r);
+        coop_log::info("coop_mod: [STORY] room {} rebuilt on layer {}", r, dComIfG_play_c::getLayerNo(0));
+    }
+}
+
+void forget_pending_story(ModContext*, uint32_t, void*) {
+    if (s_storyPendingBits != 0) {
+        coop_log::info("coop_mod: [STORY] file changed, dropped {} pending flags",
+            s_storyPendingBits);
+    }
+    std::memset(s_storyPending, 0, sizeof(s_storyPending));
+    s_storyPendingBits = 0;
+    std::memset(s_statusBPending, 0, sizeof(s_statusBPending));
+    bundle_reset();
+}
+
+}
+
+namespace {
+
+uint8_t s_shopSwBefore[kMemSwitchEnd - kMemSwitchFirst];
+
+char s_jumpStage[8] = {};
+int s_jumpSaveNo = -1;
+uint8_t s_jumpSeen[kMemSwitchEnd - kMemSwitchFirst] = {};
+uint8_t s_jumpKnown[kMemSwitchEnd - kMemSwitchFirst] = {};
+
+int switch_byte(int sw) {
+    return kMemSwitchFirst + 4 * (sw >> 5) + (3 - ((sw & 31) >> 3));
+}
+
+int watched_switch(fopAc_ac_c* actor) {
+    const s16 name = fopAcM_GetName(actor);
+    if (name == fpcNm_Tag_Wljump_e) return (fopAcM_GetParam(actor) >> 8) & 0xFF;
+    if (name == fpcNm_BG_OBJ_e) {
+        auto* bg = static_cast<daBgObj_c*>(actor);
+        if (bg->mSpecData.mSpecType != 0) return bg->field_0xccc & 0xFF;
+    }
+    return 0xFF;
+}
+
+void* watch_jump_tag(void* proc, void*) {
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    if (actor == nullptr) return nullptr;
+    const int sw = watched_switch(actor);
+    if (sw >= 0x80) return nullptr;
+    const int i = switch_byte(sw) - kMemSwitchFirst;
+    const uint8_t bit = static_cast<uint8_t>(1u << (sw & 7));
+    const uint8_t* mem = mem_bytes(dComIfGs_getSaveInfo()->getMemory());
+    const bool on = (mem[switch_byte(sw)] & bit) != 0;
+    const bool seen = (s_jumpSeen[i] & bit) != 0;
+    const bool known = (s_jumpKnown[i] & bit) != 0;
+    s_jumpSeen[i] = static_cast<uint8_t>(s_jumpSeen[i] | bit);
+    if (on) s_jumpKnown[i] = static_cast<uint8_t>(s_jumpKnown[i] | bit);
+
+    if (!seen || !on || known) return nullptr;
+    MsgShopSoldOut msg{};
+    std::memcpy(msg.stage, s_jumpStage, sizeof(msg.stage));
+    msg.saveNo = static_cast<int8_t>(s_jumpSaveNo);
+    msg.sw = static_cast<uint8_t>(sw);
+    coop_net_send(kMsgShopSoldOut, &msg, sizeof(msg));
+    coop_log::info("coop_mod: [SWITCH] {} sw={} on, sent",
+        fopAcM_GetName(actor) == fpcNm_BG_OBJ_e ? "broken rock" : "jump spot", sw);
+    return nullptr;
+}
+
+void jump_switch_update() {
+    char stage[8];
+    int saveNo = -1;
+    if (dComIfGs_getSaveInfo() == nullptr || !current_stage(stage, saveNo)) return;
+    if (dungeon_stage(stage)) return;
+    if (saveNo != s_jumpSaveNo || std::memcmp(stage, s_jumpStage, 8) != 0) {
+        std::memcpy(s_jumpStage, stage, 8);
+        s_jumpSaveNo = saveNo;
+        std::memset(s_jumpSeen, 0, sizeof(s_jumpSeen));
+        std::memset(s_jumpKnown, 0, sizeof(s_jumpKnown));
+    }
+    fopAcM_Search(watch_jump_tag, nullptr);
+}
+bool s_shopSwArmed = false;
+
+HookAction on_shop_sold_out_pre(ModContext*, void*, void*, void*) {
+    s_shopSwArmed = daAlink_getAlinkActorClass() != nullptr;
+    if (s_shopSwArmed) {
+        std::memcpy(s_shopSwBefore, mem_bytes(dComIfGs_getSaveInfo()->getMemory()) + kMemSwitchFirst,
+            sizeof(s_shopSwBefore));
+    }
+    return HOOK_CONTINUE;
+}
+
+void on_shop_sold_out_post(ModContext*, void*, void*, void*) {
+    if (!s_shopSwArmed) return;
+    s_shopSwArmed = false;
+    if (!coop_net_connected() || !coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) return;
+    char stage[8];
+    int saveNo = 0;
+    if (!current_stage(stage, saveNo)) return;
+    const uint8_t* now = mem_bytes(dComIfGs_getSaveInfo()->getMemory());
+    for (int b = kMemSwitchFirst; b < kMemSwitchEnd; ++b) {
+        const uint8_t added = static_cast<uint8_t>(now[b] & ~s_shopSwBefore[b - kMemSwitchFirst]);
+        if (added == 0 || !overworld_switch_byte(stage, b)) continue;
+        for (int bit = 0; bit < 8; ++bit) {
+            if ((added & (1 << bit)) == 0) continue;
+            const int off = b - kMemSwitchFirst;
+            MsgShopSoldOut msg{};
+            std::memcpy(msg.stage, stage, sizeof(msg.stage));
+            msg.saveNo = static_cast<int8_t>(saveNo);
+            msg.sw = static_cast<uint8_t>((off / 4) * 32 + (3 - off % 4) * 8 + bit);
+            coop_net_send(kMsgShopSoldOut, &msg, sizeof(msg));
+            coop_log::info("coop_mod: [SHOP] sold out stage={} sw={}", stage, msg.sw);
+        }
+    }
+}
+
+void apply_shop_sold_out(const MsgShopSoldOut& msg) {
+    if (!coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) return;
+    if (msg.saveNo < 0 || msg.saveNo >= dSv_save_c::STAGE_MAX || msg.sw >= 0x80) return;
+    if (msg.saveNo == kKakarikoSlot && msg.sw == kBombHouseGoneSw) return;
+    char name[9] = {};
+    std::memcpy(name, msg.stage, 8);
+    const int byte = kMemSwitchFirst + 4 * (msg.sw >> 5) + (3 - ((msg.sw & 31) >> 3));
+    if (!overworld_switch_byte(name, byte)) return;
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    char stage[8];
+    int saveNo = 0;
+    const bool sameSlot = current_stage(stage, saveNo) && saveNo == msg.saveNo;
+    uint8_t* target = sameSlot ? mem_bytes(info->getMemory())
+                               : mem_bytes(info->getSavedata().getSave(msg.saveNo));
+    target[byte] = static_cast<uint8_t>(target[byte] | (1 << (msg.sw & 7)));
+
+    if (sameSlot && s_bundle.have && s_bundle.saveNo == saveNo) {
+        s_bundle.sw[byte - kMemSwitchFirst] =
+            static_cast<uint8_t>(s_bundle.sw[byte - kMemSwitchFirst] | (1 << (msg.sw & 7)));
+    }
+    if (sameSlot && s_jumpSaveNo == saveNo) {
+        s_jumpKnown[byte - kMemSwitchFirst] =
+            static_cast<uint8_t>(s_jumpKnown[byte - kMemSwitchFirst] | (1 << (msg.sw & 7)));
+    }
+    coop_log::info("coop_mod: [SWITCH] remote stage={} sw={} live={}", name, msg.sw, sameSlot);
+}
+
+}
+
+void world_register_vars() {
+    ConfigVarDesc dungeon = CONFIG_VAR_DESC_INIT;
+    dungeon.name = "share_dungeon_progress";
+    dungeon.type = CONFIG_VAR_BOOL;
+    dungeon.default_bool = true;
+    if (svc_config->register_var(mod_ctx, &dungeon, &s_dungeonVar) != MOD_OK) s_dungeonVar = 0;
+
+    ConfigVarDesc story = CONFIG_VAR_DESC_INIT;
+    story.name = "share_story_progress";
+    story.type = CONFIG_VAR_BOOL;
+    story.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &story, &s_storyVar) != MOD_OK) s_storyVar = 0;
+
+    ConfigVarDesc selfTest = CONFIG_VAR_DESC_INIT;
+    selfTest.name = "debug_world_selftest_ticks";
+    selfTest.type = CONFIG_VAR_INT;
+    selfTest.default_int = 0;
+    if (svc_config->register_var(mod_ctx, &selfTest, &s_selfTestVar) != MOD_OK) s_selfTestVar = 0;
+
+    const ModResult storyHook = mods::hook::add_pre<StoryStageLoadHook>(on_stage_load_pre);
+    coop_log::info("coop_mod: [STORY] stage-load hook: {}", static_cast<int>(storyHook));
+    if (svc_save != nullptr) {
+        svc_save->observe_saves(mod_ctx, forget_pending_story, forget_pending_story, nullptr,
+            nullptr, nullptr);
+    }
+
+    const ModResult r = mods::hook::add_pre<TboxOpenWaitHook>(
+        [](ModContext*, void* args, void* retval, void*) -> HookAction {
+            auto* chest = mods::arg<daTbox_c*>(args, 0);
+            if (chest == nullptr) return HOOK_CONTINUE;
+            const int no = chest->getTboxNo();
+            if (no < 0 || no >= 64) return HOOK_CONTINUE;
+
+            if (!dComIfGs_isTbox(no) && !s_scrubbedByRemote[no]) return HOOK_CONTINUE;
+
+            static bool said[64] = {};
+            if (!said[no]) {
+                said[no] = true;
+                coop_log::info("coop_mod: [CHEST] {} already emptied, open refused", no);
+            }
+            if (retval != nullptr) *static_cast<int*>(retval) = 1;
+            return HOOK_SKIP_ORIGINAL;
+        });
+    coop_log::info("coop_mod: [CHEST] open guard installed: {}", static_cast<int>(r));
+    const bool shopPre = mods::hook::add_pre<ShopSoldOutHook>(on_shop_sold_out_pre) == MOD_OK;
+    const bool shopPost = mods::hook::add_post<ShopSoldOutHook>(on_shop_sold_out_post) == MOD_OK;
+    coop_log::info("coop_mod: [SHOP] sold-out hook: {}", shopPre && shopPost ? "ok" : "failed");
+}
+
+ConfigVarHandle world_dungeon_var() {
+    return s_dungeonVar;
+}
+
+ConfigVarHandle world_story_var() {
+    return s_storyVar;
+}
+
+void world_update() {
+    ++s_tick;
+    if (!coop_net_connected()) {
+        s_base.have = false;
+        s_heldWorldCount = 0;
+        return;
+    }
+
+    if (!rando_join_sync_allowed()) {
+        s_base.have = false;
+        s_heldWorldCount = 0;
+        return;
+    }
+
+    if (coop_on_title_screen() || !joinsync_ready_to_share()) {
+        s_base.have = false;
+        s_heldWorldCount = 0;
+        return;
+    }
+
+    if (s_heldWorldCount > 0 && !local_mid_sequence()) {
+        coop_log::info("coop_mod: [WORLD] sequence over, applying {} held updates",
+            s_heldWorldCount);
+        s_replayingWorld = true;
+        for (int i = 0; i < s_heldWorldCount; ++i) {
+            const HeldWorldMsg& h = s_heldWorld[i];
+            world_on_message(h.type, h.bytes, h.size, h.from);
+        }
+        s_replayingWorld = false;
+        s_heldWorldCount = 0;
+    }
+    room_rebuild_update();
+    if (coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) {
+        bundle_track();
+        if (s_tick % 30 == 0) bundle_apply_ready();
+        if (s_tick % 15 == 0) jump_switch_update();
+    }
+    if (s_tick % 10 == 0) scan();
+    if (s_tick % 30 == 0 && daAlink_getAlinkActorClass() != nullptr) retry_pending_chests();
+
+    drive_remote_chest_lids();
+    tbox2_update();
+    if (s_tick % kDigestEveryTicks == 0) {
+        dSv_info_c* info = dComIfGs_getSaveInfo();
+        char stage[8];
+        int saveNo = -1;
+
+        if (info != nullptr && current_stage(stage, saveNo)) {
+            send_digest(info, stage, saveNo);
+        }
+    }
+    run_self_test();
+}
+
+bool world_hold_story_flag(uint16_t flag) {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return false;
+    const int b = flag >> 8;
+    const uint8_t bit = static_cast<uint8_t>(flag & 0xFF);
+    if (b < 0 || b >= kEventSize || bit == 0) return false;
+    const uint8_t have = info->getSavedata().getEvent().mEvent[b];
+    if ((have & bit) == bit || (s_storyPending[b] & bit) == bit) return false;
+    s_storyPending[b] = static_cast<uint8_t>(s_storyPending[b] | bit);
+    s_storyPendingBits += bit_count(static_cast<uint8_t>(bit & ~have));
+    return true;
+}
+
+std::string world_state_dump() {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return "(no save)\n";
+    static const char kHex[] = "0123456789abcdef";
+    const auto hex = [](const uint8_t* p, int n) {
+        std::string s;
+        s.reserve(static_cast<size_t>(n) * 2);
+        for (int i = 0; i < n; ++i) {
+            s += kHex[p[i] >> 4];
+            s += kHex[p[i] & 15];
+        }
+        return s;
+    };
+    std::string out;
+    char line[256];
+    char stage[8] = {};
+    int saveNo = -1;
+    const bool here = current_stage(stage, saveNo);
+    char name[9] = {};
+    std::memcpy(name, stage, 8);
+    std::snprintf(line, sizeof(line), "stage: %s slot %d room %d layer %d\n", here ? name : "-", saveNo,
+        here ? static_cast<int>(dComIfGp_roomControl_getStayNo()) : -1,
+        here ? dComIfG_play_c::getLayerNo(0) : -1);
+    out += line;
+    std::snprintf(line, sizeof(line), "time: hour %.2f date %d passing %d dark %d\n",
+        dComIfGs_getTime() / 15.0f, static_cast<int>(dComIfGs_getDate()),
+        here && dComIfGp_roomControl_getTimePass() ? 1 : 0, here && dKy_darkworld_check() ? 1 : 0);
+    out += line;
+    const uint8_t* statusB = status_b_flags(info);
+    std::snprintf(line, sizeof(line), "statusB: transform %02x darkclear %02x\n", statusB[0], statusB[1]);
+    out += line;
+    {
+        char horse[9] = {};
+        std::memcpy(horse, dComIfGs_getHorseRestartStageName(), 8);
+        const cXyz& hp = dComIfGs_getHorseRestartPos();
+        std::snprintf(line, sizeof(line), "horse: '%s' room %d at %.0f %.0f %.0f\n", horse,
+            static_cast<int>(dComIfGs_getHorseRestartRoomNo()), hp.x, hp.y, hp.z);
+        out += line;
+    }
+    out += "flags: " + hex(info->getSavedata().getEvent().mEvent, kEventSize) + "\n";
+    out += "tmp: " + hex(info->getTmp().mEvent, kEventSize) + "\n";
+    if (here) {
+        out += "mem: " + hex(mem_bytes(info->getMemory()), kMemSize) + "\n";
+        dSv_danBit_c& dan = info->getDan();
+        std::snprintf(line, sizeof(line), "dan: stage %d ", static_cast<int>(dan.mStageNo));
+        out += line;
+        out += hex(reinterpret_cast<uint8_t*>(&dan) + kDanOffset, kDanSize) + "\n";
+    }
+    for (int i = 0; i < dSv_save_c::STAGE_MAX; ++i) {
+        std::snprintf(line, sizeof(line), "slot %02d: ", i);
+        out += line;
+        out += hex(mem_bytes(info->getSavedata().getSave(i)), kMemSize) + "\n";
+    }
+    const auto& get = info->getSavedata().getPlayer().getGetItem();
+    out += "itembits: " + hex(reinterpret_cast<const uint8_t*>(get.mItemFlags), sizeof(get.mItemFlags)) + "\n";
+    {
+        uint8_t slots[24];
+        for (int i = 0; i < 24; ++i) slots[i] = dComIfGs_getItem(i, false);
+        out += "items: " + hex(slots, 24) + "\n";
+    }
+    std::snprintf(line, sizeof(line), "life %d/%d rupees %d poes %d\n", static_cast<int>(dComIfGs_getLife()),
+        static_cast<int>(dComIfGs_getMaxLife()), static_cast<int>(dComIfGs_getRupee()),
+        static_cast<int>(dComIfGs_getPohSpiritNum()));
+    out += line;
+    std::snprintf(line, sizeof(line), "story pending %d, bundles held %d\n", s_storyPendingBits,
+        static_cast<int>(std::count_if(std::begin(s_pendingBundles), std::end(s_pendingBundles),
+            [](const PendingBundle& p) { return p.used; })));
+    out += line;
+    return out;
+}
+
+bool world_story_stale_here() {
+    if (s_storyPendingBits == 0 || daAlink_getAlinkActorClass() == nullptr) return false;
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    const char* stage = dComIfGp_getStartStageName();
+    if (info == nullptr || stage == nullptr || dungeon_stage(stage) || dKy_darkworld_check()) return false;
+    const int room = dComIfGp_roomControl_getStayNo();
+    uint8_t* ev = info->getSavedata().getEvent().mEvent;
+
+    const int fixed = dComIfGp_getStartStageLayer();
+    const int now = dComIfG_play_c::getLayerNo_common(stage, room, fixed);
+    uint8_t kept[kEventSize];
+    std::memcpy(kept, ev, kEventSize);
+    for (int b = 0; b < kEventSize; ++b) ev[b] = static_cast<uint8_t>(ev[b] | s_storyPending[b]);
+    const int then = dComIfG_play_c::getLayerNo_common(stage, room, fixed);
+    std::memcpy(ev, kept, kEventSize);
+    return now != then;
+}
+
+bool world_story_refresh_here() {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr || s_rebuild.active) return false;
+    int found = 0;
+    for (int r = 0; r < kRooms; ++r) {
+        room_of_scene_class* scene = loaded_room_scene(r);
+
+        if (scene == nullptr || scene->field_0x1d4 >= 0) continue;
+        if (room_is_creating(scene)) {
+            std::memset(s_rebuild.rooms, 0, sizeof(s_rebuild.rooms));
+            return true;
+        }
+        s_rebuild.rooms[r] = true;
+        ++found;
+    }
+    if (found == 0) return false;
+    story_apply_pending(info);
+    for (int r = 0; r < kRooms; ++r) {
+        if (!s_rebuild.rooms[r]) continue;
+        room_of_scene_class* scene = loaded_room_scene(r);
+        if (scene == nullptr) {
+            s_rebuild.rooms[r] = false;
+            continue;
+        }
+        fpcM_LyJudge(&scene->base, delete_room_object, nullptr);
+        daGrass_c::deleteRoomGrass(r);
+        daGrass_c::deleteRoomFlower(r);
+        daSus_c::reset(r);
+
+        dComIfGs_clearRoomSwitch(dComIfGp_roomControl_getZoneNo(r));
+        dComIfGs_clearRoomItem(dComIfGp_roomControl_getZoneNo(r));
+    }
+    s_rebuild.active = true;
+    s_rebuild.at = s_tick + 3;
+    coop_log::info("coop_mod: [STORY] rebuilding {} loaded room(s) for the story", found);
+    return true;
+}
+
+void world_note_item_taken() {
+    if (!coop_net_connected()) return;
+    s_bundle.keySpentTick = s_tick != 0 ? s_tick : 1;
+    s_bundle.lockWhy = "item lock";
+}
+
+void world_on_connected() {
+    bundle_reset();
+    s_base.have = false;
+    s_lightDrop.have = false;
+    s_collect.have = false;
+    s_statusB.have = false;
+    s_visited.have = false;
+    s_visitedShareDue = true;
+    s_selfTestTicks = 0;
+    s_selfTestDone = false;
+}
+
+void world_on_message(uint8_t type, const uint8_t* payload, size_t size, uint8_t from) {
+    if (!rando_join_sync_allowed()) return;
+
+    if (coop_on_title_screen() || !joinsync_ready_to_share()) return;
+    if (type == kMsgWorldSyncRequest) {
+        if (size < sizeof(MsgWorldSyncRequest) || !coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) return;
+        MsgWorldSyncRequest req;
+        std::memcpy(&req, payload, sizeof(req));
+        answer_sync_request(req);
+        return;
+    }
+    if (type == kMsgStoryBundle) {
+        if (size < sizeof(MsgStoryBundle) || !coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) return;
+        MsgStoryBundle msg;
+        std::memcpy(&msg, payload, sizeof(msg));
+        bundle_on_message(msg);
+        return;
+    }
+    if (type == kMsgShopSoldOut) {
+        if (size < sizeof(MsgShopSoldOut)) return;
+        MsgShopSoldOut msg;
+        std::memcpy(&msg, payload, sizeof(msg));
+        apply_shop_sold_out(msg);
+        return;
+    }
+    if (type == kMsgTbox2) {
+        if (size < sizeof(MsgTbox2)) return;
+        MsgTbox2 msg;
+        std::memcpy(&msg, payload, sizeof(msg));
+        open_tbox2_from_message(msg);
+        return;
+    }
+    if (type == kMsgWorldDigest) {
+        if (size < offsetof(MsgWorldDigest, storyRules)) return;
+        MsgWorldDigest msg{};
+        std::memcpy(&msg, payload, std::min(size, sizeof(msg)));
+        handle_digest(msg, from);
+        return;
+    }
+
+    if ((type == kMsgWorldFull || type == kMsgWorldDelta) && !s_replayingWorld &&
+        local_mid_sequence() && daAlink_getAlinkActorClass() != nullptr) {
+        if (s_heldWorld == nullptr) s_heldWorld = new HeldWorldMsg[kHeldWorldMax];
+        if (s_heldWorldCount < kHeldWorldMax && size <= sizeof(HeldWorldMsg::bytes)) {
+            HeldWorldMsg& h = s_heldWorld[s_heldWorldCount++];
+            h.type = type;
+            h.from = from;
+            h.size = static_cast<uint16_t>(size);
+            std::memcpy(h.bytes, payload, size);
+            if (s_heldWorldCount == 1) {
+                coop_log::info("coop_mod: [WORLD] holding remote world state during local sequence");
+            }
+            return;
+        }
+
+    }
+    if (type == kMsgWorldFull) {
+        if (size < sizeof(MsgWorldFull)) return;
+        MsgWorldFull full;
+        std::memcpy(&full, payload, sizeof(full));
+        handle_full(full);
+        return;
+    }
+    if (size < sizeof(MsgWorldDelta)) return;
+    MsgWorldDelta msg;
+    std::memcpy(&msg, payload, sizeof(msg));
+    if (msg.size > 32) return;
+    if ((msg.region == kRegionZone || msg.region == kRegionTmp) && !dungeon_stage(msg.stage)) {
+        return;
+    }
+    const bool storyRegion = msg.region == kRegionEvent;
+    if (storyRegion ? !coop_session(kSessStory, cfg_bool(s_storyVar, false)) : !coop_session(kSessDungeon, cfg_bool(s_dungeonVar, true))) return;
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return;
+
+    char stage[8];
+    int saveNo = -1;
+    const bool here = current_stage(stage, saveNo) && std::memcmp(stage, msg.stage, 8) == 0 &&
+                      saveNo == msg.saveNo;
+    const bool baselineValid = here && s_base.have;
+
+    const bool sameSlot = current_stage(stage, saveNo) && saveNo == msg.saveNo;
+    const bool slotBaselineValid = sameSlot && s_base.have;
+
+    switch (msg.region) {
+    case kRegionMemory: {
+        if (msg.saveNo < 0 || msg.saveNo >= dSv_save_c::STAGE_MAX) return;
+        if (msg.offset + msg.size > kMemSize) return;
+        uint8_t* target = sameSlot ? mem_bytes(info->getMemory())
+                                   : mem_bytes(info->getSavedata().getSave(msg.saveNo));
+
+        uint8_t newlySet[8] = {};
+        if (sameSlot) {
+            for (int i = 0; i < msg.size; ++i) {
+                const int at = msg.offset + i;
+                if (at >= 8) break;
+                newlySet[at] = static_cast<uint8_t>(msg.set[i] & ~target[at]);
+            }
+        }
+        uint8_t memBefore[kMemSize];
+        std::memcpy(memBefore, target, kMemSize);
+        apply_bytes(target, slotBaselineValid ? s_base.mem : nullptr, msg, kKeyOffset);
+
+        for (int b = kMemSwitchFirst; b < kMemSwitchEnd; ++b) {
+            if (overworld_switch_byte(msg.stage, b)) target[b] = memBefore[b];
+        }
+        keep_bomb_house(msg.saveNo, target, memBefore);
+        if (sameSlot) {
+            keep_mem_local(stage, target, memBefore);
+            if (slotBaselineValid) keep_mem_local(stage, s_base.mem, memBefore);
+
+            open_chests_from_bits(newlySet);
+            remove_collected_from_bits(newlySet);
+        }
+        break;
+    }
+    case kRegionKeys: {
+        if (msg.saveNo < 0 || msg.saveNo >= dSv_save_c::STAGE_MAX) return;
+        uint8_t* target = sameSlot ? mem_bytes(info->getMemory())
+                                   : mem_bytes(info->getSavedata().getSave(msg.saveNo));
+        target[kKeyOffset] = msg.set[0];
+        if (slotBaselineValid) s_base.mem[kKeyOffset] = msg.set[0];
+        break;
+    }
+    case kRegionDan: {
+        dSv_danBit_c& dan = info->getDan();
+        if (!here || dan.mStageNo != msg.saveNo || msg.offset + msg.size > kDanSize) return;
+        uint8_t* danBytes = reinterpret_cast<uint8_t*>(&dan) + kDanOffset;
+        uint8_t danBefore[kDanSize];
+        std::memcpy(danBefore, danBytes, kDanSize);
+        apply_bytes(danBytes, (baselineValid && s_base.haveDan) ? s_base.dan : nullptr, msg);
+        keep_dan_local(danBytes, danBefore);
+        if (baselineValid && s_base.haveDan) keep_dan_local(s_base.dan, danBefore);
+        break;
+    }
+    case kRegionZone: {
+        if (!here || msg.room < 0 || msg.room >= kRooms || msg.offset + msg.size > kZoneBitSize) return;
+        for (int i = 0; i < kZones; ++i) {
+            dSv_zone_c& zone = info->getZone(i);
+            if (zone.getRoomNo() != msg.room) continue;
+            uint8_t* zoneBytes = reinterpret_cast<uint8_t*>(&zone.getBit());
+            uint8_t zoneBefore[kZoneBitSize];
+            std::memcpy(zoneBefore, zoneBytes, kZoneBitSize);
+            const bool haveBase = baselineValid && s_base.haveZone[msg.room];
+            apply_bytes(zoneBytes, haveBase ? s_base.zone[msg.room] : nullptr, msg);
+            keep_zone_local(msg.room, zoneBytes, zoneBefore);
+            if (haveBase) keep_zone_local(msg.room, s_base.zone[msg.room], zoneBefore);
+            break;
+        }
+        break;
+    }
+    case kRegionZoneActor: {
+
+        if (!here || msg.room < 0 || msg.room >= kRooms ||
+            msg.offset + msg.size > kZoneActorSize) return;
+        for (int i = 0; i < kZones; ++i) {
+            dSv_zone_c& zone = info->getZone(i);
+            if (zone.getRoomNo() != msg.room) continue;
+            MsgWorldDelta onlySet = msg;
+            std::memset(onlySet.clr, 0, sizeof(onlySet.clr));
+            apply_bytes(reinterpret_cast<uint8_t*>(&zone.getActor()),
+                (baselineValid && s_base.haveZone[msg.room]) ? s_base.zoneActor[msg.room] : nullptr,
+                onlySet);
+            break;
+        }
+        break;
+    }
+    case kRegionLightDrop: {
+
+        if (msg.size != kLightDropSize) return;
+        auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getLightDrop());
+
+        cur[4] = static_cast<uint8_t>(cur[4] | msg.set[4]);
+        if (s_lightDrop.have) s_lightDrop.bytes[4] = static_cast<uint8_t>(s_lightDrop.bytes[4] | msg.set[4]);
+        break;
+    }
+    case kRegionStatusB: {
+
+        if (msg.size != kStatusBSize) return;
+        hold_status_b(info, msg.set);
+        break;
+    }
+    case kRegionCollect: {
+
+        if (msg.size != kCollectSize) return;
+        auto* cur = reinterpret_cast<uint8_t*>(&info->getSavedata().getPlayer().getCollect());
+        for (int i = 0; i < kCollectSize; ++i) {
+            if (collect_item_only(i)) continue;
+            cur[i] = static_cast<uint8_t>(cur[i] | msg.set[i]);
+
+            if (s_collect.have) s_collect.bytes[i] = static_cast<uint8_t>(s_collect.bytes[i] | msg.set[i]);
+        }
+        break;
+    }
+    case kRegionVisited: {
+
+        if (msg.room < 0 || msg.room >= kMaps || msg.size != kVisitedSize) return;
+        auto* cur = reinterpret_cast<uint8_t*>(info->getSavedata().getSave2(msg.room));
+        for (int i = 0; i < kVisitedSize; ++i) {
+            cur[i] = static_cast<uint8_t>(cur[i] | msg.set[i]);
+            if (s_visited.have) s_visited.maps[msg.room][i] = cur[i];
+        }
+        break;
+    }
+    case kRegionTmp: {
+
+        if (!here || msg.offset + msg.size > kEventSize) return;
+        uint8_t before[kEventSize];
+        std::memcpy(before, info->getTmp().mEvent, kEventSize);
+        apply_bytes(info->getTmp().mEvent,
+            (baselineValid && s_base.haveTmp) ? s_base.tmp : nullptr, msg);
+        keep_private_tmp(info->getTmp().mEvent, before);
+        break;
+    }
+    case kRegionEvent: {
+
+        if (msg.offset + msg.size > kEventSize) return;
+        const int added = story_hold(info, msg.set, msg.offset, msg.size);
+        if (added > 0) {
+            coop_log::info("coop_mod: [STORY] {} new remote flags, deferred to stage load ({} waiting)", added, s_storyPendingBits);
+        }
+        return;
+    }
+    default:
+        return;
+    }
+    coop_log::info("coop_mod: [WORLD] applied region={} stage={:.8s} save={} room={} {}+{} ({})",
+        static_cast<int>(msg.region), msg.stage, static_cast<int>(msg.saveNo),
+        static_cast<int>(msg.room), static_cast<int>(msg.offset), static_cast<int>(msg.size),
+        here ? "live" : "saved");
+}

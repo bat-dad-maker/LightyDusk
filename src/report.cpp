@@ -1,0 +1,738 @@
+
+
+#include "mod.hpp"
+#include "net/messages.hpp"
+#include "print.hpp"
+#include "util.hpp"
+
+#include "mods/service.hpp"
+#include "mods/svc/config.h"
+#include "mods/svc/host.h"
+#include "mods/svc/http.h"
+#include "mods/svc/ui.h"
+
+#include "d/actor/d_a_alink.h"
+#include "d/d_com_inf_game.h"
+#include "f_op/f_op_actor_mng.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/utsname.h>
+#endif
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+extern const ConfigService* svc_config;
+extern const HostService* svc_host;
+
+IMPORT_OPTIONAL_SERVICE(HttpService, svc_http);
+extern const UiService* svc_ui;
+
+namespace {
+
+const char* const kReportUrl = "https://crests-rooms.crestsofcourage.workers.dev/report";
+
+std::mutex s_logMutex;
+std::deque<std::string> s_lines;
+size_t s_lineBytes = 0;
+const size_t kKeepBytes = 400u * 1024u;
+std::string s_unwritten;
+const auto s_start = std::chrono::steady_clock::now();
+
+std::filesystem::path log_dir() {
+    const char* dir = nullptr;
+    if (svc_host == nullptr || svc_host->data_dir(mod_ctx, &dir) != MOD_OK || dir == nullptr) return {};
+    return std::filesystem::u8path(dir);
+}
+
+std::string current_log() {
+    std::lock_guard lock(s_logMutex);
+    std::string out;
+    out.reserve(s_lineBytes);
+    for (const std::string& line : s_lines) out += line;
+    return out;
+}
+
+std::string previous_log(int back = 1, size_t keep = kKeepBytes) {
+    std::ifstream in(log_dir() / ("coop-log-" + std::to_string(back) + ".txt"), std::ios::binary);
+    if (!in) return "(no log from that run)\n";
+    std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (all.size() > keep) all.erase(0, all.size() - keep);
+    return all;
+}
+
+std::string crash_trail_tail(size_t keep = 16u * 1024u) {
+    std::ifstream in(std::filesystem::u8path(coop_crash_trail_path()), std::ios::binary);
+    if (!in) return "(no crash trail)\n";
+    std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (all.size() > keep) {
+        all.erase(0, all.size() - keep);
+        const size_t nl = all.find('\n');
+        if (nl != std::string::npos) all.erase(0, nl + 1);
+    }
+    return all;
+}
+
+std::string engine_log_before(size_t keep = 48u * 1024u) {
+    const std::filesystem::path data = log_dir();
+    if (data.empty()) return "(no engine log)\n";
+    std::error_code ec;
+    const std::filesystem::path logs = data.parent_path().parent_path() / "logs";
+    std::vector<std::filesystem::path> runs;
+    for (const auto& e : std::filesystem::directory_iterator(logs, ec)) {
+        const std::string name = path_text(e.path().filename());
+        if (name.rfind("dusklight-", 0) == 0 && e.path().extension() == ".log") runs.push_back(e.path());
+    }
+    if (runs.size() < 2) return "(no engine log from that run)\n";
+    std::sort(runs.begin(), runs.end());
+    std::ifstream in(runs[runs.size() - 2], std::ios::binary);
+    if (!in) return "(no engine log from that run)\n";
+    std::string out;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find("Loading Resource") != std::string::npos) continue;
+        out += line;
+        out += '\n';
+        if (out.size() > 4 * keep) out.erase(0, out.size() - keep);
+    }
+    if (out.size() > keep) out.erase(0, out.size() - keep);
+    return out;
+}
+
+std::ofstream s_file;
+size_t s_fileBytes = 0;
+const size_t kFileCap = 2u * 1024u * 1024u;
+
+void flush_to_disk() {
+    std::string chunk;
+    {
+        std::lock_guard lock(s_logMutex);
+        if (s_unwritten.empty()) return;
+        chunk.swap(s_unwritten);
+    }
+    const std::filesystem::path dir = log_dir();
+    if (dir.empty()) return;
+    if (s_file.is_open() && s_fileBytes > kFileCap) s_file.close();
+    if (!s_file.is_open()) {
+        const bool first = s_fileBytes == 0;
+        s_file.open(dir / "coop-log.txt", std::ios::binary | std::ios::trunc);
+        if (!s_file) return;
+        s_fileBytes = 0;
+        if (!first) chunk = current_log();
+    }
+    s_file << chunk;
+    s_file.flush();
+    s_fileBytes += chunk.size();
+}
+
+std::string platform_name() {
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__ANDROID__)
+    return "android";
+#elif defined(__APPLE__) && TARGET_OS_IOS
+    return "ios";
+#elif defined(__APPLE__)
+    return "macos";
+#elif defined(__linux__)
+    return "linux";
+#else
+    return "unknown";
+#endif
+}
+
+std::string device_name() {
+#if defined(__ANDROID__)
+    char maker[PROP_VALUE_MAX] = {}, model[PROP_VALUE_MAX] = {}, release[PROP_VALUE_MAX] = {};
+    __system_property_get("ro.product.manufacturer", maker);
+    __system_property_get("ro.product.model", model);
+    __system_property_get("ro.build.version.release", release);
+    return std::string(maker) + " " + model + ", Android " + release;
+#elif defined(__APPLE__) || defined(__linux__)
+    struct utsname u {};
+    if (uname(&u) != 0) return "";
+    std::string out = std::string(u.machine) + ", " + u.sysname + " " + u.release;
+#if defined(__linux__)
+    std::ifstream os("/etc/os-release");
+    std::string line;
+    while (std::getline(os, line)) {
+        if (line.rfind("PRETTY_NAME=", 0) == 0) {
+            std::string name = line.substr(12);
+            if (name.size() >= 2 && name.front() == '"') name = name.substr(1, name.size() - 2);
+            out += " (" + name + ")";
+            break;
+        }
+    }
+#endif
+    return out;
+#else
+    return "";
+#endif
+}
+
+std::string session_summary() {
+    std::string s;
+    s += "role: ";
+    s += !coop_net_connected() ? "not connected" : coop_net_is_host() ? "host" : "joiner";
+    s += "\nplayer id: " + std::to_string(coop_net_local_id());
+    const std::string code = online_room_code();
+    if (!code.empty()) s += "\nroom code: yes";
+    const char* stage = dComIfGp_getStartStageName();
+    s += "\nstage: ";
+    s += (stage != nullptr && stage[0] != '\0') ? stage : "(none)";
+    if (daAlink_getAlinkActorClass() != nullptr) {
+        s += " room " + std::to_string(dComIfGp_roomControl_getStayNo());
+    }
+    s += "\nrandomizer: ";
+    s += rando_active() ? "yes" : "no";
+    s += "\nmemory: " + coop_mem_status();
+
+    s += "\nmodels:";
+    bool anyModel = false;
+    for (int slot = 0; slot < kSkinChoiceCount; ++slot) {
+        const std::string chosen = skins_local_slot(slot);
+        if (chosen.empty()) continue;
+        s += std::string(anyModel ? ", " : " ") + skins_slot_label(slot) + "=" + chosen;
+        anyModel = true;
+    }
+    if (!anyModel) s += " (all the game's own)";
+    s += "\nplayers:";
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        const uint8_t id = static_cast<uint8_t>(i);
+        if (id == coop_net_local_id() || !coop_net_player_present(id)) continue;
+        const CoopPeer& p = features_peer_of(id);
+        char line[160];
+        std::snprintf(line, sizeof(line), "\n  %d '%s' stage=%.8s inGame=%d%s", i, p.name.c_str(),
+            p.stage, p.inGame ? 1 : 0, coop_player_unheard(id) ? " NO SIGNAL" : "");
+        s += line;
+    }
+    return s;
+}
+
+std::string json_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + in.size() / 16 + 2);
+    for (unsigned char c : in) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+    }
+    return out;
+}
+
+std::string scrub_addresses(std::string text) {
+    std::string out;
+    out.reserve(text.size());
+    size_t i = 0;
+    while (i < text.size()) {
+
+        size_t j = i;
+        int parts = 0;
+        while (parts < 4) {
+            size_t k = j;
+            while (k < text.size() && k - j < 4 && text[k] >= '0' && text[k] <= '9') ++k;
+            if (k == j || k - j > 3) break;
+            ++parts;
+            j = k;
+            if (parts < 4) {
+                if (j < text.size() && text[j] == '.') ++j;
+                else break;
+            }
+        }
+        const bool boundary = i == 0 || !(text[i - 1] >= '0' && text[i - 1] <= '9');
+        if (parts == 4 && boundary) {
+            out += "x.x.x.x";
+            i = j;
+        } else {
+            out.push_back(text[i++]);
+        }
+    }
+    return out;
+}
+
+struct ActorTally {
+    std::string npcs;
+    int counts[0x400] = {};
+};
+
+void* tally_actor(void* proc, void* data) {
+    auto* actor = static_cast<fopAc_ac_c*>(proc);
+    auto* t = static_cast<ActorTally*>(data);
+    if (actor == nullptr || !fopAcM_IsActor(actor)) return nullptr;
+    const int name = fopAcM_GetName(actor);
+    if (fopAcM_GetGroup(actor) == fopAc_NPC_e && t->npcs.size() < 3000) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), " %d@%d,%d,%d r%d", name, static_cast<int>(actor->current.pos.x),
+            static_cast<int>(actor->current.pos.y), static_cast<int>(actor->current.pos.z),
+            static_cast<int>(fopAcM_GetRoomNo(actor)));
+        t->npcs += buf;
+    } else if (name >= 0 && name < 0x400) {
+        ++t->counts[name];
+    }
+    return nullptr;
+}
+
+std::string actors_here() {
+    if (daAlink_getAlinkActorClass() == nullptr) return "(not in the game)\n";
+    static ActorTally t;
+    t.npcs.clear();
+    std::memset(t.counts, 0, sizeof(t.counts));
+    fopAcM_Search(tally_actor, &t);
+    std::string out = "npcs:" + t.npcs + "\nothers:";
+    for (int i = 0; i < 0x400 && out.size() < 6000; ++i) {
+        if (t.counts[i] == 0) continue;
+        out += " " + std::to_string(i) + (t.counts[i] > 1 ? "x" + std::to_string(t.counts[i]) : "");
+    }
+    return out + "\n";
+}
+
+std::string build_body(const char* kind, const std::string& code, const std::string& text,
+    const std::string& when, const std::string& log) {
+    std::string b = "{";
+    b += "\"kind\":\"" + std::string(kind) + "\"";
+    if (!code.empty()) b += ",\"code\":\"" + json_escape(code) + "\"";
+    b += ",\"player\":\"" + json_escape(features_local_name()) + "\"";
+    b += ",\"platform\":\"" + platform_name() + "\"";
+    b += ",\"device\":\"" + json_escape(device_name()) + "\"";
+    b += ",\"mod\":\"" COOP_MOD_VERSION "\"";
+    b += ",\"when\":\"" + json_escape(when) + "\"";
+    b += ",\"text\":\"" + json_escape(text) + "\"";
+    b += ",\"session\":\"" + json_escape(scrub_addresses(session_summary())) + "\"";
+
+    const std::string state = "=== save state ===\n" + world_state_dump() + "=== end save state ===\n" +
+                              "=== actors here ===\n" + actors_here();
+    b += ",\"log\":\"" + json_escape(state + scrub_addresses(log)) + "\"";
+    b += "}";
+    return b;
+}
+
+std::string s_text;
+int s_when = 0;
+bool s_sending = false;
+std::string s_status = "";
+uint32_t s_sentAtTick = 0;
+uint32_t s_tick = 0;
+const char* const kWhen[] = {"Just now", "Earlier this session", "The game crashed or closed last time"};
+
+std::string s_answered[8];
+int s_answeredNext = 0;
+
+std::string code_from(const HttpResult* r) {
+    if (r == nullptr || r->body == nullptr) return "";
+    const std::string body(static_cast<const char*>(r->body), r->body_size);
+    const size_t at = body.find("\"code\":\"");
+    if (at == std::string::npos) return "";
+    const size_t start = at + 8;
+    const size_t end = body.find('"', start);
+    if (end == std::string::npos || end - start > 11) return "";
+    return body.substr(start, end - start);
+}
+
+bool post(const std::string& body, HttpCompleteFn done) {
+    if (svc_http == nullptr) return false;
+    static const HttpHeader kHeaders[] = {{"Content-Type", "application/json"}};
+    HttpRequestDesc desc = HTTP_REQUEST_DESC_INIT;
+    desc.method = HTTP_METHOD_POST;
+    desc.url = kReportUrl;
+    desc.headers = kHeaders;
+    desc.header_count = 1;
+    desc.body = body.data();
+    desc.body_size = body.size();
+    desc.total_timeout_ms = 60000;
+    desc.max_body_bytes = 64 * 1024;
+    HttpRequestHandle handle = 0;
+    return svc_http->request(mod_ctx, &desc, done, nullptr, &handle) == MOD_OK;
+}
+
+void on_report_sent(ModContext*, HttpRequestHandle, const HttpResult* r, void*) {
+    s_sending = false;
+    const std::string code = code_from(r);
+    if (r == nullptr || r->error != HTTP_ERROR_NONE || r->status_code != 200 || code.empty()) {
+        const int status = r != nullptr ? r->status_code : 0;
+        coop_log::warn("coop_mod: [REPORT] not sent (error {}, status {})",
+            r != nullptr ? static_cast<int>(r->error) : -1, status);
+        s_status = status == 429 ? "Too many reports - try again in a few minutes."
+                                 : "Couldn't send it. Check your connection and try again.";
+        return;
+    }
+    coop_log::info("coop_mod: [REPORT] sent as {}", code);
+
+    const bool copied = svc_ui != nullptr && SERVICE_HAS(svc_ui, UiService, set_clipboard_text) &&
+                        svc_ui->set_clipboard_text != nullptr &&
+                        svc_ui->set_clipboard_text(mod_ctx, code.c_str()) == MOD_OK;
+    s_status = "Sent! Your report code is " + code +
+               (copied ? " (copied) - paste it in the Discord thread."
+                       : " - mention it in the Discord thread.");
+    s_text.clear();
+    coop_notify_c(kNotifyOther, "Bug report sent",
+        ("Code " + code + (copied ? " is copied - paste it in the Discord thread."
+                                  : " - mention it in the Discord thread.")).c_str());
+
+    if (coop_net_connected()) {
+        MsgLogRequest req{};
+        std::strncpy(req.code, code.c_str(), sizeof(req.code) - 1);
+        coop_net_send(kMsgLogRequest, &req, sizeof(req));
+    }
+}
+
+void on_log_sent(ModContext*, HttpRequestHandle, const HttpResult* r, void*) {
+    if (r == nullptr || r->error != HTTP_ERROR_NONE || r->status_code != 200) {
+        coop_log::warn("coop_mod: [REPORT] log for peer report not sent");
+    }
+}
+
+void send_report() {
+    if (s_sending || s_text.empty()) return;
+    flush_to_disk();
+    const bool lastRun = s_when == 2;
+
+    const std::string thisRun = current_log();
+    const std::string lastRunLog = previous_log();
+    const std::string before = "=== the run before this one ===\n" + lastRunLog;
+    const std::string now = "=== this run ===\n" + thisRun;
+    std::string log = lastRun ? before + "\n" + now : now + "\n" + before;
+
+    if (lastRun) log += "\n=== two runs before this one ===\n" + previous_log(2, 250u * 1024u);
+
+    log += "\n=== crash trail, last lines ===\n" + crash_trail_tail();
+    log += "\n=== dusklight's own log, the run before ===\n" +
+           (lastRun ? engine_log_before() : engine_log_before(16u * 1024u));
+    const std::string body = build_body("report", "", s_text, kWhen[s_when], log);
+    if (!post(body, on_report_sent)) {
+        s_status = "Couldn't send it - this build has no network access.";
+        return;
+    }
+    s_sending = true;
+    s_sentAtTick = s_tick;
+    s_status = "Sending...";
+    coop_log::info("coop_mod: [REPORT] sending ({} KB)", body.size() / 1024);
+}
+
+UiElementHandle s_statusElem = 0;
+std::string s_statusShown;
+
+}
+
+void coop_log_capture(char level, const std::string& message) {
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count();
+    char head[24];
+    std::snprintf(head, sizeof(head), "[%8.1f] %c ", secs, level);
+    std::string line = head;
+    line += message;
+    line += '\n';
+    std::lock_guard lock(s_logMutex);
+    s_lineBytes += line.size();
+    s_unwritten += line;
+    s_lines.push_back(std::move(line));
+    while (s_lineBytes > kKeepBytes && !s_lines.empty()) {
+        s_lineBytes -= s_lines.front().size();
+        s_lines.pop_front();
+    }
+    if (s_unwritten.size() > kKeepBytes) s_unwritten.erase(0, s_unwritten.size() - kKeepBytes);
+}
+
+std::string s_crashId;
+bool s_crashPending = false;
+uint32_t s_crashTicks = 0;
+ConfigVarHandle s_autoCrashVar = 0;
+ConfigVarHandle s_crashSeenVar = 0;
+UiDialogHandle s_crashDialog = 0;
+
+std::string previous_engine_log_name(bool* crashed) {
+    *crashed = false;
+    const std::filesystem::path data = log_dir();
+    if (data.empty()) return "";
+    std::error_code ec;
+    const std::filesystem::path logs = data.parent_path().parent_path() / "logs";
+    std::vector<std::filesystem::path> runs;
+    for (const auto& e : std::filesystem::directory_iterator(logs, ec)) {
+        const std::string name = path_text(e.path().filename());
+        if (name.rfind("dusklight-", 0) == 0 && e.path().extension() == ".log") runs.push_back(e.path());
+    }
+    if (runs.size() < 2) return "";
+    std::sort(runs.begin(), runs.end());
+    const std::filesystem::path& before = runs[runs.size() - 2];
+    std::ifstream in(before, std::ios::binary);
+    std::string line;
+    while (in && std::getline(in, line)) {
+        if (line.find("APPLICATION CRASHED") != std::string::npos) {
+            *crashed = true;
+            break;
+        }
+    }
+    return path_text(before.filename());
+}
+
+void detect_last_crash() {
+    bool engine = false;
+    const std::string engineLog = previous_engine_log_name(&engine);
+    bool trail = false;
+    std::ifstream in(std::filesystem::u8path(coop_crash_trail_path()), std::ios::binary);
+    if (in) {
+        std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const size_t start = all.rfind("--- session start ---");
+        const size_t crash = all.rfind("CRASH ");
+        trail = crash != std::string::npos && (start == std::string::npos || crash > start);
+    }
+    if (!engine && !trail) return;
+    s_crashId = !engineLog.empty() ? engineLog : "trail";
+    s_crashPending = true;
+    coop_log::info("coop_mod: [REPORT] the last run crashed ({})", engine ? "game's crash report" : "crash trail");
+}
+
+void send_crash_report(const char* why) {
+    if (s_text.empty()) s_text = why;
+    s_when = 2;
+    send_report();
+}
+
+void mark_crash_seen() {
+    s_crashPending = false;
+    if (s_crashSeenVar != 0) svc_config->set_string(mod_ctx, s_crashSeenVar, s_crashId.c_str());
+}
+
+void offer_crash_report() {
+    if (svc_ui == nullptr || !SERVICE_HAS(svc_ui, UiService, dialog_push) || svc_ui->dialog_push == nullptr) {
+        mark_crash_seen();
+        return;
+    }
+    static UiDialogAction actions[3];
+    actions[0] = UI_DIALOG_ACTION_INIT;
+    actions[0].label = "Send";
+    actions[0].on_pressed = [](ModContext*, UiDialogHandle, void*) {
+        send_crash_report("(crash report from the prompt after a crash)");
+    };
+    actions[1] = UI_DIALOG_ACTION_INIT;
+    actions[1].label = "Always send";
+    actions[1].on_pressed = [](ModContext*, UiDialogHandle, void*) {
+        if (s_autoCrashVar != 0) svc_config->set_bool(mod_ctx, s_autoCrashVar, true);
+        send_crash_report("(crash report from the prompt after a crash)");
+    };
+    actions[2] = UI_DIALOG_ACTION_INIT;
+    actions[2].label = "Not this time";
+    UiDialogDesc desc = UI_DIALOG_DESC_INIT;
+    desc.title = "The game crashed last time";
+    desc.body_rml =
+        "Send the crash report so it can be fixed? It sends the co-op log and the crash details from "
+        "that run. Network addresses are removed.";
+    desc.variant = UI_DIALOG_WARNING;
+    desc.actions = actions;
+    desc.action_count = 3;
+    desc.build = [](ModContext*, UiElementHandle pane, void*, ModError*) -> ModResult {
+        UiControlDesc text = UI_CONTROL_DESC_INIT;
+        text.kind = UI_CONTROL_STRING;
+        text.label = "What were you doing? (optional)";
+        text.binding = UI_BINDING_CALLBACKS;
+        text.max_length = 1500;
+        text.string_set_mode = UI_STRING_SET_ON_CHANGE;
+        text.get = [](ModContext*, void*, UiControlValue* out) { out->string_value = s_text.c_str(); };
+        text.set = [](ModContext*, void*, const UiControlValue* v) {
+            s_text = v->string_value != nullptr ? v->string_value : "";
+        };
+        svc_ui->pane_add_control(mod_ctx, pane, &text, nullptr);
+        return MOD_OK;
+    };
+    mark_crash_seen();
+    svc_ui->dialog_push(mod_ctx, &desc, &s_crashDialog);
+}
+
+const int kKeepRuns = 3;
+
+void report_init() {
+
+    const std::filesystem::path dir = log_dir();
+    if (dir.empty()) return;
+    std::error_code ec;
+    const auto run = [&](int n) { return dir / ("coop-log-" + std::to_string(n) + ".txt"); };
+    std::filesystem::remove(run(kKeepRuns), ec);
+    for (int n = kKeepRuns - 1; n >= 1; --n) std::filesystem::rename(run(n), run(n + 1), ec);
+    std::filesystem::rename(dir / "coop-log.txt", run(1), ec);
+    std::filesystem::remove(dir / "coop-log-previous.txt", ec);
+    detect_last_crash();
+}
+
+void report_update() {
+    ++s_tick;
+
+    static char s_stage[8] = {};
+    const char* stage = dComIfGp_getStartStageName();
+    const bool newStage = stage != nullptr && std::strncmp(stage, s_stage, sizeof(s_stage)) != 0;
+    if (newStage) std::strncpy(s_stage, stage, sizeof(s_stage));
+    if (newStage || s_tick % 300 == 0) flush_to_disk();
+}
+
+void report_on_message(const uint8_t* payload, size_t size, uint8_t from) {
+    if (size < sizeof(MsgLogRequest) || from == coop_net_local_id()) return;
+    MsgLogRequest req;
+    std::memcpy(&req, payload, sizeof(req));
+    req.code[sizeof(req.code) - 1] = '\0';
+    const std::string code(req.code);
+    if (code.size() < 3) return;
+    for (const std::string& done : s_answered) {
+        if (done == code) return;
+    }
+    s_answered[s_answeredNext] = code;
+    s_answeredNext = (s_answeredNext + 1) % 8;
+    flush_to_disk();
+    const std::string asker = features_peer_of(from).name;
+
+    std::string log = "=== this run ===\n" + current_log();
+    log += "\n=== the run before this one ===\n" + previous_log(1, 300u * 1024u);
+    log += "\n=== crash trail, last lines ===\n" + crash_trail_tail();
+    log += "\n=== dusklight's own log, the run before ===\n" + engine_log_before(16u * 1024u);
+    const std::string body = build_body("log", code, "log for " + asker + "'s report", "", log);
+    if (post(body, on_log_sent)) {
+        coop_log::info("coop_mod: [REPORT] sending log for {} report {}", asker, code);
+    }
+}
+
+void report_build_tab(UiElementHandle left, UiElementHandle right) {
+    s_statusElem = 0;
+    s_statusShown.clear();
+    svc_ui->pane_add_section(mod_ctx, left, "Report a bug");
+
+    UiControlDesc text = UI_CONTROL_DESC_INIT;
+    text.kind = UI_CONTROL_STRING;
+    text.label = "What happened";
+    text.binding = UI_BINDING_CALLBACKS;
+    text.max_length = 1500;
+    text.string_set_mode = UI_STRING_SET_ON_CHANGE;
+    text.get = [](ModContext*, void*, UiControlValue* out) { out->string_value = s_text.c_str(); };
+    text.set = [](ModContext*, void*, const UiControlValue* v) {
+        s_text = v->string_value != nullptr ? v->string_value : "";
+    };
+    text.help_rml = "What you were doing, what you expected, and what happened instead.";
+    svc_ui->pane_add_control(mod_ctx, left, &text, nullptr);
+
+    UiControlDesc when = UI_CONTROL_DESC_INIT;
+    when.kind = UI_CONTROL_SELECT;
+    when.label = "When";
+    when.binding = UI_BINDING_CALLBACKS;
+    when.options = kWhen;
+    when.option_count = 3;
+    when.get = [](ModContext*, void*, UiControlValue* out) { out->int_value = s_when; };
+    when.set = [](ModContext*, void*, const UiControlValue* v) {
+        s_when = static_cast<int>(v->int_value >= 0 && v->int_value < 3 ? v->int_value : 0);
+    };
+    when.help_rml = "If the game crashed, pick the last one - it sends the log from before the crash.";
+    svc_ui->pane_add_control(mod_ctx, left, &when, nullptr);
+
+    UiControlDesc send = UI_CONTROL_DESC_INIT;
+    send.kind = UI_CONTROL_BUTTON;
+    send.label = "Send report";
+    send.on_pressed = [](ModContext*, void*) { send_report(); };
+    send.is_disabled = [](ModContext*, void*) { return s_sending || s_text.empty(); };
+    svc_ui->pane_add_control(mod_ctx, left, &send, nullptr);
+
+    svc_ui->pane_add_text(mod_ctx, left, s_status.c_str(), &s_statusElem);
+    s_statusShown = s_status;
+
+    UiControlDesc autoSend = UI_CONTROL_DESC_INIT;
+    autoSend.kind = UI_CONTROL_TOGGLE;
+    autoSend.label = "Send crash reports by themselves";
+    autoSend.binding = UI_BINDING_CONFIG_VAR;
+    autoSend.config_var = s_autoCrashVar;
+    autoSend.help_rml = "After the game crashes, the next start sends the crash report without asking. "
+                        "Off, it asks first.";
+    if (s_autoCrashVar != 0) svc_ui->pane_add_control(mod_ctx, left, &autoSend, nullptr);
+
+    svc_ui->pane_add_text(mod_ctx, right,
+        "Sent with your report:\n"
+        "- your device and versions\n"
+        "- who you're playing with and where you are\n"
+        "- the co-op mod's log\n\n"
+        "Everyone you're connected to sends their co-op log too, so we can see both sides.\n\n"
+        "Network addresses are removed.",
+        nullptr);
+}
+
+void report_update_tab() {
+    if (s_statusElem == 0 || s_statusShown == s_status) return;
+    s_statusShown = s_status;
+    svc_ui->elem_set_text(mod_ctx, s_statusElem, s_status.c_str());
+}
+
+ConfigVarHandle s_hintVar = 0;
+bool s_hintArmed = false;
+uint32_t s_hintTicks = 0;
+
+void report_hint_arm() {
+    s_hintArmed = true;
+}
+
+void report_register_vars() {
+    if (svc_config == nullptr) return;
+    ConfigVarDesc desc = CONFIG_VAR_DESC_INIT;
+    desc.name = "report_hint_shown";
+    desc.type = CONFIG_VAR_BOOL;
+    desc.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &desc, &s_hintVar) != MOD_OK) s_hintVar = 0;
+    ConfigVarDesc autoDesc = CONFIG_VAR_DESC_INIT;
+    autoDesc.name = "report_crashes_automatically";
+    autoDesc.type = CONFIG_VAR_BOOL;
+    autoDesc.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &autoDesc, &s_autoCrashVar) != MOD_OK) s_autoCrashVar = 0;
+    ConfigVarDesc seenDesc = CONFIG_VAR_DESC_INIT;
+    seenDesc.name = "report_crash_seen";
+    seenDesc.type = CONFIG_VAR_STRING;
+    seenDesc.default_string = "";
+    if (svc_config->register_var(mod_ctx, &seenDesc, &s_crashSeenVar) != MOD_OK) s_crashSeenVar = 0;
+}
+
+void crash_report_update() {
+    if (!s_crashPending || ++s_crashTicks < 300) return;
+    if (s_crashSeenVar != 0) {
+        char seen[256] = {};
+        size_t len = 0;
+        if (svc_config->get_string(mod_ctx, s_crashSeenVar, seen, sizeof(seen), &len) == MOD_OK && s_crashId == seen) {
+            s_crashPending = false;
+            return;
+        }
+    }
+    if (cfg_bool(s_autoCrashVar, false)) {
+        mark_crash_seen();
+        send_crash_report("(automatic crash report)");
+        return;
+    }
+    offer_crash_report();
+}
+
+void report_hint_update() {
+    crash_report_update();
+    if (!s_hintArmed || s_hintVar == 0 || cfg_bool(s_hintVar, false)) return;
+    if (++s_hintTicks < 120) return;
+    coop_notify_c(kNotifyOther, "Found a bug?", "Report bugs in CO-OP > Report Bug");
+    svc_config->set_bool(mod_ctx, s_hintVar, true);
+}
+
+std::string coop_crash_trail_path() {
+    const std::filesystem::path dir = log_dir();
+    const auto u8 = (dir.empty() ? std::filesystem::path("coop-crash-trail.txt") : dir / "coop-crash-trail.txt").u8string();
+    return std::string(u8.begin(), u8.end());
+}

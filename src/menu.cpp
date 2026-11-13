@@ -1,0 +1,2038 @@
+
+
+#include "mod.hpp"
+#include "net/messages.hpp"
+
+#include "mods/service.hpp"
+#include "mods/svc/config.h"
+#include "mods/svc/log.hpp"
+#include "print.hpp"
+#include "mods/svc/ui.h"
+
+#include "d/d_com_inf_game.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace {
+
+struct SurfaceHandles {
+    UiElementHandle status = 0;
+    UiElementHandle peer = 0;
+    UiElementHandle models = 0;
+    UiElementHandle party = 0;
+    UiElementHandle invite = 0;
+    UiElementHandle net = 0;
+    UiElementHandle netPeers = 0;
+    UiListHandle players = 0;
+    UiListHandle catchUp = 0;
+    std::vector<std::string> catchUpLabels;
+    std::string lastStatus;
+    std::string lastPeer;
+    std::string lastModels;
+    std::string lastParty;
+    std::string lastInvite;
+    std::string lastNet;
+    std::string lastNetPeers;
+    std::string lastList;
+
+    std::string lastBackup;
+    bool listPushed = false;
+
+    std::vector<uint8_t> rowIds;
+    std::vector<std::string> rowLabels;
+
+    UiElementHandle globalStatus = 0;
+    UiElementHandle statusCard = 0;
+    UiElementHandle playersCard = 0;
+    std::string lastStatusCard;
+    std::string lastPlayersCard;
+    UiElementHandle voiceKey = 0;
+    std::string lastVoiceKey;
+    std::string lastGlobalStatus;
+    UiListHandle blockList = 0;
+    std::string lastBlockList;
+    bool blockListPushed = false;
+    std::vector<GlobalPlayer> blockRows;
+    std::vector<bool> blockRowBlocked;
+    std::vector<std::string> blockLabels;
+
+    std::vector<UiElementHandle> presetHas;
+    std::vector<UiElementHandle> presetOther;
+    UiElementHandle presetHasHead = 0;
+    UiElementHandle presetOtherHead = 0;
+    UiElementHandle presetOtherRow = 0;
+    int presetOutfit = -1;
+    std::string presetHasText;
+};
+
+SurfaceHandles s_panel;
+SurfaceHandles s_window;
+UiWindowHandle s_windowHandle = 0;
+
+ConfigVarHandle s_networkTabVar = 0;
+bool s_networkTabShown = false;
+bool s_reopenWindow = false;
+
+void open_window();
+
+std::string worn_text();
+std::string party_text();
+std::string invite_text();
+std::string escape_rml(const std::string& text);
+
+bool net_active(ModContext*, void*) {
+    return coop_net_connected() || coop_net_connecting();
+}
+
+bool net_idle(ModContext*, void*) {
+    return !(coop_net_connected() || coop_net_connecting());
+}
+
+void add_control(UiElementHandle pane, const UiControlDesc& desc) {
+    if (svc_ui->pane_add_control(mod_ctx, pane, &desc, nullptr) != MOD_OK) {
+        coop_log::warn("coop_mod: [UI] could not add '{}'", desc.label != nullptr ? desc.label : "?");
+    }
+}
+
+void add_button(UiElementHandle pane, const char* label, UiPressedFn onPressed,
+    UiPredicateFn isDisabled = nullptr, const char* help = nullptr) {
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_BUTTON;
+    desc.label = label;
+    desc.on_pressed = onPressed;
+    desc.is_disabled = isDisabled;
+    desc.help_rml = help;
+    add_control(pane, desc);
+}
+
+void add_choice(UiElementHandle pane, const char* label, UiPressedFn onPressed, void* userData,
+    UiPredicateFn isSelected, const char* help = nullptr) {
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_BUTTON;
+    desc.label = label;
+    desc.on_pressed = onPressed;
+    desc.user_data = userData;
+    desc.is_selected = isSelected;
+    desc.help_rml = help;
+    add_control(pane, desc);
+}
+
+bool depends_on(ModContext*, void* data) {
+    const ConfigVarHandle var = static_cast<ConfigVarHandle>(reinterpret_cast<uintptr_t>(data));
+    return !cfg_bool(var, false);
+}
+
+void* as_data(ConfigVarHandle var) {
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(var));
+}
+
+void add_toggle(UiElementHandle pane, const char* label, ConfigVarHandle var,
+    const char* help = nullptr, ConfigVarHandle needs = 0) {
+    if (var == 0) return;
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_TOGGLE;
+    desc.label = label;
+    desc.binding = UI_BINDING_CONFIG_VAR;
+    desc.config_var = var;
+    desc.help_rml = help;
+    if (needs != 0) {
+        desc.is_disabled = depends_on;
+        desc.user_data = as_data(needs);
+    }
+    add_control(pane, desc);
+}
+
+void add_string(UiElementHandle pane, const char* label, ConfigVarHandle var, int32_t maxLength) {
+    if (var == 0) return;
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_STRING;
+    desc.label = label;
+    desc.binding = UI_BINDING_CONFIG_VAR;
+    desc.config_var = var;
+    desc.max_length = maxLength;
+    add_control(pane, desc);
+}
+
+void add_number(UiElementHandle pane, const char* label, ConfigVarHandle var, int64_t min,
+    int64_t max, int64_t step, const char* suffix, const char* help = nullptr,
+    ConfigVarHandle needs = 0) {
+    if (var == 0) return;
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_NUMBER;
+    desc.label = label;
+    desc.binding = UI_BINDING_CONFIG_VAR;
+    desc.config_var = var;
+    desc.min = min;
+    desc.max = max;
+    desc.step = step;
+    desc.suffix = suffix;
+    if (needs != 0) {
+        desc.is_disabled = depends_on;
+        desc.user_data = as_data(needs);
+    }
+    desc.help_rml = help;
+    add_control(pane, desc);
+}
+
+void add_dropdown(UiElementHandle pane, const char* label, ConfigVarHandle var,
+    const char* const* options, size_t count, const char* help = nullptr, ConfigVarHandle needs = 0) {
+    if (var == 0) return;
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_DROPDOWN;
+    desc.label = label;
+    desc.binding = UI_BINDING_CONFIG_VAR;
+    desc.config_var = var;
+    desc.options = options;
+    desc.option_count = count;
+    if (needs != 0) {
+        desc.is_disabled = depends_on;
+        desc.user_data = as_data(needs);
+    }
+    desc.help_rml = help;
+    add_control(pane, desc);
+}
+
+const char* const kColorPresets[] = {
+    "ab706e", "6382a0", "94749a", "ec8644", "b9ab00", "ec9fc8", "505154", "f8f7f4", "91723e",
+};
+
+void add_color(UiElementHandle pane, const char* label, ConfigVarHandle var) {
+    if (var == 0) return;
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_COLOR;
+    desc.label = label;
+    desc.binding = UI_BINDING_CONFIG_VAR;
+    desc.config_var = var;
+    desc.color_presets = kColorPresets;
+    desc.color_preset_count = sizeof(kColorPresets) / sizeof(kColorPresets[0]);
+    add_control(pane, desc);
+}
+
+std::string status_text() {
+
+    if (!coop_net_connected() && !coop_net_connecting() && cfg_bool(global_enabled_var(), false)) {
+        return "Hyrule Online: " + global_status();
+    }
+    return coop_net_status();
+}
+
+std::string ping_text(uint8_t id) {
+    const int32_t ms = coop_net_ping_ms(id);
+    if (ms < 0) return "";
+    return ", " + std::to_string(ms) + " ms";
+}
+
+std::string location_text(const CoopPeer& peer) {
+    const std::string stage(peer.stage);
+    if (stage.empty()) return "?";
+    const char* mine = dComIfGp_getStartStageName();
+    if (mine != nullptr && std::strncmp(mine, peer.stage, 8) == 0) return "nearby";
+    return stage;
+}
+
+std::string peer_text() {
+    if (!coop_net_connected()) return "Not connected.";
+    std::string out;
+    int seen = 0;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        const uint8_t id = static_cast<uint8_t>(i);
+        if (id == coop_net_local_id() || !coop_net_player_present(id)) continue;
+        const CoopPeer& p = features_peer_of(id);
+        ++seen;
+        if (!p.present) {
+            out += "Player " + std::to_string(id) + " is joining. ";
+        } else if (!p.inGame) {
+            out += p.name + " is loading. ";
+        } else {
+            continue;
+        }
+    }
+    if (seen == 0) return "Connected. Waiting for players.";
+    return out;
+}
+
+std::string party_text() {
+    if (!coop_net_connected()) return "Not connected.\n\nHost or join a game from the Connect tab.";
+    std::string out;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        const uint8_t id = static_cast<uint8_t>(i);
+        if (id == coop_net_local_id() || !coop_net_player_present(id)) continue;
+        const CoopPeer& p = features_peer_of(id);
+        if (!out.empty()) out += "\n\n";
+        if (!p.present) {
+            out += "Player " + std::to_string(id) + "\njoining";
+            continue;
+        }
+        out += p.name + "\n";
+        if (!p.inGame) {
+            out += "loading";
+            continue;
+        }
+        out += location_text(p);
+        const std::string ping = ping_text(id);
+        if (!ping.empty()) out += ping;
+        if (coop_player_unheard(id)) out += ", no signal";
+        else if (coop_player_paused(id)) out += ", paused";
+    }
+    if (out.empty()) return "Connected.\n\nWaiting for somebody to join.";
+    return out;
+}
+
+std::string invite_text() {
+    if (!coop_net_is_host() || !(coop_net_connected() || coop_net_connecting())) return "";
+
+    const std::string code = online_room_code();
+    const std::string online = online_status();
+    const std::string address = upnp_external_address();
+    if (!code.empty()) {
+        std::string out = "Room code: " + code;
+        if (!online.empty()) out += ". " + online;
+        return out;
+    }
+    if (!online.empty()) return online;
+    if (!address.empty()) return "Others can join you at " + address;
+    return upnp_status();
+}
+
+void size_list(UiListHandle list, size_t rows) {
+    if (list != 0) svc_ui->elem_set_class(mod_ctx, list, "coop-list", rows > 0);
+}
+
+void push_block_list(SurfaceHandles& h) {
+    if (h.blockList == 0) return;
+    std::vector<GlobalPlayer> rows;
+    std::vector<bool> isBlocked;
+    const auto add = [&](const GlobalPlayer& p) {
+        for (const GlobalPlayer& r : rows) {
+            if (r.tag == p.tag) return;
+        }
+        rows.push_back(p);
+        isBlocked.push_back(global_blocked(p.tag));
+    };
+    for (const GlobalPlayer& p : global_players()) add(p);
+    for (const GlobalPlayer& p : chat_recent_speakers()) add(p);
+    for (const GlobalPlayer& p : global_blocked_list()) add(p);
+    std::string joined;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        joined += rows[i].tag + rows[i].name + (isBlocked[i] ? "!" : "") + "\n";
+    }
+    if (h.blockListPushed && joined == h.lastBlockList) return;
+    h.lastBlockList = joined;
+    h.blockListPushed = true;
+    h.blockRows = rows;
+    h.blockRowBlocked = isBlocked;
+    h.blockLabels.clear();
+    for (size_t i = 0; i < rows.size(); ++i) {
+        h.blockLabels.push_back(rows[i].name + (isBlocked[i] ? "  (blocked)" : ""));
+    }
+
+    std::vector<UiListItem> items;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        UiListItem item = UI_LIST_ITEM_INIT;
+        item.key = std::strtoull(rows[i].tag.c_str(), nullptr, 16);
+        item.label = h.blockLabels[i].c_str();
+        items.push_back(item);
+    }
+    svc_ui->list_set_items(mod_ctx, h.blockList, items.empty() ? nullptr : items.data(), items.size());
+    size_list(h.blockList, items.size());
+}
+
+void on_block_pressed(ModContext*, UiListHandle, uint64_t key, void*) {
+    SurfaceHandles& h = s_window;
+    for (const GlobalPlayer& row : h.blockRows) {
+        if (std::strtoull(row.tag.c_str(), nullptr, 16) != key) continue;
+        const bool on = !global_blocked(row.tag);
+        global_set_blocked(row, on);
+        coop_log::info("coop_mod: [GLOBAL] list press {} -> {}", row.tag, on ? "block" : "unblock");
+        break;
+    }
+    h.blockListPushed = false;
+    push_block_list(h);
+}
+
+void push_players(SurfaceHandles& h) {
+    if (h.players == 0) return;
+
+    std::string joined;
+    h.rowIds.clear();
+    h.rowLabels.clear();
+    if (coop_net_connected()) {
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            const uint8_t id = static_cast<uint8_t>(i);
+            if (id == coop_net_local_id() || !coop_net_player_present(id)) continue;
+            const CoopPeer& p = features_peer_of(id);
+            if (!p.present || !p.inGame) continue;
+            h.rowIds.push_back(id);
+            const char* state = coop_player_unheard(id)  ? " (no signal)"
+                                : coop_player_paused(id) ? " (paused)"
+                                                         : "";
+            h.rowLabels.push_back(p.name + state + ", " +
+                                  location_text(p) + ping_text(id));
+            joined += h.rowLabels.back() + " ";
+        }
+    }
+    if (h.listPushed && joined == h.lastList) return;
+    h.lastList = joined;
+    h.listPushed = true;
+    size_list(h.players, h.rowIds.size());
+    size_list(h.catchUp, h.rowIds.size());
+    if (h.rowIds.empty()) {
+        svc_ui->list_set_items(mod_ctx, h.players, nullptr, 0);
+        if (h.catchUp != 0) svc_ui->list_set_items(mod_ctx, h.catchUp, nullptr, 0);
+        return;
+    }
+    std::vector<UiListItem> items;
+    items.reserve(h.rowIds.size());
+    for (size_t i = 0; i < h.rowIds.size(); ++i) {
+        UiListItem item = UI_LIST_ITEM_INIT;
+        item.key = h.rowIds[i];
+        item.label = h.rowLabels[i].c_str();
+        items.push_back(item);
+    }
+    svc_ui->list_set_items(mod_ctx, h.players, items.data(), items.size());
+    if (h.catchUp == 0) return;
+    h.catchUpLabels.clear();
+    for (uint8_t id : h.rowIds) h.catchUpLabels.push_back("Catch up to " + features_peer_of(id).name);
+    std::vector<UiListItem> catchUp;
+    for (size_t i = 0; i < h.rowIds.size(); ++i) {
+        UiListItem item = UI_LIST_ITEM_INIT;
+        item.key = h.rowIds[i];
+        item.label = h.catchUpLabels[i].c_str();
+        catchUp.push_back(item);
+    }
+    svc_ui->list_set_items(mod_ctx, h.catchUp, catchUp.data(), catchUp.size());
+}
+
+void sort_presets(SurfaceHandles& h);
+
+struct NetRates {
+    uint64_t sampledMs = 0;
+    CoopNetTraffic last{};
+    double upKBs = 0.0, downKBs = 0.0;
+    double upPackets = 0.0, downPackets = 0.0;
+    uint64_t resendsLast[kCoopMaxPlayers] = {};
+    uint64_t resendsPerSec[kCoopMaxPlayers] = {};
+};
+NetRates s_rates;
+
+uint64_t now_ms() {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+void sample_rates() {
+    const uint64_t now = now_ms();
+    const CoopNetTraffic t = coop_net_traffic();
+    if (s_rates.sampledMs == 0) {
+        s_rates.sampledMs = now;
+        s_rates.last = t;
+        return;
+    }
+    const uint64_t dt = now - s_rates.sampledMs;
+    if (dt < 1000) return;
+    const double secs = static_cast<double>(dt) / 1000.0;
+    s_rates.upKBs = static_cast<double>(t.txBytes - s_rates.last.txBytes) / 1024.0 / secs;
+    s_rates.downKBs = static_cast<double>(t.rxBytes - s_rates.last.rxBytes) / 1024.0 / secs;
+    s_rates.upPackets = static_cast<double>(t.txPackets - s_rates.last.txPackets) / secs;
+    s_rates.downPackets = static_cast<double>(t.rxPackets - s_rates.last.rxPackets) / secs;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        CoopLinkInfo link;
+        const uint64_t resends = coop_net_link_info(static_cast<uint8_t>(i), &link) ? link.resends : 0;
+        s_rates.resendsPerSec[i] = resends >= s_rates.resendsLast[i] ? resends - s_rates.resendsLast[i] : 0;
+        s_rates.resendsLast[i] = resends;
+    }
+    s_rates.sampledMs = now;
+    s_rates.last = t;
+}
+
+std::string fmt_size(uint64_t bytes) {
+    char buf[32];
+    if (bytes >= 1024ull * 1024ull) {
+        std::snprintf(buf, sizeof(buf), "%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.1f KB", static_cast<double>(bytes) / 1024.0);
+    }
+    return buf;
+}
+
+std::string fmt_rate(double kbs, double packets) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.1f KB/s, %.0f packets/s", kbs, packets);
+    return buf;
+}
+
+int players_in_session() {
+    int n = 0;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        if (coop_net_player_present(static_cast<uint8_t>(i))) ++n;
+    }
+    return n;
+}
+
+std::string net_text() {
+    sample_rates();
+    std::string out = std::string("Crests of Courage ") + COOP_MOD_VERSION + "\n\n";
+    if (!coop_net_connected()) return out + "Not connected.";
+    const int players = players_in_session();
+    out += coop_net_is_host() ? std::string("Hosting")
+                              : "Joined as player " + std::to_string(coop_net_local_id());
+    out += ", " + std::to_string(players) + (players == 1 ? " player\n\n" : " players\n\n");
+    const CoopNetTraffic t = coop_net_traffic();
+    out += "Upload: " + fmt_rate(s_rates.upKBs, s_rates.upPackets) + "\n";
+    out += "Download: " + fmt_rate(s_rates.downKBs, s_rates.downPackets) + "\n\n";
+    out += "Since launch: " + fmt_size(t.txBytes) + " up, " + fmt_size(t.rxBytes) + " down";
+    return out;
+}
+
+std::string net_peers_text() {
+    if (!coop_net_connected()) return "";
+    std::string out;
+    for (int i = 0; i < kCoopMaxPlayers; ++i) {
+        const uint8_t id = static_cast<uint8_t>(i);
+        if (id == coop_net_local_id() || !coop_net_player_present(id)) continue;
+        const CoopPeer& p = features_peer_of(id);
+        if (!out.empty()) out += "\n\n";
+        out += (p.present && !p.name.empty()) ? p.name : "Player " + std::to_string(id);
+        const int32_t ms = coop_net_ping_ms(id);
+        out += ms >= 0 ? "\nPing: " + std::to_string(ms) + " ms" : std::string("\nPing: measuring");
+        CoopLinkInfo link;
+        if (!coop_net_link_info(id, &link)) {
+            out += "\nThrough the host";
+        } else if (!link.udp) {
+            out += "\nDirect connection (TCP)";
+        } else {
+            out += "\nRoom code (UDP), " + std::to_string(s_rates.resendsPerSec[id]) + " resent/s";
+            if (link.queuedBytes > 0) out += ", " + fmt_size(link.queuedBytes) + " waiting";
+        }
+    }
+    return out.empty() ? "Nobody else is here yet." : out;
+}
+
+std::string global_status_card_rml();
+std::string voice_key_text();
+std::string global_players_card_rml();
+
+void refresh(SurfaceHandles& h) {
+    if (h.status != 0) {
+        const std::string text = status_text();
+        if (text != h.lastStatus) {
+            h.lastStatus = text;
+            svc_ui->elem_set_text(mod_ctx, h.status, h.lastStatus.c_str());
+        }
+    }
+    if (h.peer != 0) {
+        const std::string text = peer_text();
+        if (text != h.lastPeer) {
+            h.lastPeer = text;
+            svc_ui->elem_set_text(mod_ctx, h.peer, h.lastPeer.c_str());
+        }
+    }
+    if (h.models != 0) {
+        const std::string text = worn_text();
+        if (text != h.lastModels) {
+            h.lastModels = text;
+            svc_ui->elem_set_text(mod_ctx, h.models, h.lastModels.c_str());
+        }
+    }
+    sort_presets(h);
+    if (h.invite != 0) {
+        const std::string text = invite_text();
+        if (text != h.lastInvite) {
+            h.lastInvite = text;
+            svc_ui->elem_set_text(mod_ctx, h.invite, h.lastInvite.c_str());
+        }
+    }
+    if (h.party != 0) {
+        const std::string text = party_text();
+        if (text != h.lastParty) {
+            h.lastParty = text;
+            svc_ui->elem_set_text(mod_ctx, h.party, h.lastParty.c_str());
+        }
+    }
+    if (h.net != 0) {
+        const std::string text = net_text();
+        if (text != h.lastNet) {
+            h.lastNet = text;
+            svc_ui->elem_set_text(mod_ctx, h.net, h.lastNet.c_str());
+        }
+    }
+    if (h.globalStatus != 0) {
+        const std::string text = "Status: " + global_status();
+        if (text != h.lastGlobalStatus) {
+            h.lastGlobalStatus = text;
+            svc_ui->elem_set_text(mod_ctx, h.globalStatus, h.lastGlobalStatus.c_str());
+        }
+    }
+    push_block_list(h);
+    if (h.voiceKey != 0) {
+        const std::string text = voice_key_text();
+        if (text != h.lastVoiceKey) {
+            h.lastVoiceKey = text;
+            svc_ui->elem_set_text(mod_ctx, h.voiceKey, h.lastVoiceKey.c_str());
+        }
+    }
+    if (h.statusCard != 0) {
+        const std::string rml = global_status_card_rml();
+        if (rml != h.lastStatusCard) {
+            h.lastStatusCard = rml;
+            svc_ui->elem_set_rml(mod_ctx, h.statusCard, rml.c_str());
+        }
+    }
+    if (h.playersCard != 0) {
+        const std::string rml = global_players_card_rml();
+        if (rml != h.lastPlayersCard) {
+            h.lastPlayersCard = rml;
+            svc_ui->elem_set_rml(mod_ctx, h.playersCard, rml.c_str());
+        }
+    }
+    if (h.netPeers != 0) {
+        const std::string text = net_peers_text();
+        if (text != h.lastNetPeers) {
+            h.lastNetPeers = text;
+            svc_ui->elem_set_text(mod_ctx, h.netPeers, h.lastNetPeers.c_str());
+        }
+    }
+    push_players(h);
+}
+
+void on_player_pressed(ModContext*, UiListHandle, uint64_t key, void*) {
+
+    if (key < kCoopMaxPlayers) features_teleport_to_player(static_cast<uint8_t>(key));
+}
+
+using GroupFn = ModResult (*)(ModContext*, UiElementHandle, void*, ModError*);
+
+void add_panel_header(UiElementHandle pane, const char* title, const char* subtitle = nullptr,
+    const char* tone = "") {
+    std::string rml = "<div class=\"coop-head ";
+    rml += tone;
+    rml += "\">";
+    rml += escape_rml(title);
+    rml += "</div>";
+    if (subtitle != nullptr && subtitle[0] != '\0') {
+        rml += "<div class=\"coop-sub\">";
+        rml += escape_rml(subtitle);
+        rml += "</div>";
+    }
+    svc_ui->pane_add_rml(mod_ctx, pane, rml.c_str(), nullptr);
+}
+
+void add_group_or_section(UiElementHandle left, UiElementHandle detail, const char* title,
+    GroupFn build, void* data = nullptr) {
+    if (detail != 0) {
+        UiGroupDesc group = UI_GROUP_DESC_INIT;
+        group.label = title;
+        group.build = build;
+        group.user_data = data;
+        if (svc_ui->pane_add_group(mod_ctx, left, detail, &group, nullptr) == MOD_OK) return;
+        coop_log::warn("coop_mod: [UI] could not add the '{}' group", title);
+    }
+    svc_ui->pane_add_section(mod_ctx, left, title);
+    build(mod_ctx, left, data, nullptr);
+}
+
+void add_step(UiElementHandle pane, int number, const char* text) {
+
+    std::string rml = "<div class=\"coop-step\"><span class=\"coop-step-n\">";
+    rml += std::to_string(number);
+    rml += "</span><span class=\"coop-step-t\">";
+    rml += escape_rml(text);
+    rml += "</span></div>";
+    svc_ui->pane_add_rml(mod_ctx, pane, rml.c_str(), nullptr);
+}
+
+ModResult build_online_guide(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Playing together");
+    svc_ui->pane_add_text(mod_ctx, pane,
+        "Everyone types the same Room. One of you presses Host, the rest press Join.", nullptr);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Same wifi");
+    svc_ui->pane_add_text(mod_ctx, pane,
+        "If the room won't connect, use Join by address in Advanced with the host's local "
+        "address.", nullptr);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "If the code won't connect");
+    svc_ui->pane_add_text(mod_ctx, pane,
+        "Some networks are too strict. Use Tailscale instead. It's free and works everywhere.",
+        nullptr);
+    add_step(pane, 1, "Everyone installs Tailscale and signs in.");
+    add_step(pane, 2, "The host invites the others at login.tailscale.com, under Users.");
+    add_step(pane, 3, "The host presses Host.");
+    add_step(pane, 4, "The others use Join by address in Advanced with the host's Tailscale "
+                      "address. It starts with 100.");
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Firewall");
+    svc_ui->pane_add_text(mod_ctx, pane,
+        "If your device asks to let Dusklight through, allow it.", nullptr);
+    return MOD_OK;
+}
+
+ModResult group_advanced(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Advanced");
+    svc_ui->pane_add_section(mod_ctx, pane, "Join by address");
+    add_string(pane, "Address", coop_net_address_var(), 64);
+    add_number(pane, "Port", coop_net_join_port_var(), 1024, 65535, 1, nullptr);
+    add_button(pane, "Join by address", [](ModContext*, void*) { coop_net_join(); }, net_active,
+        "Same wifi, Tailscale, or a forwarded port.");
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Hosting");
+    add_number(pane, "Port to listen on", coop_net_port_var(), 1024, 65535, 1, nullptr);
+    add_toggle(pane, "Room codes", coop_net_rooms_var());
+    add_toggle(pane, "Open the port for me", coop_net_upnp_var());
+    add_toggle(pane, "Connect on launch", coop_net_autoconnect_var());
+    add_toggle(pane, "Keep playing if the host leaves", coop_net_migrate_var(),
+        "If the host crashes or leaves a room-code game, another player takes over the same room and everyone carries on.");
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Your save");
+    add_button(pane, "Restore latest backup",
+        [](ModContext*, void*) { joinsync_restore_backup(false); }, net_active);
+    add_button(pane, "Restore oldest backup",
+        [](ModContext*, void*) { joinsync_restore_backup(true); }, net_active);
+
+    static std::string s_backup;
+    s_backup = joinsync_backup_summary();
+    svc_ui->pane_add_text(mod_ctx, pane, s_backup.c_str(), nullptr);
+
+    static const std::string kVersionLine = std::string("Version ") + COOP_MOD_VERSION;
+    svc_ui->pane_add_text(mod_ctx, pane, kVersionLine.c_str(), nullptr);
+    return MOD_OK;
+}
+
+std::string global_status_card_rml() {
+    std::string dot = "hot-dot";
+    std::string value = "Off";
+    std::string detail = "Other players can see your IP address while this is on.";
+    if (global_active()) {
+        dot += " hot-on";
+        value = "Online";
+        detail = global_status();
+    } else if (global_connecting()) {
+        dot += " hot-busy";
+        value = "Connecting";
+        detail = global_status();
+    } else if (cfg_bool(global_enabled_var(), false)) {
+        value = "Paused";
+        detail = global_status();
+    }
+    return "<div class=\"hot-card\"><div class=\"hot-card-top\"><div class=\"hot-card-title\">Status</div>"
+           "<div class=\"hot-card-value\"><div class=\"" + dot + "\"></div><div class=\"hot-card-value-text\">" +
+           value + "</div></div></div><div class=\"hot-card-sub\">" + escape_rml(detail) + "</div></div>";
+}
+
+std::string global_players_card_rml() {
+    const bool on = global_active();
+    return "<div class=\"hot-card\"><div class=\"hot-card-top\"><div class=\"hot-card-title\">Players Online</div>"
+           "<div class=\"hot-card-value\"><img class=\"hot-community-icon\" "
+           "src=\"mod://dev.remiafterdark.coop_mod/res/crowd.png\" /><div class=\"hot-card-value-text\">" +
+           std::to_string(global_total()) + "</div></div></div><div class=\"hot-card-sub\">" +
+           (on ? "Playing Hyrule Online right now." : "Join to see who's playing.") + "</div></div>";
+}
+
+void add_wide_rml(UiElementHandle pane, const std::string& rml, UiElementHandle* out = nullptr) {
+    UiElementHandle h = 0;
+    svc_ui->pane_add_rml(mod_ctx, pane, rml.c_str(), &h);
+    if (h != 0) svc_ui->elem_set_class(mod_ctx, h, "hot-wide", true);
+    if (out != nullptr) *out = h;
+}
+
+std::string voice_key_text() {
+    return voice_key_capture_active() ? "Mute key: press a key (Esc to cancel)"
+                                      : "Mute key: " + voice_mute_key_name();
+}
+
+ModResult group_global_voice(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Voice", "Talk to the players near you.");
+    if (!voice_supported()) {
+        svc_ui->pane_add_text(mod_ctx, pane, "Voice chat isn't available on this device yet.", nullptr);
+        return MOD_OK;
+    }
+    static std::string s_status;
+    s_status = "Status: " + voice_status();
+    svc_ui->pane_add_text(mod_ctx, pane, s_status.c_str(), nullptr);
+    add_toggle(pane, "Voice chat", voice_enabled_var(), "In Hyrule Online and in co-op.");
+    if (voice_can_talk()) {
+        static std::vector<std::string> s_mics;
+        static std::vector<const char*> s_micPtrs;
+        s_mics = voice_input_devices();
+        s_micPtrs.clear();
+        for (const std::string& m : s_mics) s_micPtrs.push_back(m.c_str());
+        add_dropdown(pane, "Microphone", voice_input_index_var(), s_micPtrs.data(), s_micPtrs.size(), nullptr,
+            voice_enabled_var());
+        add_toggle(pane, "Mute my microphone", voice_muted_var(), nullptr, voice_enabled_var());
+        add_number(pane, "Microphone volume", voice_mic_volume_var(), 0, 200, 10, "%", nullptr, voice_enabled_var());
+#if defined(_WIN32)
+        s_window.lastVoiceKey = voice_key_text();
+        svc_ui->pane_add_text(mod_ctx, pane, s_window.lastVoiceKey.c_str(), &s_window.voiceKey);
+        add_button(pane, "Change mute key", [](ModContext*, void*) { voice_begin_key_capture(); }, nullptr,
+            "Mutes and unmutes your microphone in game. Press this, then the new key.");
+#endif
+    } else {
+        svc_ui->pane_add_text(mod_ctx, pane,
+            "Talking isn't available on this device yet, but you can hear the players near you.", nullptr);
+    }
+    add_number(pane, "Player volume", voice_player_volume_var(), 0, 200, 10, "%", nullptr, voice_enabled_var());
+    add_number(pane, "Range", voice_range_var(), 0, 200, 10, "%", "How far away you can hear people.",
+        voice_enabled_var());
+    add_toggle(pane, "Fade with distance in co-op", voice_proximity_var(),
+        "Off: everyone in your co-op room is heard at full volume. Hyrule Online always fades.",
+        voice_enabled_var());
+    return MOD_OK;
+}
+
+ModResult group_global_chat(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Chat");
+    svc_ui->pane_add_text(mod_ctx, pane, chat_how_text(), nullptr);
+    add_toggle(pane, "Show chat on screen", chat_show_var());
+    add_number(pane, "Chat size", chat_size_var(), 50, 200, 10, "%");
+    add_number(pane, "Fade after", chat_fade_var(), 2, 120, 1, " s");
+    return MOD_OK;
+}
+
+ModResult group_global_names(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Name tags");
+    add_toggle(pane, "Show their names", global_nametags_var(),
+        "Only for Hyrule Online. Off in Local > Name tags hides these too.");
+    add_number(pane, "Name distance", global_nametag_distance_var(), 500, 30000, 500, "",
+        "How far away you can read their names.", global_nametags_var());
+    add_color(pane, "Your name color", colors_name_var());
+    add_button(pane, "Name color back to white", [](ModContext*, void*) {
+        if (colors_name_var() != 0) svc_config->set_string(mod_ctx, colors_name_var(), "");
+    });
+    return MOD_OK;
+}
+
+ModResult group_global_box(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "On-screen box");
+    add_toggle(pane, "Show the box", global_hud_var(),
+        "How many players are in this area, while Hyrule Online is on. On a PC you can drag it with the mouse.");
+    add_toggle(pane, "Players in all of Hyrule", global_hud_all_var(), "Everyone online, above the count for this area.",
+        global_hud_var());
+    add_toggle(pane, "PvP players in this area", global_hud_pvp_var(), "How many players here have PvP on, in red.",
+        global_hud_var());
+    add_number(pane, "Across", global_hud_x_var(), 0, 100, 1, "%", nullptr, global_hud_var());
+    add_number(pane, "Down", global_hud_y_var(), 0, 100, 1, "%", nullptr, global_hud_var());
+    add_number(pane, "Size", global_hud_size_var(), 50, 200, 5, "%", nullptr, global_hud_var());
+    add_number(pane, "Opacity", global_hud_opacity_var(), 20, 100, 5, "%", nullptr, global_hud_var());
+    add_button(pane, "Put it back", [](ModContext*, void*) { global_hud_reset_place(); });
+    return MOD_OK;
+}
+
+ModResult group_global_pvp(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "PvP");
+    add_toggle(pane, "PvP", global_pvp_var(),
+        "Fight other players who have it on too. Their names show in red.");
+    add_toggle(pane, "Only show PvP players", global_pvp_only_var(),
+        "Hides everyone who doesn't have PvP on.");
+    return MOD_OK;
+}
+
+void build_global(UiElementHandle pane, SurfaceHandles& h, UiElementHandle detail) {
+    add_panel_header(pane, "Hyrule Online", "Play alongside everyone out in Hyrule.");
+    add_wide_rml(pane, "<div class=\"hot-intro\">See other people playing in the same area as you. You each "
+                       "keep your own game, nothing gets shared.</div>");
+    h.lastStatusCard = global_status_card_rml();
+    add_wide_rml(pane, h.lastStatusCard, &h.statusCard);
+    h.lastPlayersCard = global_players_card_rml();
+    add_wide_rml(pane, h.lastPlayersCard, &h.playersCard);
+
+    UiControlDesc join = UI_CONTROL_DESC_INIT;
+    join.kind = UI_CONTROL_BUTTON;
+    join.label = "JOIN HYRULE";
+    join.on_pressed = [](ModContext*, void*) { svc_config->set_bool(mod_ctx, global_enabled_var(), true); };
+    join.is_disabled = [](ModContext*, void*) -> bool { return cfg_bool(global_enabled_var(), false); };
+    join.help_rml = "Other players can see your IP address while this is on.";
+    UiElementHandle joinHandle = 0;
+    if (svc_ui->pane_add_control(mod_ctx, pane, &join, &joinHandle) == MOD_OK && joinHandle != 0) {
+        svc_ui->elem_set_class(mod_ctx, joinHandle, "hot-primary", true);
+    }
+    UiControlDesc leave = UI_CONTROL_DESC_INIT;
+    leave.kind = UI_CONTROL_BUTTON;
+    leave.label = "LEAVE HYRULE";
+    leave.on_pressed = [](ModContext*, void*) { svc_config->set_bool(mod_ctx, global_enabled_var(), false); };
+    leave.is_disabled = [](ModContext*, void*) -> bool { return !cfg_bool(global_enabled_var(), false); };
+    svc_ui->pane_add_control(mod_ctx, pane, &leave, nullptr);
+
+    add_group_or_section(pane, detail, "Voice", group_global_voice);
+    add_group_or_section(pane, detail, "Chat", group_global_chat);
+    add_group_or_section(pane, detail, "Name tags", group_global_names);
+    add_group_or_section(pane, detail, "PvP", group_global_pvp);
+    add_group_or_section(pane, detail, "On-screen box", group_global_box);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Players");
+    svc_ui->pane_add_text(mod_ctx, pane, "Press someone to block them. Press again to unblock.", nullptr);
+    add_button(pane, "Unblock everyone", [](ModContext*, void*) {
+        for (const GlobalPlayer& p : global_blocked_list()) global_set_blocked(p, false);
+        s_window.blockListPushed = false;
+        push_block_list(s_window);
+    }, nullptr, "Everyone you blocked can be seen and heard again.");
+    UiListDesc list = UI_LIST_DESC_INIT;
+    list.on_pressed = on_block_pressed;
+    if (svc_ui->pane_add_list(mod_ctx, pane, &list, &h.blockList) != MOD_OK) h.blockList = 0;
+    h.blockListPushed = false;
+    push_block_list(h);
+}
+
+void build_connect(UiElementHandle pane, SurfaceHandles& h, UiElementHandle detail) {
+    const CoopFeatureVars& vars = features_vars();
+    h.lastStatus = status_text();
+    svc_ui->pane_add_text(mod_ctx, pane, h.lastStatus.c_str(), &h.status);
+    h.lastInvite = invite_text();
+    svc_ui->pane_add_text(mod_ctx, pane, h.lastInvite.c_str(), &h.invite);
+
+    add_string(pane, "Name", vars.name, kCoopNameMax - 1);
+    add_string(pane, "Room", coop_net_room_code_var(), static_cast<int32_t>(kRoomNameMax));
+    add_button(pane, "Host", [](ModContext*, void*) { coop_net_host(); }, net_active,
+        "Empty Room gets a random code.");
+    add_button(pane, "Join", [](ModContext*, void*) { coop_net_join_code(); }, net_active);
+    add_button(pane, "Disconnect", [](ModContext*, void*) { coop_net_disconnect(); }, net_idle);
+    add_button(pane, "Chat", [](ModContext*, void*) { chat_open(); }, nullptr,
+        "Talk to everyone in your session.");
+
+    add_group_or_section(pane, detail, "Advanced", group_advanced);
+    add_group_or_section(pane, detail, "How to play together", build_online_guide);
+}
+
+void build_players(UiElementHandle pane, SurfaceHandles& h) {
+
+    h.lastPeer = peer_text();
+    svc_ui->pane_add_text(mod_ctx, pane, h.lastPeer.c_str(), &h.peer);
+
+    UiListDesc list = UI_LIST_DESC_INIT;
+    list.on_pressed = on_player_pressed;
+    if (svc_ui->pane_add_list(mod_ctx, pane, &list, &h.players) != MOD_OK) {
+        h.players = 0;
+    }
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Stuck?");
+    svc_ui->pane_add_text(mod_ctx, pane,
+        "Takes their story and progress and puts you next to them. Your rupees, ammo and hearts stay yours.",
+        nullptr);
+    UiListDesc catchUp = UI_LIST_DESC_INIT;
+    catchUp.on_pressed = [](ModContext*, UiListHandle, uint64_t key, void*) {
+        if (key < kCoopMaxPlayers) joinsync_catch_up(static_cast<uint8_t>(key));
+    };
+    if (svc_ui->pane_add_list(mod_ctx, pane, &catchUp, &h.catchUp) != MOD_OK) h.catchUp = 0;
+    h.listPushed = false;
+    push_players(h);
+}
+
+ModResult group_sharing(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Share");
+    const CoopFeatureVars& vars = features_vars();
+    add_toggle(pane, "Items", vars.syncInventory,
+        "Not rupees or ammo. Small keys are shared: one of you spends it, it is gone for all.");
+    add_toggle(pane, "Dungeon progress", world_dungeon_var(),
+        "Chests, switches and doors. Open one and it is open for everybody.");
+    add_toggle(pane, "World objects", enemies_breakables_var(),
+        "Pots, grass, blocks and the like.");
+    add_toggle(pane, "Time of day", vars.syncTime,
+        "One clock for everybody, so it is not day for you and night for them.");
+    return MOD_OK;
+}
+
+ModResult group_together(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Playing together");
+    add_toggle(pane, "Death link", features_vars().deathLink,
+        "One of you dies, everybody dies.");
+    return MOD_OK;
+}
+
+ModResult group_pvp(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "PvP");
+    add_toggle(pane, "PvP", pvp_enabled_var(),
+        "Players can hit each other with anything that hits an enemy. The host's setting is the one "
+        "in use.");
+    add_number(pane, "Damage", pvp_damage_var(), 0, 400, 25, "%",
+        "How much of each hit lands, for everybody.", pvp_enabled_var());
+    add_toggle(pane, "Lock on to players", pvp_lock_on_var(),
+        "Z-target other players while PvP is on. Your own setting.");
+    return MOD_OK;
+}
+
+ModResult group_unfinished(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Unfinished", nullptr, "coop-danger");
+
+    add_toggle(pane, "Story progress", world_story_var(),
+        "Quest flags are shared. They are only ever added, never taken away, and you get them the "
+        "next time you change area, never in the middle of a scene. Fishing records, donations "
+        "and the like stay your own.");
+    add_toggle(pane, "Enemy sync", enemies_enabled_var(),
+        "Enemies fight all of you: one set shared between you, instead of a copy each. Can leave an "
+        "enemy alive on one screen and dead on the other.");
+    add_toggle(pane, "Boss sync", boss_enabled_var(),
+        "Ook and Diababa only; other bosses are untouched. CAN SOFTLOCK THE FIGHT. If it does, "
+        "turn this off and re-enter the room.");
+    add_toggle(pane, "Hold boss fights until everyone's there", boss_wait_var(),
+        "The fight waits at the door until the whole party has walked in. Can leave you stuck at "
+        "the door if someone never arrives.");
+    return MOD_OK;
+}
+
+ModResult group_dev(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Dev");
+    add_toggle(pane, "Enemy decisions", enemies_decisions_var());
+    add_toggle(pane, "Pushed objects", enemies_movers_var());
+    add_toggle(pane, "Warp effect on others (can crash)", features_vars().puppetWarpFx);
+    add_toggle(pane, "Log puppet materials on build", puppet_warp_dump_var(),
+        "Dumps every material of each model as a puppet is built. Noisy, and it reads engine "
+        "structures directly. Only turn it on to chase a model bug.");
+    return MOD_OK;
+}
+
+void build_game(UiElementHandle pane, UiElementHandle detail) {
+    if (coop_session_from_host()) {
+        svc_ui->pane_add_text(mod_ctx, pane,
+            "You are connected, so the host's settings are the ones in use.", nullptr);
+    }
+    add_group_or_section(pane, detail, "Share", group_sharing);
+    add_group_or_section(pane, detail, "Playing together", group_together);
+    add_group_or_section(pane, detail, "PvP", group_pvp);
+    add_group_or_section(pane, detail, "Unfinished: these can break your game", group_unfinished);
+    if (features_debug_menu()) add_group_or_section(pane, detail, "Dev", group_dev);
+}
+
+ModResult group_nametags(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Name tags");
+    const CoopFeatureVars& vars = features_vars();
+    add_toggle(pane, "Show their name", vars.nametags,
+        "Above them, smaller the further away they are.");
+    add_toggle(pane, "Track them off screen", vars.nametagsEdge,
+        "An arrow at the edge of the screen pointing at players you cannot see.", vars.nametags);
+    add_toggle(pane, "Hide when far away", vars.nametagsHideFar,
+        "Tags disappear past about a field's width instead of following them forever.",
+        vars.nametags);
+    add_color(pane, "Your name color", colors_name_var());
+    add_button(pane, "Name color back to white", [](ModContext*, void*) {
+        if (colors_name_var() != 0) svc_config->set_string(mod_ctx, colors_name_var(), "");
+    });
+    return MOD_OK;
+}
+
+ModResult group_health(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Health");
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Player");
+    const ConfigVarHandle world = features_vars().nametagsHealth;
+    add_toggle(pane, "Show hearts under them", world,
+        "Real hearts at their feet, sized like their name tag.");
+    add_toggle(pane, "Only when they get hurt", squad_hud_hurt_only_var(),
+        "Hidden until they take damage, then shown for a while.", world);
+    add_number(pane, "Size", squad_hud_world_size_var(), 20, 150, 5, "%",
+        "Against the size of their name tag, so they still shrink with distance.", world);
+    add_number(pane, "Stay up for", squad_hud_hurt_seconds_var(), 1, 30, 1, "s",
+        "How long after a hit the hearts remain.", squad_hud_hurt_only_var());
+    add_number(pane, "Fade out over", squad_hud_hurt_fade_var(), 0, 50, 1, "/10s",
+        "The tail end of that time is spent fading. Zero cuts them off instead.",
+        squad_hud_hurt_only_var());
+
+    svc_ui->pane_add_section(mod_ctx, pane, "HUD");
+    add_toggle(pane, "Show players on HUD", squad_hud_enabled_var(),
+        "Everybody's hearts under your own. Past three players the rest become one line each.");
+    add_number(pane, "Size", squad_hud_size_var(), 20, 100, 5, "%",
+        "How big theirs are next to your own hearts.", squad_hud_enabled_var());
+    static const char* const kSides[] = {"Left", "Right"};
+    add_dropdown(pane, "Side", squad_hud_side_var(), kSides, 2,
+        "Left sits under your own hearts. Right mirrors it on the other edge of the screen.",
+        squad_hud_enabled_var());
+    add_number(pane, "Distance down", squad_hud_offset_var(), 0, 300, 2, nullptr,
+        "Moves the whole list down. The space between players stays the same.",
+        squad_hud_enabled_var());
+    add_number(pane, "Distance from the side", squad_hud_offset_x_var(), -40, 400, 2, nullptr,
+        "Moves the whole list in from the edge of the screen it is on.", squad_hud_enabled_var());
+    return MOD_OK;
+}
+
+ModResult group_map(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Map");
+    svc_ui->pane_add_text(mod_ctx, pane,
+        "Off to start with. Players show as a Link face, outlined in red when they have PvP on.",
+        nullptr);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Map screen");
+    add_toggle(pane, "Show players on the map", map_markers_full_var(),
+        "Their face where they are, on the field map. Players inside a building or a dungeon are "
+        "not on it.");
+    add_toggle(pane, "Show players on dungeon maps", map_markers_dungeon_var(),
+        "Everybody in the same dungeon, on the floor they are on.");
+    add_toggle(pane, "Their names", map_markers_names_var(), "Under each face.");
+    add_number(pane, "Name size", map_markers_name_size_var(), 50, 200, 10, "%", nullptr,
+        map_markers_names_var());
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Minimap");
+    add_toggle(pane, "Show players on the minimap", map_markers_minimap_var(),
+        "A face for each player nearby. Players in the next area over show faded at the edge.");
+    add_number(pane, "Marker size", map_markers_arrow_size_var(), 50, 250, 10, "%", nullptr,
+        map_markers_minimap_var());
+    add_toggle(pane, "Keep far players at the edge", map_markers_edge_var(),
+        "Somebody off the edge of the minimap stays on its border, on their side.",
+        map_markers_minimap_var());
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Both");
+    add_toggle(pane, "Show players on other floors", map_markers_other_floor_var(),
+        "Faded, so you can tell they are upstairs or down.");
+    static const char* const kColors[] = {"Each their own", "All white"};
+    add_dropdown(pane, "Colours", map_markers_colors_var(), kColors, 2,
+        "Each player gets a colour for their name, so you can tell who is who.");
+    return MOD_OK;
+}
+
+ModResult group_sound(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Sound");
+    const CoopFeatureVars& vars = features_vars();
+    add_toggle(pane, "Hear other players", vars.syncSounds,
+        "Their sword swings, footsteps and voice, from where they are standing.");
+    add_number(pane, "Their volume", vars.soundVolume, 0, 100, 5, "%",
+        "Quieter than your own by default, so the room does not double up.", vars.syncSounds);
+    return MOD_OK;
+}
+
+ModResult group_joining(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Joining");
+    add_toggle(pane, "Keep my own rupees, ammo and hearts", joinsync_keep_consumables_var(),
+        "Joining with a file you have played: you keep your rupees, arrows, bombs, slingshot seeds "
+        "and hearts instead of taking the host's, up to what the host's wallet, quiver, bags and "
+        "heart containers hold. A brand-new file takes the host's. Either way you never arrive "
+        "at the host's current health - off, or on a new file, you arrive at full.");
+    return MOD_OK;
+}
+
+ModResult group_messages(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Notifications");
+    const ConfigVarHandle on = notify_on_var();
+    add_toggle(pane, "Show notifications", on, "Turn this off to hide all of them.");
+    add_toggle(pane, "Preview while editing", notify_preview_var(),
+        "Shows a batch of sample notifications so you can see how they will look while you change "
+        "these settings. Only in-game, with a save loaded. Turns itself off when this window "
+        "closes.", on);
+    add_number(pane, "Test amount", notify_test_amount_var(), 1, 40, 1, nullptr,
+        "How many samples the preview shows. Changing it makes a fresh batch.",
+        notify_preview_var());
+    add_toggle(pane, "Cycle test", notify_cycle_var(),
+        "When the batch has gone, send it again - over and over, until you turn this off.",
+        notify_preview_var());
+    add_toggle(pane, "Use Dusklight's notifications instead", notify_engine_var(),
+        "Its own pop-ups: one at a time, no stacking.", on);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "What to show");
+    add_toggle(pane, "Items they find", features_vars().notifyItems,
+        "When somebody finds something that matters: a key, an item, a heart piece. In a "
+        "randomizer it also says where they found it, and rupees and ammo are left out.", on);
+    add_toggle(pane, "Players joining and leaving", notify_kind_var(kNotifyPlayers), nullptr, on);
+    add_toggle(pane, "Randomizer", notify_kind_var(kNotifyRando),
+        "The host's seed arriving, switching to it, and so on.", on);
+    add_toggle(pane, "Teleports", notify_kind_var(kNotifyTeleport), nullptr, on);
+    add_toggle(pane, "Everything else", notify_kind_var(kNotifyOther),
+        "Death link, version mismatches, model notes and the rest.", on);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Timing");
+    add_number(pane, "Stay up for", notify_seconds_var(), 1, 30, 1, "s",
+        "How long each one stays when nothing else is waiting.", on);
+    add_number(pane, "At once", notify_max_var(), 1, 8, 1, nullptr,
+        "How many can be on screen together. The rest wait their turn.", on);
+    add_number(pane, "When busy, each stays", notify_busy_var(), 5, 100, 1, "/10s",
+        "With more waiting behind them, each one only stays this long, so a pile of them comes "
+        "through in quick bursts instead of taking a minute.", on);
+    add_number(pane, "Hurry once this many wait", notify_hurry_var(), 1, 30, 1, nullptr,
+        "How big the queue has to get before they speed up.", on);
+    add_toggle(pane, "Show how many are waiting", notify_more_var(),
+        "A \"+3 more\" line under the stack.", on);
+    add_toggle(pane, "Slide in", notify_slide_var(), "Off, they just fade in.", on);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Position and size");
+    static const char* const kSides[] = {"Left", "Middle", "Right"};
+    add_dropdown(pane, "Side", notify_side_var(), kSides, 3, nullptr, on);
+    static const char* const kEdges[] = {"Top", "Bottom"};
+    add_dropdown(pane, "Edge", notify_edge_var(), kEdges, 2,
+        "Which edge the stack starts from. It grows away from it.", on);
+    add_number(pane, "Distance from the side", notify_from_side_var(), 0, 400, 2, nullptr,
+        "Moves them in from the side they are on. No effect in the middle.", on);
+    add_number(pane, "Distance from the edge", notify_from_edge_var(), 0, 400, 2, nullptr,
+        "Moves them in from the top or bottom. The default keeps them above the rupee counter.",
+        on);
+    add_number(pane, "Size", notify_size_var(), 40, 200, 5, "%", nullptr, on);
+    return MOD_OK;
+}
+
+void build_screen(UiElementHandle pane, UiElementHandle detail) {
+    add_group_or_section(pane, detail, "Name tags", group_nametags);
+    add_group_or_section(pane, detail, "Health", group_health);
+    add_group_or_section(pane, detail, "Map", group_map);
+    add_group_or_section(pane, detail, "Sound", group_sound);
+    add_group_or_section(pane, detail, "Notifications", group_messages);
+    add_group_or_section(pane, detail, "Joining", group_joining);
+    svc_ui->pane_add_section(mod_ctx, pane, "Menu");
+    add_toggle(pane, "Show Network tab", s_networkTabVar, "Ping and traffic for each player.");
+}
+
+std::vector<std::string> s_modelNames;
+std::vector<std::string> s_modelTitles;
+std::vector<std::string> s_modelHelp;
+
+std::string escape_rml(const std::string& text) {
+    std::string out;
+    for (char c : text) {
+        if (c == '<') out += "&lt;";
+        else if (c == '>') out += "&gt;";
+        else if (c == '&') out += "&amp;";
+        else out += c;
+    }
+    return out;
+}
+
+void add_rml_list(std::string& out, const char* heading, const std::vector<std::string>& items,
+    const char* itemClass) {
+    if (items.empty()) return;
+    out += "<div class=\"coop-listhead\">";
+    out += escape_rml(heading);
+    out += "</div>";
+    for (const std::string& item : items) {
+        out += "<div class=\"";
+        out += itemClass;
+        out += "\">";
+        out += escape_rml(item);
+        out += "</div>";
+    }
+}
+
+std::string model_help_rml(int index) {
+    std::string out;
+    const std::string credit = skins_author_text(index);
+    if (!credit.empty()) {
+        out += "<div class=\"coop-credit\">" + escape_rml(credit) + "</div>";
+    }
+    const std::string own = skins_own_words(index);
+    if (!own.empty()) {
+        out += "<div class=\"coop-note\">" + escape_rml(own) + "</div>";
+    }
+    std::vector<std::string> outfits;
+    skins_outfit_list(index, outfits);
+    add_rml_list(out, "Outfits", outfits, "coop-item");
+
+    std::vector<std::string> has;
+    std::vector<std::string> missing;
+    skins_equipment_list(index, has, missing);
+    add_rml_list(out, "Equipment", has, "coop-item");
+
+    add_rml_list(out, "Not included", missing, "coop-item coop-missing");
+    return out;
+}
+
+std::vector<std::string> s_slotOptions[kSkinChoiceCount];
+std::vector<const char*> s_slotOptionPtrs[kSkinChoiceCount];
+std::vector<std::string> s_slotModelNames[kSkinChoiceCount];
+std::string s_slotHelp[kSkinChoiceCount];
+
+std::string worn_text() {
+    if (skins_all_same("")) return "Wearing Link's own model.";
+    for (int i = 0; i < skins_count(); ++i) {
+        if (skins_all_same(skins_name(i))) return "Wearing " + skins_title(i) + ".";
+    }
+    return "Wearing a mix of models.";
+}
+
+bool add_slot_dropdown(UiElementHandle pane, int slot) {
+    s_slotOptions[slot].clear();
+    s_slotOptionPtrs[slot].clear();
+    s_slotModelNames[slot].clear();
+
+    s_slotOptions[slot].push_back(slot >= kSkinChoiceFirstItem ? "Same as Equipment" : "Default");
+    for (size_t i = 0; i < s_modelNames.size(); ++i) {
+        if (!skins_covers_slot(s_modelNames[i].c_str(), slot)) continue;
+        s_slotOptions[slot].push_back(s_modelTitles[i]);
+        s_slotModelNames[slot].push_back(s_modelNames[i]);
+    }
+
+    if (slot == kSkinChoiceVoice) {
+        s_slotOptions[slot].push_back("Silent");
+        s_slotModelNames[slot].push_back(kSilentVoice);
+    }
+    for (const std::string& option : s_slotOptions[slot]) {
+        s_slotOptionPtrs[slot].push_back(option.c_str());
+    }
+    if (s_slotModelNames[slot].empty()) return false;
+
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+
+    desc.kind = UI_CONTROL_DROPDOWN;
+    desc.label = skins_slot_label(slot);
+    desc.options = s_slotOptionPtrs[slot].data();
+    desc.option_count = s_slotOptionPtrs[slot].size();
+    desc.user_data = reinterpret_cast<void*>(static_cast<intptr_t>(slot));
+    desc.get = [](ModContext*, void* data, UiControlValue* value) {
+        const int slot = static_cast<int>(reinterpret_cast<intptr_t>(data));
+        const std::string worn = skins_local_slot(slot);
+        int index = 0;
+        for (size_t i = 0; i < s_slotModelNames[slot].size(); ++i) {
+            if (s_slotModelNames[slot][i] == worn) index = static_cast<int>(i) + 1;
+        }
+        value->int_value = index;
+    };
+    desc.set = [](ModContext*, void* data, const UiControlValue* value) {
+        const int slot = static_cast<int>(reinterpret_cast<intptr_t>(data));
+        const int index = static_cast<int>(value->int_value);
+        const bool known = index > 0 && index <= static_cast<int>(s_slotModelNames[slot].size());
+        skins_set_local_slot(slot, known ? s_slotModelNames[slot][index - 1].c_str() : "");
+    };
+    add_control(pane, desc);
+    return true;
+}
+
+ModResult build_colors_detail(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Colors");
+
+    add_button(pane, "Reset colors", [](ModContext*, void*) { colors_reset_mine(); });
+    std::string lastGroup;
+    for (int i = 0; i < colors_slot_count(); ++i) {
+        const std::string group = colors_slot_group(i);
+        if (group != lastGroup) {
+            svc_ui->pane_add_section(mod_ctx, pane, group.c_str());
+            lastGroup = group;
+        }
+        add_color(pane, colors_slot_label(i), colors_slot_var(i));
+    }
+    return MOD_OK;
+}
+
+ModResult build_equipment_detail(ModContext*, UiElementHandle pane, void*, ModError*) {
+    add_panel_header(pane, "Equipment");
+    svc_ui->pane_add_text(mod_ctx, pane,
+        "One model for everything you hold, and any piece below can come from somewhere else. A "
+        "piece left on Same as Equipment follows the choice above it.", nullptr);
+    add_slot_dropdown(pane, kSkinChoiceEquipment);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Pieces");
+    int offered = 0;
+    for (int slot = kSkinChoiceFirstItem; slot < kSkinChoiceCount; ++slot) {
+        if (add_slot_dropdown(pane, slot)) ++offered;
+    }
+    if (offered == 0) {
+        svc_ui->pane_add_text(mod_ctx, pane,
+            "None of your models have a sword or shield of their own.", nullptr);
+    }
+    return MOD_OK;
+}
+
+const char* outfit_heading(int outfit) {
+    switch (outfit) {
+    case kSkinOutfitOrdon: return "Has Ordon clothes";
+    case kSkinOutfitZora: return "Has Zora armor";
+    case kSkinOutfitMagic: return "Has Magic armor";
+    case kSkinOutfitWolf: return "Has a wolf";
+    default: return "Has the Hero's clothes";
+    }
+}
+
+std::vector<bool> s_presetInHas;
+void* pack_preset(int row, bool otherGroup) {
+    return reinterpret_cast<void*>(static_cast<intptr_t>(row | (otherGroup ? 0x10000 : 0)));
+}
+int preset_row(void* data) {
+    return static_cast<int>(reinterpret_cast<intptr_t>(data) & 0xFFFF);
+}
+bool preset_hidden(ModContext*, void* data) {
+    const int row = preset_row(data);
+    const bool other = (reinterpret_cast<intptr_t>(data) & 0x10000) != 0;
+    if (row < 0 || row >= static_cast<int>(s_presetInHas.size())) return other;
+    return other ? s_presetInHas[row] : !s_presetInHas[row];
+}
+
+void sort_presets(SurfaceHandles& h) {
+    if (h.presetHas.empty() || h.presetHas.size() != h.presetOther.size()) return;
+    const int outfit = local_skin_outfit();
+    if (outfit == h.presetOutfit) return;
+    h.presetOutfit = outfit;
+    int others = 0;
+    s_presetInHas.assign(h.presetHas.size(), true);
+    for (size_t i = 0; i < h.presetHas.size(); ++i) {
+
+        const bool has = i == 0 ||
+            (i - 1 < s_modelNames.size() && skins_covers_outfit(s_modelNames[i - 1].c_str(), outfit));
+        if (h.presetHas[i] != 0) svc_ui->elem_set_visible(mod_ctx, h.presetHas[i], has);
+        if (h.presetOther[i] != 0) svc_ui->elem_set_visible(mod_ctx, h.presetOther[i], !has);
+        s_presetInHas[i] = has;
+        if (!has) ++others;
+    }
+    h.presetHasText = outfit_heading(outfit);
+    if (h.presetHasHead != 0) {
+        svc_ui->elem_set_text(mod_ctx, h.presetHasHead, h.presetHasText.c_str());
+    }
+
+    if (h.presetOtherHead != 0) svc_ui->elem_set_visible(mod_ctx, h.presetOtherHead, others > 0);
+    if (h.presetOtherRow != 0) svc_ui->elem_set_visible(mod_ctx, h.presetOtherRow, others > 0);
+}
+
+void build_models(UiElementHandle pane, SurfaceHandles& h, UiElementHandle detail) {
+
+    s_modelNames.clear();
+    s_modelTitles.clear();
+    s_modelHelp.clear();
+    for (int i = 0; i < skins_count(); ++i) {
+        if (skins_hidden(i)) continue;
+        s_modelNames.push_back(skins_name(i));
+        s_modelTitles.push_back(skins_title(i));
+        s_modelHelp.push_back(model_help_rml(i));
+    }
+
+    h.lastModels = worn_text();
+    svc_ui->pane_add_text(mod_ctx, pane, h.lastModels.c_str(), &h.models);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Presets");
+
+    h.presetHas.clear();
+    h.presetOther.clear();
+    h.presetOutfit = -1;
+    h.presetHasText = outfit_heading(local_skin_outfit());
+    const auto add_group = [&](UiElementHandle& head, const char* title, UiElementHandle* rowOut,
+                               std::vector<UiElementHandle>& into, bool otherGroup) {
+        svc_ui->pane_add_text(mod_ctx, pane, title, &head);
+        if (head != 0) svc_ui->elem_set_class(mod_ctx, head, "coop-preset-head", true);
+        if (rowOut != nullptr) *rowOut = 0;
+        const UiElementHandle parent = pane;
+        for (size_t i = 0; i <= s_modelNames.size(); ++i) {
+            UiControlDesc desc = UI_CONTROL_DESC_INIT;
+            desc.kind = UI_CONTROL_BUTTON;
+            if (i == 0) {
+                desc.label = "Link";
+                desc.help_rml = "Link as the game draws him.";
+                desc.user_data = pack_preset(0, otherGroup);
+                desc.on_pressed = [](ModContext*, void*) { skins_set_local_all(""); };
+                desc.is_selected = [](ModContext*, void*) { return skins_all_same(""); };
+            } else {
+                desc.label = s_modelTitles[i - 1].c_str();
+                desc.help_rml = s_modelHelp[i - 1].c_str();
+                desc.user_data = pack_preset(static_cast<int>(i), otherGroup);
+                desc.on_pressed = [](ModContext*, void* d) {
+                    const int index = preset_row(d) - 1;
+                    if (index >= 0 && index < static_cast<int>(s_modelNames.size())) skins_set_local_all(s_modelNames[index].c_str());
+                };
+                desc.is_selected = [](ModContext*, void* d) {
+                    const int index = preset_row(d) - 1;
+                    return index >= 0 && index < static_cast<int>(s_modelNames.size()) &&
+                           skins_all_same(s_modelNames[index].c_str());
+                };
+            }
+            desc.is_disabled = preset_hidden;
+            UiElementHandle control = 0;
+            svc_ui->pane_add_control(mod_ctx, parent, &desc, &control);
+            if (control != 0) svc_ui->elem_set_class(mod_ctx, control, "coop-preset", true);
+            into.push_back(control);
+        }
+    };
+    add_group(h.presetHasHead, h.presetHasText.c_str(), nullptr, h.presetHas, false);
+    add_group(h.presetOtherHead, "Other models", &h.presetOtherRow, h.presetOther, true);
+    sort_presets(h);
+    if (s_modelNames.empty()) {
+        svc_ui->pane_add_text(mod_ctx, pane,
+            "Nothing installed yet. Put a model folder in the folder below and press Reload.",
+            nullptr);
+    }
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Mix-n-match");
+
+    if (detail != 0) {
+        UiGroupDesc group = UI_GROUP_DESC_INIT;
+        group.label = "Equipment";
+        group.build = build_equipment_detail;
+        svc_ui->pane_add_group(mod_ctx, pane, detail, &group, nullptr);
+    } else {
+        add_slot_dropdown(pane, kSkinChoiceEquipment);
+    }
+    if (detail != 0) {
+        UiGroupDesc colors = UI_GROUP_DESC_INIT;
+        colors.label = "Colors";
+        colors.build = build_colors_detail;
+        svc_ui->pane_add_group(mod_ctx, pane, detail, &colors, nullptr);
+    }
+    for (int slot = 0; slot < kSkinChoiceCount; ++slot) {
+
+        if (slot == kSkinChoiceCutscenes) continue;
+
+        if (slot >= kSkinChoiceFirstItem) continue;
+
+        if (slot == kSkinChoiceEquipment) continue;
+        add_slot_dropdown(pane, slot);
+    }
+    svc_ui->pane_add_section(mod_ctx, pane, "Your models folder");
+    if (skins_can_open_folder()) {
+        add_button(pane, "Open the folder", [](ModContext*, void*) { skins_open_folder(); });
+    } else {
+
+        static std::string s_folder;
+        s_folder = skins_folder_path();
+        if (!s_folder.empty()) svc_ui->pane_add_text(mod_ctx, pane, s_folder.c_str(), nullptr);
+    }
+    add_button(pane, "Reload", [](ModContext*, void*) { skins_refresh(); }, nullptr,
+        "Press after adding or changing a folder.");
+}
+
+std::vector<std::string> s_colorGroups;
+
+ModResult group_colors(ModContext*, UiElementHandle pane, void* data, ModError*) {
+    const int index = static_cast<int>(reinterpret_cast<intptr_t>(data));
+    if (index < 0 || index >= static_cast<int>(s_colorGroups.size())) return MOD_OK;
+    add_panel_header(pane, s_colorGroups[index].c_str());
+
+    UiControlDesc reset = UI_CONTROL_DESC_INIT;
+    reset.kind = UI_CONTROL_BUTTON;
+    reset.label = "Reset to default";
+    reset.user_data = data;
+    reset.on_pressed = [](ModContext*, void* group) {
+        const int g = static_cast<int>(reinterpret_cast<intptr_t>(group));
+        if (g < 0 || g >= static_cast<int>(s_colorGroups.size())) return;
+        for (int i = 0; i < colors_slot_count(); ++i) {
+            if (s_colorGroups[g] == colors_slot_group(i) && colors_slot_var(i) != 0) {
+                svc_config->set_string(mod_ctx, colors_slot_var(i), "");
+            }
+        }
+    };
+    add_control(pane, reset);
+    for (int i = 0; i < colors_slot_count(); ++i) {
+        if (s_colorGroups[index] != colors_slot_group(i)) continue;
+        add_color(pane, colors_slot_label(i), colors_slot_var(i));
+    }
+    return MOD_OK;
+}
+
+void build_colors(UiElementHandle pane, UiElementHandle detail) {
+
+    add_button(pane, "Reset colors", [](ModContext*, void*) { colors_reset_mine(); });
+    s_colorGroups.clear();
+    for (int i = 0; i < colors_slot_count(); ++i) {
+        const std::string group = colors_slot_group(i);
+        if (s_colorGroups.empty() || s_colorGroups.back() != group) s_colorGroups.push_back(group);
+    }
+    for (size_t i = 0; i < s_colorGroups.size(); ++i) {
+        add_group_or_section(pane, detail, s_colorGroups[i].c_str(), group_colors,
+            reinterpret_cast<void*>(static_cast<intptr_t>(i)));
+    }
+}
+
+void build_debug(UiElementHandle pane) {
+    svc_ui->pane_add_section(mod_ctx, pane, "Debug");
+    add_button(pane, "Spawn test puppet", [](ModContext*, void*) { coop_debug_spawn_puppet(); });
+    add_button(pane, "Transform", [](ModContext*, void*) { coop_debug_force_transform(); });
+    add_button(pane, "Give Midna", [](ModContext*, void*) { coop_debug_give_midna(); });
+    add_button(pane, "Be Ganondorf", [](ModContext*, void*) {
+        const bool on = ganon_debug_toggle();
+        features_toast(on ? "You're Ganondorf" : "You're Link again",
+            on ? "Link-sized, with all your own things. Press again to go back." : "");
+    }, nullptr, "Draws Ganondorf in your place, Link-sized, moving with your animations. Only "
+        "what you look like changes - your items, sword and everything else are still Link's. "
+        "Only on your screen.");
+    add_button(pane, "Be Beast Ganon", [](ModContext*, void*) {
+        const bool on = beast_debug_toggle();
+        features_toast(on ? "Your wolf is Beast Ganon" : "Your wolf is the wolf again",
+            on ? "Turn into the wolf to see him. Press again to go back." : "");
+    }, nullptr, "Puts Beast Ganon in your wolf's slot (or takes him out): the wolf is drawn as him, "
+        "wolf-sized. Other players see him too.");
+    add_button(pane, "Test notifications", [](ModContext*, void*) { notify_debug_test(); },
+        nullptr, "One of every kind at once, to see how they stack, where they sit and how long "
+        "they stay.");
+}
+
+ModResult build_panel(ModContext*, UiElementHandle pane, void*, ModError*) {
+    report_hint_arm();
+    s_panel = SurfaceHandles{};
+    UiControlDesc open = UI_CONTROL_DESC_INIT;
+    open.kind = UI_CONTROL_GROUP;
+    open.label = "Open Co-op";
+    open.on_pressed = [](ModContext*, void*) { open_window(); };
+    add_control(pane, open);
+
+    build_connect(pane, s_panel, 0);
+    build_players(pane, s_panel);
+    build_game(pane, 0);
+    build_screen(pane, 0);
+    build_models(pane, s_panel, 0);
+    build_colors(pane, 0);
+    if (features_debug_menu()) build_debug(pane);
+    return MOD_OK;
+}
+
+ModResult update_panel(ModContext*, void*, ModError*) {
+    refresh(s_panel);
+    return MOD_OK;
+}
+
+ModResult tab_connect(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    s_window = SurfaceHandles{};
+    build_connect(left, s_window, right);
+    svc_ui->pane_add_text(mod_ctx, right,
+        "Everyone types the same Room. One of you presses Host, the rest press Join. "
+        "Leave Room empty and Host makes a code for you to share.\n\n"
+        "Joining loads the host's game where they are standing. Your own save is backed up "
+        "first, and you can restore it from Advanced.\n\n"
+        "If it won't connect, open How to play together.",
+        nullptr);
+    return MOD_OK;
+}
+
+ModResult tab_global(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    s_window = SurfaceHandles{};
+    build_global(left, s_window, right);
+    add_wide_rml(right,
+        "<div class=\"coop-head\">About</div>"
+        "<div class=\"hot-about-title\">Hyrule Online</div>"
+        "<div class=\"hot-about-text\">See other people playing in the same area as you. You each keep "
+        "your own game, nothing gets shared.</div>"
+        "<div class=\"hot-about-text\">Other players can see your IP address while this is on.</div>"
+        "<div class=\"hot-about-text\">Turns off while you're in a co-op room.</div>"
+        "<div class=\"hot-rule\"></div>"
+        "<div class=\"hot-about-credit\">Hyrule Online page by ThyHeroOfTime</div>"
+        "<div class=\"hot-about-credit\">UI design by Dragonberri</div>");
+    return MOD_OK;
+}
+
+ModResult tab_players(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    s_window = SurfaceHandles{};
+    build_players(left, s_window);
+
+    s_window.lastParty = party_text();
+    svc_ui->pane_add_text(mod_ctx, right, s_window.lastParty.c_str(), &s_window.party);
+    svc_ui->pane_add_text(mod_ctx, right, "Pick one to teleport to them.", nullptr);
+    return MOD_OK;
+}
+
+ModResult tab_game(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    s_window = SurfaceHandles{};
+    build_game(left, right);
+    svc_ui->pane_add_text(mod_ctx, right,
+        "The rules of the shared world. Whoever hosts decides them for everybody.", nullptr);
+    return MOD_OK;
+}
+
+ModResult tab_screen(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    s_window = SurfaceHandles{};
+    build_screen(left, right);
+    svc_ui->pane_add_text(mod_ctx, right,
+        "Only your screen. None of this changes the game for anyone else.", nullptr);
+    return MOD_OK;
+}
+
+ModResult tab_models(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    s_window = SurfaceHandles{};
+    build_models(left, s_window, right);
+
+    svc_ui->pane_add_text(mod_ctx, right,
+        "Pick a model to see what it has and choose what to wear.\n\n"
+        "Other players see your model only if they have it too. If they don't, they see Link.",
+        nullptr);
+    return MOD_OK;
+}
+
+ModResult tab_network(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    s_window = SurfaceHandles{};
+    s_window.lastNet = net_text();
+    svc_ui->pane_add_text(mod_ctx, left, s_window.lastNet.c_str(), &s_window.net);
+    s_window.lastNetPeers = net_peers_text();
+    svc_ui->pane_add_text(mod_ctx, right, s_window.lastNetPeers.c_str(), &s_window.netPeers);
+    return MOD_OK;
+}
+
+ModResult tab_debug(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle, void*, ModError*) {
+    s_window = SurfaceHandles{};
+    build_debug(left);
+    return MOD_OK;
+}
+
+ModResult update_window(ModContext*, void*, ModError*) {
+    refresh(s_window);
+    if (cfg_bool(s_networkTabVar, false) != s_networkTabShown) s_reopenWindow = true;
+    return MOD_OK;
+}
+
+void on_window_closed(ModContext*, UiWindowHandle, void*) {
+    notify_stop_preview();
+    s_windowHandle = 0;
+    s_window = SurfaceHandles{};
+}
+
+const char* const kWindowStyle = R"RCSS(
+
+section-heading {
+    opacity: 0.85;
+    font-size: var(--font-size-lg);
+    letter-spacing: 1dp;
+    padding-bottom: var(--space-xs);
+    border-bottom: 1dp rgba(var(--color-border-rgb), 30%);
+    margin-bottom: var(--space-xs);
+}
+
+section-heading:not(:first-of-type) {
+    padding-top: var(--space-md);
+}
+
+pane > div {
+    color: rgba(var(--color-text-rgb), 72%);
+    line-height: 1.45;
+    max-width: 560dp;
+    padding-bottom: var(--space-xs);
+}
+
+pane {
+    padding: var(--space-lg);
+    gap: var(--space-xs);
+}
+
+select-button {
+    margin-bottom: 1dp;
+}
+
+.coop-preset-head {
+    display: block;
+    font-family: var(--font-family-heading);
+    text-transform: uppercase;
+    letter-spacing: 1dp;
+    font-size: var(--font-size-md);
+    color: rgba(var(--color-text-rgb), 60%);
+    padding-top: var(--space-xs);
+    padding-bottom: 2dp;
+}
+
+select-button key {
+    font-weight: bold;
+}
+
+select-button.group-button {
+    padding-top: var(--space-xs);
+    padding-bottom: var(--space-xs);
+    border-bottom-width: 1dp;
+    border-bottom-color: rgba(var(--color-border-rgb), 22%);
+}
+
+select-button.group-button key {
+    font-family: var(--font-family-heading);
+    font-size: var(--font-size-2xl);
+}
+
+.coop-head {
+    display: block;
+    font-family: var(--font-family-heading);
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 1dp;
+    font-size: var(--font-size-3xl);
+    color: var(--color-accent);
+    padding-bottom: var(--space-xs);
+    border-bottom-width: 1dp;
+    border-bottom-color: rgba(var(--color-accent-rgb), 35%);
+}
+
+.coop-head.coop-danger {
+    color: var(--color-error);
+    border-bottom-color: rgba(var(--color-error-rgb), 45%);
+}
+
+.coop-sub {
+    display: block;
+    color: rgba(var(--color-text-rgb), 55%);
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    padding-top: var(--space-xs);
+    padding-bottom: var(--space-sm);
+}
+
+.coop-step {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    padding-bottom: var(--space-sm);
+}
+
+.coop-step-n {
+    flex: 0 0 22dp;
+    width: 22dp;
+    height: 22dp;
+    line-height: 22dp;
+    text-align: center;
+    border-radius: 11dp;
+    background-color: rgba(var(--color-accent-rgb), 20%);
+    color: var(--color-accent);
+    font-family: var(--font-family-heading);
+    font-weight: bold;
+    font-size: var(--font-size-2xs);
+}
+
+.coop-step-t {
+    flex: 1 1 auto;
+    color: rgba(var(--color-text-rgb), 88%);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+}
+
+.coop-credit {
+    display: block;
+    font-family: var(--font-family-heading);
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 1dp;
+    font-size: var(--font-size-md);
+    color: var(--color-accent);
+    padding-bottom: var(--space-xs);
+}
+
+.coop-note {
+    display: block;
+    color: rgba(var(--color-text-rgb), 72%);
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    padding-bottom: var(--space-xs);
+}
+
+.coop-listhead {
+    display: block;
+    font-family: var(--font-family-heading);
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 1dp;
+    font-size: var(--font-size-2xs);
+    color: rgba(var(--color-text-rgb), 45%);
+    padding-top: var(--space-sm);
+    padding-bottom: var(--space-2xs);
+}
+
+.coop-item {
+    display: block;
+    font-size: var(--font-size-md);
+    color: rgba(var(--color-text-rgb), 88%);
+    padding-top: 2dp;
+    padding-bottom: 2dp;
+    padding-left: var(--space-sm);
+    border-left-width: 2dp;
+    border-left-color: rgba(var(--color-accent-rgb), 55%);
+    margin-bottom: 2dp;
+}
+
+.coop-item.coop-missing {
+    color: rgba(var(--color-text-rgb), 38%);
+    border-left-color: rgba(var(--color-border-rgb), 28%);
+}
+
+pane > ui-list.coop-list {
+    flex: 0 0 auto;
+    height: 240dp;
+}
+
+pane > div.hot-wide {
+    max-width: none;
+}
+
+.hot-intro {
+    display: block;
+    color: rgba(var(--color-text-rgb), 88%);
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    padding-bottom: var(--space-sm);
+}
+
+.hot-card {
+    display: block;
+    padding-top: var(--space-sm);
+    padding-bottom: var(--space-sm);
+    padding-left: var(--space-md);
+    padding-right: var(--space-md);
+    margin-bottom: var(--space-xs);
+    border-radius: 3dp;
+    background-color: rgba(29, 28, 22, 94%);
+    box-shadow: rgba(148, 119, 51, 55%) 0 0 0 1dp;
+}
+
+.hot-card-top {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.hot-card-title {
+    color: rgb(236, 226, 196);
+    font-weight: bold;
+    font-size: var(--font-size-lg);
+}
+
+.hot-card-value {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    color: rgb(236, 226, 196);
+    font-size: var(--font-size-lg);
+}
+
+.hot-card-value-text {
+    display: block;
+    color: inherit;
+    font-size: inherit;
+}
+
+.hot-community-icon {
+    width: 24dp;
+    height: 18dp;
+    margin-right: var(--space-sm);
+}
+
+.hot-dot {
+    flex: 0 0 10dp;
+    width: 10dp;
+    height: 10dp;
+    border-radius: 5dp;
+    margin-right: var(--space-sm);
+    background-color: rgb(165, 165, 160);
+}
+
+.hot-dot.hot-on {
+    background-color: rgb(92, 205, 104);
+}
+
+.hot-dot.hot-busy {
+    background-color: rgb(220, 176, 61);
+}
+
+.hot-card-sub {
+    display: block;
+    color: rgba(var(--color-text-rgb), 72%);
+    font-size: var(--font-size-md);
+    line-height: 1.4;
+    padding-top: 2dp;
+}
+
+button.hot-primary:not(:disabled) {
+    color: rgb(255, 236, 174);
+    background-color: rgba(103, 82, 38, 92%);
+    box-shadow: rgb(220, 176, 61) 0 0 0 2dp;
+}
+
+.hot-rule {
+    display: block;
+    height: 1dp;
+    background-color: rgba(202, 163, 59, 45%);
+    margin-top: var(--space-md);
+    margin-bottom: var(--space-sm);
+}
+
+.hot-about-title {
+    display: block;
+    color: rgb(236, 226, 196);
+    font-weight: bold;
+    font-size: var(--font-size-lg);
+    padding-top: var(--space-sm);
+    padding-bottom: var(--space-xs);
+}
+
+.hot-about-text {
+    display: block;
+    color: rgba(var(--color-text-rgb), 80%);
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    padding-bottom: var(--space-xs);
+}
+
+.hot-about-credit {
+    display: block;
+    color: rgb(236, 226, 196);
+    font-size: var(--font-size-md);
+    padding-top: var(--space-sm);
+}
+
+)RCSS";
+
+void open_window() {
+    report_hint_arm();
+    if (s_windowHandle != 0) return;
+
+    UiTabDesc tabs[9];
+    size_t tabCount = 0;
+    const auto add_tab = [&](const char* title, UiTabBuildFn build, UiPanelUpdateFn update) {
+        tabs[tabCount] = UI_TAB_DESC_INIT;
+        tabs[tabCount].title = title;
+        tabs[tabCount].build = build;
+        tabs[tabCount].update = update;
+        ++tabCount;
+    };
+    add_tab("Connect", tab_connect, update_window);
+    add_tab("Hyrule Online", tab_global, update_window);
+
+    add_tab("Host", tab_game, update_window);
+    add_tab("Local", tab_screen, update_window);
+    add_tab("Players", tab_players, update_window);
+
+    add_tab("Customization", tab_models, update_window);
+
+    s_networkTabShown = cfg_bool(s_networkTabVar, false);
+    if (s_networkTabShown) add_tab("Network", tab_network, update_window);
+
+    add_tab("Report Bug",
+        [](ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*,
+            ModError*) -> ModResult {
+            report_build_tab(left, right);
+            return MOD_OK;
+        },
+        [](ModContext*, void*, ModError*) -> ModResult {
+            report_update_tab();
+            return MOD_OK;
+        });
+    if (features_debug_menu()) add_tab("Debug", tab_debug, update_window);
+
+    UiWindowDesc desc = UI_WINDOW_DESC_INIT;
+    desc.tabs = tabs;
+    desc.tab_count = tabCount;
+    desc.rcss = kWindowStyle;
+    desc.on_closed = on_window_closed;
+    if (svc_ui->window_push(mod_ctx, &desc, &s_windowHandle) != MOD_OK) {
+        s_windowHandle = 0;
+        coop_log::warn("coop_mod: [UI] failed to open the co-op window");
+    }
+}
+
+}
+
+void ui_update() {
+    if (!s_reopenWindow) return;
+    s_reopenWindow = false;
+    if (s_windowHandle == 0) return;
+    svc_ui->window_close(mod_ctx, s_windowHandle);
+    s_windowHandle = 0;
+    open_window();
+}
+
+void ui_init() {
+    ConfigVarDesc network = CONFIG_VAR_DESC_INIT;
+    network.name = "show_network_tab";
+    network.type = CONFIG_VAR_BOOL;
+    network.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &network, &s_networkTabVar) != MOD_OK) s_networkTabVar = 0;
+
+    UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
+    panel.build = build_panel;
+    panel.update = update_panel;
+    if (svc_ui->register_mods_panel(mod_ctx, &panel) != MOD_OK) {
+        coop_log::warn("coop_mod: [UI] failed to register the mods panel");
+    }
+
+    UiMenuTabDesc tab = UI_MENU_TAB_DESC_INIT;
+    tab.label = "Co-op";
+    tab.on_selected = [](ModContext*, void*) { open_window(); };
+    UiMenuTabHandle handle = 0;
+    if (svc_ui->register_menu_tab(mod_ctx, &tab, &handle) != MOD_OK) {
+        coop_log::warn("coop_mod: [UI] failed to add the Co-op menu bar tab");
+    }
+
+    UiMenuTabDesc chat = UI_MENU_TAB_DESC_INIT;
+    chat.label = "Chat";
+    chat.on_selected = [](ModContext*, void*) { chat_open(); };
+    UiMenuTabHandle chatHandle = 0;
+    if (svc_ui->register_menu_tab(mod_ctx, &chat, &chatHandle) != MOD_OK) {
+        coop_log::warn("coop_mod: [UI] failed to add the Chat menu bar tab");
+    }
+}

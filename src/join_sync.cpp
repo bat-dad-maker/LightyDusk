@@ -1,0 +1,690 @@
+
+
+#include "mod.hpp"
+#include "mods/svc/save.h"
+
+extern const SaveService* svc_save;
+#include "net/messages.hpp"
+
+#include "mods/service.hpp"
+#include "mods/svc/config.h"
+#include "mods/svc/host.h"
+#include "mods/svc/log.hpp"
+#include "print.hpp"
+
+#include "d/actor/d_a_alink.h"
+#include "d/d_com_inf_game.h"
+#include "d/d_save.h"
+#include "d/d_stage.h"
+
+#include <algorithm>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+const uint16_t kJoinSyncVersion = 1;
+const size_t kSaveSize = sizeof(dSv_save_c);
+
+static_assert(sizeof(dSv_save_c) == 0x958, "dSv_save_c size moved - the join-sync blob length is wrong");
+
+ConfigVarHandle s_acceptVar = 0;
+ConfigVarHandle s_keepConsumablesVar = 0;
+
+bool s_fileIsNew = false;
+
+void on_file_new(ModContext*, uint32_t, void*) {
+    s_fileIsNew = true;
+}
+
+void on_file_loaded(ModContext*, uint32_t, void*) {
+    s_fileIsNew = false;
+}
+
+bool s_hostSentTo[kCoopMaxPlayers] = {};
+bool s_joinerApplied = false;
+bool s_havePending = false;
+std::vector<uint8_t> s_pending;
+uint32_t s_settledTicks = 0;
+
+bool in_gameplay_settled() {
+
+    if (daAlink_getAlinkActorClass() == nullptr || dComIfGp_event_runCheck() ||
+        dComIfGp_isEnableNextStage() || dComIfGp_getStageStagInfo() == nullptr ||
+        coop_on_title_screen())
+    {
+        s_settledTicks = 0;
+        return false;
+    }
+
+    return ++s_settledTicks >= 10;
+}
+
+int current_save_slot() {
+    stage_stag_info_class* info = dComIfGp_getStageStagInfo();
+    if (info == nullptr) return -1;
+    const int slot = dStage_stagInfo_GetSaveTbl(info);
+    return (slot >= 0 && slot < dSv_save_c::STAGE_MAX) ? slot : -1;
+}
+
+void send_snapshot(uint8_t to) {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return;
+    std::vector<uint8_t> buffer(sizeof(MsgJoinSyncHeader) + kSaveSize);
+    MsgJoinSyncHeader header{};
+    header.version = kJoinSyncVersion;
+    header.size = static_cast<uint16_t>(kSaveSize);
+    std::memcpy(buffer.data(), &header, sizeof(header));
+
+    dSv_save_c& save = info->getSavedata();
+    std::memcpy(buffer.data() + sizeof(header), &save, kSaveSize);
+
+    const int slot = current_save_slot();
+    if (slot >= 0) {
+        const size_t slotOffset = offsetof(dSv_save_c, mSave) + slot * sizeof(dSv_memory_c);
+        std::memcpy(buffer.data() + sizeof(header) + slotOffset, &info->getMemory(),
+            sizeof(dSv_memory_c));
+    }
+
+    coop_net_send_to(to, kMsgJoinSync, buffer.data(), buffer.size());
+    s_hostSentTo[to] = true;
+    coop_log::info("coop_mod: [JOIN] sent progress to player {} ({} bytes)", to, kSaveSize);
+}
+
+const char kBackupMagic[4] = {'T', 'P', 'C', 'B'};
+const uint16_t kBackupVersion = 1;
+const int kBackupsKept = 5;
+
+#pragma pack(push, 1)
+struct SaveBackupHeader {
+    char magic[4];
+    uint16_t version;
+    uint16_t size;
+    int64_t unixTime;
+    char stage[8];
+};
+#pragma pack(pop)
+
+bool s_carryingJoinedWorld = false;
+
+bool backup_dir(std::filesystem::path& out) {
+    if (!SERVICE_HAS(svc_host, HostService, data_dir)) return false;
+    const char* dir = nullptr;
+    if (svc_host->data_dir(mod_ctx, &dir) != MOD_OK || dir == nullptr) return false;
+    out = std::filesystem::u8path(dir) / "save_backups";
+    std::error_code ec;
+    std::filesystem::create_directories(out, ec);
+    return !ec;
+}
+
+std::string path_text(const std::filesystem::path& p) {
+    const auto u8 = p.u8string();
+    return std::string(u8.begin(), u8.end());
+}
+
+std::vector<std::filesystem::path> list_backups() {
+    std::vector<std::filesystem::path> out;
+    std::filesystem::path dir;
+    if (!backup_dir(dir)) return out;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        const std::string name = path_text(entry.path().filename());
+        if (name.rfind("before_join_", 0) == 0 && entry.path().extension() == ".bin") {
+            out.push_back(entry.path());
+        }
+    }
+
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        return path_text(a.filename()) > path_text(b.filename());
+    });
+    return out;
+}
+
+void live_save_blob(dSv_info_c* info, uint8_t* out) {
+    std::memcpy(out, &info->getSavedata(), kSaveSize);
+    const int slot = current_save_slot();
+    if (slot >= 0) {
+        const size_t slotOffset = offsetof(dSv_save_c, mSave) + slot * sizeof(dSv_memory_c);
+        std::memcpy(out + slotOffset, &info->getMemory(), sizeof(dSv_memory_c));
+    }
+}
+
+void write_backup(dSv_info_c* info) {
+    if (s_carryingJoinedWorld) {
+        coop_log::info("coop_mod: [BACKUP] skipped, world is still from an earlier join");
+        return;
+    }
+    std::filesystem::path dir;
+    if (!backup_dir(dir)) {
+        coop_log::warn("coop_mod: [BACKUP] no data folder, joining without backup");
+        return;
+    }
+    SaveBackupHeader header{};
+    std::memcpy(header.magic, kBackupMagic, 4);
+    header.version = kBackupVersion;
+    header.size = static_cast<uint16_t>(kSaveSize);
+    const std::time_t now = std::time(nullptr);
+    header.unixTime = static_cast<int64_t>(now);
+    const char* stage = dComIfGp_getStartStageName();
+    if (stage != nullptr) std::strncpy(header.stage, stage, sizeof(header.stage));
+
+    std::vector<uint8_t> blob(kSaveSize);
+    live_save_blob(info, blob.data());
+
+    char name[64];
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    std::strftime(name, sizeof(name), "before_join_%Y%m%d_%H%M%S.bin", &tmv);
+    const std::filesystem::path path = dir / name;
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        f.write(reinterpret_cast<const char*>(blob.data()), static_cast<std::streamsize>(blob.size()));
+        if (!f) {
+            coop_log::warn("coop_mod: [BACKUP] could not write {}", path_text(path));
+            return;
+        }
+    }
+    coop_log::info("coop_mod: [BACKUP] your progress was saved to {}", path_text(path));
+
+    const auto all = list_backups();
+    for (size_t i = kBackupsKept; i + 1 < all.size(); ++i) {
+        std::error_code ec;
+        std::filesystem::remove(all[i], ec);
+    }
+}
+
+bool read_backup(const std::filesystem::path& path, std::vector<uint8_t>& blob,
+    SaveBackupHeader& header) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.read(reinterpret_cast<char*>(&header), sizeof(header))) return false;
+    if (std::memcmp(header.magic, kBackupMagic, 4) != 0 || header.version != kBackupVersion ||
+        header.size != kSaveSize)
+    {
+        return false;
+    }
+    blob.resize(kSaveSize);
+    return static_cast<bool>(f.read(reinterpret_cast<char*>(blob.data()), kSaveSize));
+}
+
+void settle_equipped_sword(dSv_save_c& save) {
+    struct Sword {
+        u8 item;
+        u8 bit;
+    };
+    static const Sword kBestFirst[] = {
+        {dItemNo_LIGHT_SWORD_e, COLLECT_LIGHT_SWORD},
+        {dItemNo_MASTER_SWORD_e, COLLECT_MASTER_SWORD},
+        {dItemNo_SWORD_e, COLLECT_ORDON_SWORD},
+        {dItemNo_WOOD_STICK_e, COLLECT_WOODEN_SWORD},
+    };
+    dSv_player_status_a_c& a = save.mPlayer.mPlayerStatusA;
+    const dSv_player_collect_c& owned = save.mPlayer.mCollect;
+    const u8 inHand = a.getSelectEquip(COLLECT_SWORD);
+    if (inHand == dItemNo_NONE_e) return;
+    u8 best = dItemNo_NONE_e;
+    for (const Sword& s : kBestFirst) {
+        if (!owned.isCollect(COLLECT_SWORD, s.bit)) continue;
+        if (s.item == inHand) return;
+        if (best == dItemNo_NONE_e) best = s.item;
+    }
+    a.setSelectEquip(COLLECT_SWORD, best);
+    coop_log::info("coop_mod: [JOIN] sword {:#x} in hand is not owned here, now {:#x}",
+        static_cast<int>(inHand), static_cast<int>(best));
+}
+
+void merge_into_live_save(dSv_info_c* info, const uint8_t* blob) {
+    dSv_save_c& mine = info->getSavedata();
+
+    static dSv_save_c result;
+    std::memcpy(&result, blob, kSaveSize);
+
+    dSv_player_status_a_c& hostA = result.mPlayer.mPlayerStatusA;
+    const dSv_player_status_a_c& myA = mine.mPlayer.mPlayerStatusA;
+    std::memcpy(hostA.mSelectEquip, myA.mSelectEquip, sizeof(hostA.mSelectEquip));
+    hostA.mTransformStatus = myA.mTransformStatus;
+
+    const u16 hostMaxLife = hostA.mMaxLife;
+    u16 life = myA.mLife;
+    const u16 lifeCap = static_cast<u16>((hostMaxLife / 5) * 4);
+    if (life > lifeCap) life = lifeCap;
+    if (life == 0) life = lifeCap > 0 ? lifeCap : 4;
+    hostA.mLife = life;
+
+    {
+        const u8 hostTransform = result.mPlayer.mPlayerStatusB.mTransformLevelFlag;
+        const u8 hostDarkClear = result.mPlayer.mPlayerStatusB.mDarkClearLevelFlag;
+        result.mPlayer.mPlayerStatusB = mine.mPlayer.mPlayerStatusB;
+        result.mPlayer.mPlayerStatusB.mTransformLevelFlag = hostTransform;
+        result.mPlayer.mPlayerStatusB.mDarkClearLevelFlag = hostDarkClear;
+    }
+    result.mPlayer.mHorsePlace = mine.mPlayer.mHorsePlace;
+    result.mPlayer.mPlayerReturnPlace = mine.mPlayer.mPlayerReturnPlace;
+    result.mPlayer.mPlayerFieldLastStayInfo = mine.mPlayer.mPlayerFieldLastStayInfo;
+    result.mPlayer.mPlayerLastMarkInfo = mine.mPlayer.mPlayerLastMarkInfo;
+    result.mPlayer.mPlayerInfo = mine.mPlayer.mPlayerInfo;
+    result.mPlayer.mConfig = mine.mPlayer.mConfig;
+    settle_equipped_sword(result);
+
+    std::memcpy(&mine, &result, kSaveSize);
+
+    const int slot = current_save_slot();
+    if (slot >= 0) {
+        info->getMemory() = mine.getSave(slot);
+    }
+
+    features_reset_sync_baselines();
+    world_on_connected();
+}
+
+struct PendingSession {
+    bool active = false;
+    u8 selectEquip[sizeof(dSv_player_status_a_c::mSelectEquip)] = {};
+    u8 transform = 0;
+    u16 life = 0;
+    uint32_t waitedTicks = 0;
+};
+PendingSession s_session;
+
+const uint32_t kSessionGiveUpTicks = 600;
+
+void load_host_save(dSv_info_c* info, const uint8_t* blob, uint8_t at = kCoopHostId) {
+    dSv_save_c& mine = info->getSavedata();
+    static dSv_save_c result;
+    std::memcpy(&result, blob, kSaveSize);
+
+    dSv_player_status_a_c& a = result.mPlayer.mPlayerStatusA;
+    const dSv_player_status_a_c& myA = mine.mPlayer.mPlayerStatusA;
+
+    const bool keepOwn = !s_fileIsNew && cfg_bool(s_keepConsumablesVar, true);
+
+    std::memcpy(s_session.selectEquip, a.mSelectEquip, sizeof(s_session.selectEquip));
+    s_session.transform = a.mTransformStatus;
+
+    std::memcpy(a.mSelectEquip, myA.mSelectEquip, sizeof(a.mSelectEquip));
+    a.mTransformStatus = myA.mTransformStatus;
+
+    const u16 maxLife = a.mMaxLife;
+    const u16 myLife = myA.mLife;
+    u16 lifeCap = static_cast<u16>((maxLife / 5) * 4);
+    if (lifeCap == 0) lifeCap = 4;
+    const u16 joinLife = (keepOwn && myLife > 0) ? std::min<u16>(myLife, lifeCap) : lifeCap;
+    a.mLife = joinLife;
+    s_session.life = joinLife;
+
+    result.mPlayer.mConfig = mine.mPlayer.mConfig;
+
+    {
+        dSv_player_info_c& theirs = result.mPlayer.mPlayerInfo;
+        const dSv_player_info_c& own = mine.mPlayer.mPlayerInfo;
+        if (own.mPlayerName[0] != '\0') {
+            std::memcpy(theirs.mPlayerName, own.mPlayerName, sizeof(theirs.mPlayerName));
+        }
+        if (own.mHorseName[0] != '\0') {
+            std::memcpy(theirs.mHorseName, own.mHorseName, sizeof(theirs.mHorseName));
+        }
+    }
+
+    if (keepOwn) {
+        dSv_player_item_record_c& rec = result.mPlayer.mItemRecord;
+        const dSv_player_item_record_c& myRec = mine.mPlayer.mItemRecord;
+        dSv_player_item_max_c& cap = result.mPlayer.mItemMax;
+        rec.setArrowNum(std::min<u8>(myRec.getArrowNum(), cap.getArrowNum()));
+        rec.setPachinkoNum(myRec.getPachinkoNum());
+        for (u8 bag = 0; bag < 3; ++bag) rec.setBombNum(bag, myRec.getBombNum(bag));
+        static const u16 kWalletCap[] = {300, 600, 1000};
+        const u8 wallet = a.getWalletSize();
+        const u16 walletCap = wallet < 3 ? kWalletCap[wallet] : 1000;
+        a.setRupee(std::min<u16>(myA.getRupee(), walletCap));
+    }
+
+    if (result.mPlayer.mHorsePlace.mName[0] != '\0') {
+        std::memset(result.mPlayer.mHorsePlace.mName, 0, sizeof(result.mPlayer.mHorsePlace.mName));
+        std::memcpy(result.mPlayer.mHorsePlace.mName, "coop", 4);
+    }
+
+    std::memcpy(&mine, &result, kSaveSize);
+
+    const int slot = current_save_slot();
+    if (slot >= 0) info->getMemory() = mine.getSave(slot);
+
+    features_reset_sync_baselines();
+    world_on_connected();
+
+    s_session.active = features_reload_at_player(at);
+    s_session.waitedTicks = 0;
+    if (!s_session.active) {
+        coop_log::warn("coop_mod: [JOIN] host position unknown, keeping local gear and position");
+    }
+}
+
+void apply_pending_session() {
+    if (!s_session.active) return;
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return;
+    if (daAlink_getAlinkActorClass() != nullptr) {
+        if (++s_session.waitedTicks >= kSessionGiveUpTicks) {
+            coop_log::warn("coop_mod: [JOIN] load did not happen, keeping local gear");
+            s_session = PendingSession{};
+        }
+        return;
+    }
+    dSv_player_status_a_c& a = info->getSavedata().mPlayer.mPlayerStatusA;
+    std::memcpy(a.mSelectEquip, s_session.selectEquip, sizeof(a.mSelectEquip));
+    a.mTransformStatus = s_session.transform;
+    a.mLife = s_session.life;
+    coop_log::info("coop_mod: [JOIN] loading in with the host's gear and form");
+    s_session = PendingSession{};
+}
+
+void apply_snapshot() {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr || s_pending.size() != kSaveSize) return;
+
+    if (rando_join_sync_wait()) return;
+    if (!rando_join_sync_allowed()) {
+        s_havePending = false;
+        s_pending.clear();
+        s_joinerApplied = true;
+        features_toast("Kept your own file",
+            "You and the host are on different randomizer seeds, so their progress was not "
+            "copied over.");
+        return;
+    }
+
+    if (!game_mode_is_coop()) {
+        write_backup(info);
+    } else {
+        coop_log::info("coop_mod: [JOIN] co-op save, taking host world without backup");
+    }
+    load_host_save(info, s_pending.data());
+    checks_on_join_synced();
+    s_carryingJoinedWorld = true;
+    s_joinerApplied = true;
+    s_havePending = false;
+    s_pending.clear();
+
+    const CoopPeer& peer = features_peer_of(kCoopHostId);
+    features_toast(("Synced with " + (peer.present ? peer.name : std::string("the host"))).c_str(),
+        game_mode_is_coop() ? "You're using their progress now."
+                            : "You're using their progress now. Your own save is backed up.");
+
+    {
+        const std::string address = coop_net_join_address();
+        game_mode_remember_host(peer.present ? peer.name.c_str() : nullptr, address.c_str());
+    }
+    coop_log::info("coop_mod: [JOIN] applied the host's progress");
+}
+
+void restore_backup(bool oldest) {
+    if (coop_net_connected()) {
+        features_toast("Disconnect first", "You can only restore while disconnected.");
+        return;
+    }
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr || daAlink_getAlinkActorClass() == nullptr || dComIfGp_event_runCheck()) {
+        features_toast("Not right now", "Load your save first.");
+        return;
+    }
+    const auto all = list_backups();
+    if (all.empty()) {
+        features_toast("No backup found", "One is made each time you join someone.");
+        return;
+    }
+    std::vector<uint8_t> blob;
+    SaveBackupHeader header{};
+    const std::filesystem::path& chosen = oldest ? all.back() : all.front();
+    if (!read_backup(chosen, blob, header)) {
+        features_toast("Backup unreadable", "It might be from a different mod version.");
+        coop_log::warn("coop_mod: [BACKUP] could not read {}", path_text(chosen));
+        return;
+    }
+    merge_into_live_save(info, blob.data());
+    s_carryingJoinedWorld = false;
+    coop_log::info("coop_mod: [BACKUP] restored {}", path_text(chosen));
+    features_toast("Progress restored", "Save the game to keep it.");
+}
+
+}
+
+void joinsync_register_vars() {
+    ConfigVarDesc keep = CONFIG_VAR_DESC_INIT;
+    keep.name = "join_keeps_own_consumables";
+    keep.type = CONFIG_VAR_BOOL;
+    keep.default_bool = true;
+    if (svc_config->register_var(mod_ctx, &keep, &s_keepConsumablesVar) != MOD_OK) {
+        s_keepConsumablesVar = 0;
+    }
+    if (svc_save != nullptr) {
+        svc_save->observe_saves(mod_ctx, on_file_new, on_file_loaded, nullptr, nullptr, nullptr);
+    }
+    ConfigVarDesc accept = CONFIG_VAR_DESC_INIT;
+    accept.name = "join_copies_host_progress";
+    accept.type = CONFIG_VAR_BOOL;
+    accept.default_bool = true;
+    if (svc_config->register_var(mod_ctx, &accept, &s_acceptVar) != MOD_OK) s_acceptVar = 0;
+}
+
+ConfigVarHandle joinsync_keep_consumables_var() {
+    return s_keepConsumablesVar;
+}
+
+void joinsync_restore_backup(bool oldest) {
+    restore_backup(oldest);
+}
+
+std::string joinsync_backup_summary() {
+    const auto all = list_backups();
+    if (all.empty()) return "No backups yet.";
+    std::vector<uint8_t> blob;
+    SaveBackupHeader header{};
+    if (!read_backup(all.front(), blob, header)) return "Latest backup could not be read.";
+    char when[64] = "an unknown time";
+    const std::time_t t = static_cast<std::time_t>(header.unixTime);
+    std::tm tmv{};
+#ifdef _WIN32
+    const bool ok = localtime_s(&tmv, &t) == 0;
+#else
+    const bool ok = localtime_r(&t, &tmv) != nullptr;
+#endif
+    if (ok) std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tmv);
+    char stage[9] = {};
+    std::memcpy(stage, header.stage, 8);
+    return std::string("Latest backup: ") + when + (stage[0] ? std::string(" (") + stage + ")" : "") +
+           ". " + std::to_string(all.size()) + " kept. The oldest is your first one.";
+}
+
+namespace {
+
+std::vector<uint8_t> s_catchUp;
+uint8_t s_catchUpFrom = kCoopNoPlayer;
+uint32_t s_catchUpAskedTick = 0;
+uint32_t s_catchUpTick = 0;
+
+void send_catch_up(uint8_t to) {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr) return;
+    std::vector<uint8_t> buffer(sizeof(MsgCatchUpHeader) + kSaveSize);
+    MsgCatchUpHeader header{};
+    header.to = to;
+    header.size = static_cast<uint16_t>(kSaveSize);
+    std::memcpy(buffer.data(), &header, sizeof(header));
+    std::memcpy(buffer.data() + sizeof(header), &info->getSavedata(), kSaveSize);
+    const int slot = current_save_slot();
+    if (slot >= 0) {
+        const size_t slotOffset = offsetof(dSv_save_c, mSave) + slot * sizeof(dSv_memory_c);
+        std::memcpy(buffer.data() + sizeof(header) + slotOffset, &info->getMemory(), sizeof(dSv_memory_c));
+    }
+    coop_net_send_to(to, kMsgCatchUp, buffer.data(), buffer.size());
+    coop_log::info("coop_mod: [JOIN] sent our save to player {} to catch up", to);
+}
+
+void keep_own_items(dSv_save_c& theirs, const dSv_save_c& mine) {
+    dSv_player_item_c& item = theirs.mPlayer.mItem;
+    const dSv_player_item_c& myItem = mine.mPlayer.mItem;
+    int kept = 0;
+    for (int i = 0; i < 24; ++i) {
+        if (item.mItems[i] == dItemNo_NONE_e && myItem.mItems[i] != dItemNo_NONE_e) {
+            item.mItems[i] = myItem.mItems[i];
+            ++kept;
+        }
+    }
+    if (kept != 0) item.setLineUpItem();
+    dSv_player_get_item_c& get = theirs.mPlayer.mGetItem;
+    const dSv_player_get_item_c& myGet = mine.mPlayer.mGetItem;
+    for (int i = 0; i < 8; ++i) get.mItemFlags[i] = static_cast<u32>(get.mItemFlags[i]) | static_cast<u32>(myGet.mItemFlags[i]);
+    for (int i = 0; i < 8; ++i) theirs.mPlayer.mCollect.mItem[i] |= mine.mPlayer.mCollect.mItem[i];
+    if (kept != 0) coop_log::info("coop_mod: [JOIN] catch up kept {} own item slot(s)", kept);
+}
+
+void apply_catch_up() {
+    dSv_info_c* info = dComIfGs_getSaveInfo();
+    if (info == nullptr || s_catchUp.size() != kSaveSize || s_catchUpFrom >= kCoopMaxPlayers) return;
+    if (!in_gameplay_settled() || dComIfGp_event_runCheck()) return;
+    const CoopPeer& peer = features_peer_of(s_catchUpFrom);
+    keep_own_items(*reinterpret_cast<dSv_save_c*>(s_catchUp.data()), info->getSavedata());
+    load_host_save(info, s_catchUp.data(), s_catchUpFrom);
+    s_carryingJoinedWorld = true;
+    coop_log::info("coop_mod: [JOIN] caught up with player {}", s_catchUpFrom);
+    features_toast(("Caught up with " + (peer.present ? peer.name : std::string("them"))).c_str(),
+        "You have their story now.");
+    s_catchUp.clear();
+    s_catchUpFrom = kCoopNoPlayer;
+}
+
+}
+
+void joinsync_catch_up(uint8_t player) {
+    if (!coop_net_connected() || player >= kCoopMaxPlayers || player == coop_net_local_id() ||
+        !coop_net_player_present(player)) {
+        return;
+    }
+    if (!rando_join_sync_allowed()) {
+        features_toast("Can't catch up", "You're on different randomizer seeds.");
+        return;
+    }
+    MsgCatchUpWant want{};
+    want.to = player;
+    coop_net_send_to(player, kMsgCatchUpWant, &want, sizeof(want));
+    s_catchUpAskedTick = s_catchUpTick != 0 ? s_catchUpTick : 1;
+    s_catchUpFrom = player;
+    features_toast("Catching up", "Asking for their save...");
+    coop_log::info("coop_mod: [JOIN] asking player {} for their save to catch up", player);
+}
+
+void joinsync_on_catch_up(uint8_t type, const uint8_t* payload, size_t size, uint8_t from) {
+    if (from >= kCoopMaxPlayers) return;
+    if (type == kMsgCatchUpWant) {
+        if (size < sizeof(MsgCatchUpWant) || payload[0] != coop_net_local_id()) return;
+        send_catch_up(from);
+        return;
+    }
+    if (size < sizeof(MsgCatchUpHeader)) return;
+    MsgCatchUpHeader header;
+    std::memcpy(&header, payload, sizeof(header));
+    if (header.to != coop_net_local_id()) return;
+
+    if (s_catchUpAskedTick == 0 || from != s_catchUpFrom) return;
+    if (header.size != kSaveSize || size < sizeof(header) + kSaveSize) return;
+    s_catchUp.assign(payload + sizeof(header), payload + sizeof(header) + kSaveSize);
+    s_catchUpAskedTick = 0;
+    coop_log::info("coop_mod: [JOIN] save from player {} received, catching up", from);
+}
+
+bool joinsync_ready_to_share() {
+    return coop_net_is_host() || s_joinerApplied;
+}
+
+uint32_t s_wantTicks = 0;
+bool s_wantLogged = false;
+
+void joinsync_on_want(uint8_t from) {
+    if (!coop_net_is_host() || from >= kCoopMaxPlayers) return;
+    if (s_hostSentTo[from]) coop_log::info("coop_mod: [JOIN] player {} asked again, resending", from);
+    s_hostSentTo[from] = false;
+}
+
+void joinsync_forget_player(uint8_t id) {
+    if (id < kCoopMaxPlayers) s_hostSentTo[id] = false;
+}
+
+void joinsync_on_connected() {
+    s_session = PendingSession{};
+    for (int i = 0; i < kCoopMaxPlayers; ++i) s_hostSentTo[i] = false;
+
+    s_joinerApplied = coop_net_migrating();
+    if (s_joinerApplied) coop_log::info("coop_mod: [JOIN] rejoined after a host handover, keeping our world");
+    s_havePending = false;
+    s_pending.clear();
+    s_settledTicks = 0;
+    s_wantTicks = 0;
+    s_wantLogged = false;
+}
+
+void joinsync_update() {
+
+    apply_pending_session();
+    ++s_catchUpTick;
+    if (!coop_net_connected()) {
+        s_catchUp.clear();
+        s_catchUpAskedTick = 0;
+        return;
+    }
+    if (!s_catchUp.empty()) apply_catch_up();
+    if (s_catchUpAskedTick != 0 && s_catchUpTick - s_catchUpAskedTick > 600) {
+        s_catchUpAskedTick = 0;
+        features_toast("Couldn't catch up", "They didn't answer. Try again in a moment.");
+    }
+    if (coop_net_is_host()) {
+        if (!in_gameplay_settled()) return;
+        for (int i = 0; i < kCoopMaxPlayers; ++i) {
+            const uint8_t id = static_cast<uint8_t>(i);
+            if (id == coop_net_local_id() || s_hostSentTo[i]) continue;
+            if (!coop_net_player_present(id) || !features_peer_of(id).present) continue;
+            send_snapshot(id);
+        }
+        return;
+    }
+    if (s_havePending && !s_joinerApplied && in_gameplay_settled()) apply_snapshot();
+    if (s_joinerApplied || s_havePending || !in_gameplay_settled()) {
+        s_wantTicks = 0;
+        return;
+    }
+    if (++s_wantTicks % 300 != 0) return;
+    if (!s_wantLogged) {
+        s_wantLogged = true;
+        coop_log::warn("coop_mod: [JOIN] host world not received, requesting");
+    }
+    const uint8_t want = 1;
+    coop_net_send_to(kCoopHostId, kMsgJoinSyncWant, &want, sizeof(want));
+}
+
+void joinsync_on_message(const uint8_t* payload, size_t size) {
+    if (coop_net_is_host() || s_joinerApplied) return;
+    if (size < sizeof(MsgJoinSyncHeader)) return;
+    MsgJoinSyncHeader header;
+    std::memcpy(&header, payload, sizeof(header));
+    if (header.version != kJoinSyncVersion || header.size != kSaveSize ||
+        size < sizeof(header) + kSaveSize)
+    {
+        coop_log::warn("coop_mod: [JOIN] ignored snapshot from a different build");
+        return;
+    }
+
+    if (false) {
+        coop_log::info("coop_mod: [JOIN] host progress received, copying disabled");
+        return;
+    }
+    s_pending.assign(payload + sizeof(header), payload + sizeof(header) + kSaveSize);
+    s_havePending = true;
+    coop_log::info("coop_mod: [JOIN] host progress received, applying in game");
+}

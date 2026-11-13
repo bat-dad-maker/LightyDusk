@@ -1,0 +1,209 @@
+
+
+#include "mod.hpp"
+#include "net/messages.hpp"
+#include "print.hpp"
+
+#include "mods/service.hpp"
+#include "mods/svc/game_mode.h"
+#include "mods/svc/save.h"
+#include "mods/svc/ui.h"
+
+#include <cstdint>
+#include <cstring>
+
+IMPORT_OPTIONAL_SERVICE(GameModeService, svc_game_mode);
+IMPORT_OPTIONAL_SERVICE(SaveService, svc_save);
+
+namespace {
+
+const char* const kGameModeId = "dev.remiafterdark.coop_mod.coop";
+
+const char* const kSaveName = "crests-of-courage";
+
+bool s_active = false;
+
+GameModeNewSaveState* s_newSaveState = nullptr;
+UiWindowHandle s_newSaveWindow = 0;
+
+bool s_skipNextLoadPrompt = false;
+
+void finish_new_save(ModContext* ctx) {
+    if (s_newSaveState != nullptr) *s_newSaveState = GAME_MODE_STATE_PROCEED;
+    s_newSaveState = nullptr;
+    if (s_newSaveWindow != 0 && svc_ui != nullptr) svc_ui->window_close(ctx, s_newSaveWindow);
+}
+
+void add_button(UiElementHandle pane, const char* label, UiPressedFn onPressed) {
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_BUTTON;
+    desc.label = label;
+    desc.on_pressed = onPressed;
+    svc_ui->pane_add_control(mod_ctx, pane, &desc, nullptr);
+}
+
+void add_string(UiElementHandle pane, const char* label, ConfigVarHandle var, int32_t maxLength) {
+    UiControlDesc desc = UI_CONTROL_DESC_INIT;
+    desc.kind = UI_CONTROL_STRING;
+    desc.label = label;
+    desc.binding = UI_BINDING_CONFIG_VAR;
+    desc.config_var = var;
+    desc.max_length = maxLength;
+    svc_ui->pane_add_control(mod_ctx, pane, &desc, nullptr);
+}
+
+ModResult build_new_save_tab(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    add_string(left, "Name", features_vars().name, kCoopNameMax - 1);
+    add_string(left, "Room", coop_net_room_code_var(), static_cast<int32_t>(kRoomNameMax));
+    add_button(left, "Host", [](ModContext* ctx, void*) {
+        coop_net_host();
+        finish_new_save(ctx);
+    });
+    add_button(left, "Join", [](ModContext* ctx, void*) {
+        coop_net_join_code();
+        finish_new_save(ctx);
+    });
+    add_button(left, "Play alone", [](ModContext* ctx, void*) { finish_new_save(ctx); });
+
+    svc_ui->pane_add_text(mod_ctx, right, "Leave Room empty to get a random code.", nullptr);
+    return MOD_OK;
+}
+
+ModResult open_connect_window(GameModeNewSaveState* state, ModError* outError) {
+    report_hint_arm();
+    if (svc_ui == nullptr) {
+
+        if (state != nullptr) *state = GAME_MODE_STATE_PROCEED;
+        return MOD_OK;
+    }
+
+    if (s_newSaveWindow != 0) {
+        s_newSaveState = nullptr;
+        svc_ui->window_close(mod_ctx, s_newSaveWindow);
+    }
+    s_newSaveState = state;
+    UiTabDesc tabs[1] = {UI_TAB_DESC_INIT};
+    tabs[0].title = "Co-op";
+    tabs[0].build = build_new_save_tab;
+
+    UiWindowDesc desc = UI_WINDOW_DESC_INIT;
+    desc.tabs = tabs;
+    desc.tab_count = 1;
+    desc.on_closed = [](ModContext*, UiWindowHandle, void*) {
+
+        if (s_newSaveState != nullptr && *s_newSaveState == GAME_MODE_STATE_PENDING) {
+            *s_newSaveState = GAME_MODE_STATE_RETURN;
+            s_skipNextLoadPrompt = false;
+        }
+        s_newSaveState = nullptr;
+        s_newSaveWindow = 0;
+    };
+    const ModResult result = svc_ui->window_push(mod_ctx, &desc, &s_newSaveWindow);
+    if (result != MOD_OK) {
+        if (state == nullptr) return MOD_OK;
+        return mods::set_error(outError, result, "could not open the co-op start window");
+    }
+    return MOD_OK;
+}
+
+ModResult on_new_save_select(void*, GameModeNewSaveState* state, ModError* outError) {
+    s_skipNextLoadPrompt = true;
+    return open_connect_window(state, outError);
+}
+
+struct CoopSaveBlob {
+    uint32_t version;
+
+    char lastHostName[kCoopNameMax];
+    char lastHostAddress[64];
+};
+const uint32_t kBlobVersion = 1;
+
+ModResult on_activated(void*, ModError*) {
+    s_active = true;
+    report_hint_arm();
+    coop_log::info("coop_mod: [MODE] co-op mode active (separate save file)");
+    return MOD_OK;
+}
+
+ModResult on_deactivated(void*, ModError*) {
+    s_active = false;
+    return MOD_OK;
+}
+
+ModResult on_save_loaded(void*, ModError*) {
+    if (svc_save == nullptr) return MOD_OK;
+    CoopSaveBlob blob{};
+    size_t size = sizeof(blob);
+    if (svc_save->get_blob(mod_ctx, "coop", &blob, &size) != MOD_OK || size != sizeof(blob) ||
+        blob.version != kBlobVersion) {
+        return MOD_OK;
+    }
+    if (blob.lastHostName[0] != '\0') {
+        coop_log::info("coop_mod: [MODE] this file was last played with '{}'", blob.lastHostName);
+    }
+    coop_remember_last_host(blob.lastHostName, blob.lastHostAddress);
+    return MOD_OK;
+}
+
+ModResult on_save_loaded_prompt(void* userData, ModError* outError) {
+    const ModResult remembered = on_save_loaded(userData, outError);
+    if (s_skipNextLoadPrompt) {
+        s_skipNextLoadPrompt = false;
+        return remembered;
+    }
+    if (coop_net_connected() || coop_net_connecting()) return remembered;
+    open_connect_window(nullptr, nullptr);
+    return remembered;
+}
+
+}
+
+void game_mode_init() {
+    if (svc_game_mode == nullptr) {
+        coop_log::info("coop_mod: [MODE] no game mode service, using default mode");
+        return;
+    }
+    GameModeDesc desc = {};
+    desc.struct_size = sizeof(desc);
+    desc.game_mode_id = kGameModeId;
+    desc.full_name = "Co-op";
+
+    std::strncpy(const_cast<char*>(desc.save_name), kSaveName, sizeof(desc.save_name) - 1);
+    desc.user_data = nullptr;
+    desc.on_activated = on_activated;
+    desc.on_deactivated = on_deactivated;
+    desc.on_save_loaded = on_save_loaded_prompt;
+    desc.on_new_save_select = on_new_save_select;
+    if (svc_game_mode->register_game_mode(mod_ctx, &desc) != MOD_OK) {
+        coop_log::warn("coop_mod: [MODE] could not register the co-op game mode");
+        return;
+    }
+    coop_log::info("coop_mod: [MODE] co-op registered, saving to '{}'", kSaveName);
+}
+
+void game_mode_prompt_connect() {
+    open_connect_window(nullptr, nullptr);
+}
+
+bool game_mode_is_coop() {
+    if (!s_active && svc_game_mode != nullptr) {
+
+        bool active = false;
+        if (svc_game_mode->is_active(mod_ctx, kGameModeId, &active) == MOD_OK) return active;
+    }
+    return s_active;
+}
+
+void game_mode_remember_host(const char* name, const char* address) {
+    if (svc_save == nullptr || !game_mode_is_coop()) return;
+    CoopSaveBlob blob{};
+    blob.version = kBlobVersion;
+    if (name != nullptr) std::strncpy(blob.lastHostName, name, sizeof(blob.lastHostName) - 1);
+    if (address != nullptr) {
+        std::strncpy(blob.lastHostAddress, address, sizeof(blob.lastHostAddress) - 1);
+    }
+
+    svc_save->set_blob(mod_ctx, "coop", &blob, sizeof(blob));
+}

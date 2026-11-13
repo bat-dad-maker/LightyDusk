@@ -1,0 +1,877 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+const uint16_t kCoopProtocolVersion = 74;
+
+#ifndef COOP_MOD_VERSION
+#define COOP_MOD_VERSION "0.0.0"
+#endif
+constexpr uint16_t coop_version_number(const char* v) {
+    unsigned parts[3] = {0, 0, 0};
+    int part = 0;
+    for (; *v != '\0' && part < 3; ++v) {
+        if (*v == '.') {
+            ++part;
+        } else if (*v >= '0' && *v <= '9') {
+            parts[part] = parts[part] * 10 + static_cast<unsigned>(*v - '0');
+        }
+    }
+    return static_cast<uint16_t>(parts[0] * 10000 + parts[1] * 100 + parts[2]);
+}
+const uint16_t kCoopWireVersion = coop_version_number(COOP_MOD_VERSION);
+static_assert(kCoopWireVersion > 1000, "mod.json's version has to be a.b.c");
+
+inline std::string coop_version_text(uint16_t wire) {
+    if (wire < 1000) return "an older one";
+    return std::to_string(wire / 10000) + "." + std::to_string(wire / 100 % 100) + "." +
+           std::to_string(wire % 100);
+}
+
+const int kCoopMaxPlayers = 16;
+
+typedef uint16_t CoopRoster;
+const uint8_t kCoopHostId = 0;
+const uint8_t kCoopNoPlayer = 0xFF;
+
+const uint16_t kCoopMaxMessagePayload = 8192;
+const int kCoopNameMax = 24;
+const int kCoopMaxSoundsPerMessage = 48;
+
+enum CoopMsgType : uint8_t {
+    kMsgHello = 1,
+    kMsgPresence = 2,
+    kMsgItem = 3,
+    kMsgBottle = 4,
+    kMsgTime = 5,
+    kMsgSounds = 6,
+    kMsgColors = 7,
+    kMsgArrowShot = 8,
+    kMsgParticles = 9,
+    kMsgPvpState = 10,
+    kMsgPvpHit = 11,
+    kMsgWorldDelta = 12,
+    kMsgJoinSync = 13,
+    kMsgEnemyState = 14,
+    kMsgEnemyGone = 15,
+    kMsgEnemyDamage = 16,
+    kMsgWorldSyncRequest = 17,
+    kMsgWorldFull = 18,
+    kMsgEnemyHit = 19,
+    kMsgRoomClaim = 20,
+    kMsgRoomOwner = 21,
+    kMsgEnemyTargets = 22,
+    kMsgActorSpawn = 23,
+    kMsgActorState = 24,
+    kMsgActorGone = 25,
+    kMsgBossState = 26,
+    kMsgBossReady = 27,
+    kMsgBossHit = 28,
+    kMsgWorldDigest = 29,
+    kMsgDeathLink = 30,
+    kMsgBossStem = 31,
+
+    kMsgAssignId = 32,
+
+    kMsgRoster = 33,
+    kMsgItemTaken = 34,
+    kMsgPing = 35,
+    kMsgPong = 36,
+    kMsgPillarShake = 37,
+    kMsgBossBombEat = 38,
+
+    kMsgObjectHit = 39,
+    kMsgHorse = 40,
+    kMsgObjectMove = 41,
+    kMsgPause = 42,
+    kMsgGrassCut = 43,
+    kMsgSessionSettings = 44,
+    kMsgSkinChoices = 45,
+    kMsgSkinRequest = 46,
+    kMsgObjectPush = 47,
+    kMsgSkipVote = 48,
+    kMsgCarry = 49,
+    kMsgTwilightBug = 50,
+    kMsgTearGot = 51,
+    kMsgTorch = 52,
+    kMsgAnimal = 53,
+    kMsgTbox2 = 54,
+    kMsgSkills = 55,
+    kMsgRandoSeed = 56,
+    kMsgRandoSeedRequest = 57,
+    kMsgRandoChunk = 58,
+    kMsgCheckTaken = 59,
+    kMsgCheckList = 60,
+    kMsgEnemyClaim = 61,
+    kMsgSumo = 62,
+    kMsgSumoState = 63,
+    kMsgEnemySwitch = 64,
+    kMsgSharedStory = 65,
+    kMsgBombCaught = 66,
+    kMsgCageBars = 67,
+    kMsgRotBridge = 68,
+    kMsgSnapWant = 69,
+    kMsgSnapStream = 70,
+    kMsgLogRequest = 71,
+    kMsgJoinSyncWant = 72,
+    kMsgShopSoldOut = 73,
+    kMsgStoryBundle = 74,
+    kMsgNpcTalk = 75,
+    kMsgChat = 76,
+    kMsgCatchUpWant = 77,
+    kMsgCatchUp = 78,
+};
+
+const int kBundleFlags = 16;
+const int kBundleSwitches = 16;
+const int kBundleOff = 8;
+struct MsgStoryBundle {
+    char stage[8];
+    int8_t saveNo;
+    uint8_t flagCount;
+    uint8_t swCount;
+    uint8_t offCount;
+    uint16_t flags[kBundleFlags];
+    uint16_t off[kBundleOff];
+    uint8_t sw[kBundleSwitches];
+    uint8_t swOff[kBundleOff];
+    uint8_t swOffCount;
+    uint8_t pad[3];
+};
+
+struct MsgShopSoldOut {
+    char stage[8];
+    int8_t saveNo;
+    uint8_t sw;
+    uint8_t pad[2];
+};
+
+struct MsgSnapWant {
+    uint8_t target;
+    uint8_t want;
+    uint8_t pad[2];
+};
+
+struct MsgSnapStreamHead {
+    uint8_t to;
+    uint8_t pad[3];
+};
+
+struct MsgLogRequest {
+    char code[12];
+};
+
+struct MsgCageBars {
+    int8_t room;
+    uint8_t mask;
+    uint8_t pad[2];
+    float home[3];
+};
+
+struct MsgRotBridge {
+    int8_t room;
+    uint8_t kind;
+    uint8_t facing;
+    uint8_t pad;
+    int16_t angle;
+    uint16_t quiet;
+    uint32_t age;
+    float home[3];
+};
+const uint8_t kRotBridgeTurn = 0;
+const uint8_t kRotBridgeRest = 1;
+
+struct MsgBombCaught {
+    int8_t room;
+    uint8_t pad[3];
+    uint32_t key;
+};
+
+struct MsgSharedStory {
+    uint32_t bits;
+};
+
+struct MsgEnemySwitch {
+    char stage[8];
+    int16_t sw;
+    int8_t room;
+    uint8_t off;
+    int16_t procName;
+};
+
+enum SumoKind : uint8_t {
+    kSumoChallenge = 1,
+    kSumoAnswer = 2,
+    kSumoMove = 3,
+
+    kSumoResult = 4,
+    kSumoCancel = 5,
+    kSumoMash = 6,
+};
+const uint8_t kSumoChallengerWon = 1;
+const uint8_t kSumoChallengedWon = 2;
+struct MsgSumo {
+    uint8_t kind;
+    uint8_t to;
+    uint8_t value;
+    uint8_t pad;
+};
+
+struct MsgSumoState {
+    uint8_t to;
+    uint8_t act;
+    uint8_t bck;
+    uint8_t pad;
+    float frame;
+    float x, y, z;
+    int16_t angle;
+    int16_t pad2;
+};
+
+struct MsgTorch {
+    uint32_t key;
+    int8_t room;
+    uint8_t lit;
+    int16_t procName;
+    float home[3];
+};
+
+struct MsgTbox2 {
+    uint32_t key;
+    int8_t room;
+    uint8_t pad;
+    int16_t procName;
+    float home[3];
+};
+
+struct MsgNpcTalk {
+    uint32_t key;
+    int8_t room;
+    int16_t procName;
+    int16_t angleY;
+    float home[3];
+    float pos[3];
+};
+
+struct MsgCatchUpWant {
+    uint8_t to;
+    uint8_t pad[3];
+};
+struct MsgCatchUpHeader {
+    uint8_t to;
+    uint8_t pad;
+    uint16_t size;
+};
+
+struct MsgAnimal {
+    uint32_t key;
+    int8_t room;
+    int16_t procName;
+    int16_t angleY;
+    float home[3];
+    float pos[3];
+    float speedF;
+    float dist;
+};
+
+struct MsgSkills {
+    uint16_t have;
+};
+
+const uint32_t kRandoChunkBytes = 6000;
+const uint32_t kRandoSeedMaxBytes = 8u * 1024u * 1024u;
+
+struct MsgRandoSeed {
+    char hash[64];
+    uint32_t size;
+    uint32_t crc;
+};
+
+struct MsgRandoSeedRequest {
+    char hash[64];
+};
+
+struct MsgRandoChunk {
+    uint32_t crc;
+    uint32_t offset;
+    uint16_t length;
+};
+
+struct MsgCheckTaken {
+    char name[64];
+    uint8_t item;
+};
+
+struct MsgTwilightBug {
+    char stage[8];
+    int8_t room;
+    uint8_t swBit;
+    float pos[3];
+};
+
+struct MsgTearGot {
+    char stage[8];
+    int8_t saveNo;
+    uint8_t area;
+    uint8_t save;
+    uint8_t count;
+};
+
+enum CarryState : uint8_t {
+    kCarryHeld = 1,
+    kCarryGone = 3,
+    kCarryThrown = 4,
+    kCarryRest = 5,
+};
+struct MsgCarry {
+    uint32_t key;
+    int8_t room;
+    uint8_t state;
+    float pos[3];
+    int16_t angle[3];
+
+    uint8_t statueAnim;
+    uint8_t flags;
+
+    float statueFrame;
+
+    float rel[3];
+    int16_t relYaw;
+
+    float speedF;
+    float speedY;
+    float gravity;
+};
+const uint8_t kCarryFlagStatue = 0x01;
+const uint8_t kCarryFlagRelative = 0x02;
+
+const uint8_t kCarryFlagSpin = 0x04;
+
+struct MsgSkipVote {
+    uint8_t inCutscene;
+    uint8_t voted;
+    char stage[8];
+};
+
+struct MsgPause {
+    uint8_t paused;
+};
+
+struct MsgBossBombEat {
+    uint8_t index;
+    uint8_t phase2;
+};
+
+struct MsgPillarShake {
+    int8_t room;
+    uint8_t swBit;
+    uint8_t shake;
+    float homeX;
+    float homeY;
+    float homeZ;
+};
+
+struct MsgPing {
+    uint32_t token;
+};
+
+struct MsgItemTaken {
+    float home[3];
+    uint8_t itemNo;
+};
+
+struct MsgAssignId {
+    uint8_t playerId;
+    uint8_t maxPlayers;
+};
+
+struct MsgRoster {
+    CoopRoster present;
+};
+
+enum CoopBossCollider : uint8_t {
+    kBossColliderBody = 0,
+    kBossColliderCore = 1,
+    kBossColliderTentacle = 2,
+
+    kBossColliderOok = 3,
+};
+
+const int16_t kBossProcDiababa = 0x20C;
+const int16_t kBossProcTentacle = 0x20B;
+
+const int16_t kBossProcOok = 0x1DC;
+const int16_t kBossProcHelper = 0x1DB;
+const int16_t kBossProcOokBoomerang = 0x2ED;
+const int16_t kBossProcPillar = 0x033;
+
+enum CoopBossKind : uint8_t {
+    kBossKindNone = 0,
+    kBossKindDiababa = 1,
+    kBossKindTentacle = 2,
+    kBossKindOok = 3,
+    kBossKindHelper = 4,
+    kBossKindOokBoomerang = 5,
+};
+
+enum CoopActorFlags : uint8_t {
+    kActorFlagCarried = 1 << 0,
+    kActorFlagHidden = 1 << 1,
+
+    kActorFlagOwnerInCutscene = 1 << 2,
+};
+
+enum CoopRoomOwner : uint8_t {
+
+    kRoomOwnerNone = 0,
+    kRoomOwnerHost = 1,
+    kRoomOwnerJoiner = 2,
+};
+
+const int kCoopMaxEnemiesPerMessage = 96;
+
+enum CoopEnemyFlags : uint8_t {
+    kEnemyFlagHidden = 1 << 0,
+
+    kEnemyFlagCarried = 1 << 1,
+};
+
+const int kCoopColorSlots = 19;
+const int kCoopColorName = 18;
+
+enum CoopBottleEvent : uint8_t {
+    kBottleFillEmpty = 0,
+    kBottleNewFilled = 1,
+};
+
+enum CoopSoundKind : uint8_t {
+    kSoundOneShot = 0,
+    kSoundLevel = 1,
+};
+
+const int kCoopMaxParticlesPerMessage = 48;
+
+enum CoopParticleFlags : uint8_t {
+    kParticleKeyed = 1 << 0,
+    kParticleHasRot = 1 << 1,
+    kParticleHasScale = 1 << 2,
+    kParticleHasPrm = 1 << 3,
+    kParticleHasEnv = 1 << 4,
+    kParticleHasState = 1 << 5,
+};
+
+#pragma pack(push, 1)
+
+struct MsgHeader {
+    uint16_t size;
+    uint8_t type;
+    uint8_t from;
+};
+
+struct MsgHello {
+    uint16_t version;
+    char name[kCoopNameMax];
+};
+
+struct MsgPresence {
+    char name[kCoopNameMax];
+    char stage[8];
+    int8_t startRoom;
+    int8_t curRoom;
+    int8_t layer;
+    int16_t point;
+    float x, y, z;
+    int16_t angleY;
+    uint8_t inGame;
+
+    uint32_t skinStamp;
+
+    uint16_t life;
+    uint16_t maxLife;
+
+    uint8_t storyBits;
+
+    uint8_t flags;
+
+    float mapX, mapY, mapZ;
+    int16_t mapAngleY;
+    uint8_t mapValid;
+};
+
+struct MsgItem {
+    uint8_t item;
+};
+
+struct MsgBottle {
+    uint8_t event;
+    uint8_t item;
+};
+
+struct MsgTime {
+    float time;
+    uint16_t date;
+    int8_t room;
+    int8_t layer;
+    char stage[8];
+    uint32_t age;
+};
+
+struct MsgSoundEntry {
+    uint32_t id;
+    uint8_t kind;
+    float rel[3];
+};
+
+struct MsgParticleEntry {
+    uint16_t id;
+    uint8_t flags;
+    uint8_t type;
+    uint32_t key;
+    float rel[3];
+    int16_t rot[3];
+    float scale[3];
+
+    uint8_t alpha;
+    uint8_t prm[4];
+    uint8_t env[4];
+    float blend;
+
+    float rate;
+    uint8_t livePrm[4];
+    uint8_t liveEnv[4];
+    float gscl[3];
+    float pscl[2];
+    int16_t life;
+    uint16_t vol;
+    float awayCenter;
+    float awayAxis;
+    float dirSpeed;
+    float dir[3];
+    float grot[9];
+};
+
+struct MsgArrowShot {
+    uint8_t type;
+    uint8_t param;
+    float startPos[3];
+    int16_t angleX, angleY;
+    int16_t shapeX, shapeY;
+    float speed[3];
+    float flyMax;
+    float flySpeed;
+};
+
+struct MsgJoinSyncHeader {
+    uint16_t version;
+    uint16_t size;
+};
+
+struct MsgWorldDelta {
+    char stage[8];
+    int8_t saveNo;
+    uint8_t region;
+    int8_t room;
+    uint8_t offset;
+    uint8_t size;
+    uint8_t set[32];
+    uint8_t clr[32];
+};
+
+struct MsgEnemyEntry {
+    uint32_t key;
+    int8_t room;
+    int16_t procName;
+    float pos[3];
+
+    int16_t angle[3];
+    int16_t health;
+    uint8_t flags;
+
+    int16_t anmId;
+    float anmFrame;
+    float anmRate;
+
+    uint8_t anmMode;
+
+    int16_t action;
+    int16_t mode;
+
+    int16_t timers[5];
+    uint8_t timerCount;
+
+    int8_t extraState;
+};
+
+const int8_t kEnemyNoState = INT8_MIN;
+
+const int16_t kEnemyNoAction = INT16_MIN;
+
+struct MsgEnemyGone {
+    uint32_t key;
+    int8_t room;
+};
+
+struct MsgEnemyDamage {
+    uint32_t key;
+    int8_t room;
+    int16_t amount;
+};
+
+struct MsgWorldDigest {
+    char stage[8];
+    int8_t saveNo;
+    uint32_t memoryHash;
+    uint32_t danHash;
+    uint32_t tmpHash;
+
+    int8_t room;
+    uint32_t zoneHash;
+
+    uint32_t visitedHash;
+    uint32_t lightDropHash;
+    uint32_t collectHash;
+
+    uint32_t eventHash;
+    uint32_t statusBHash;
+
+    uint8_t storyRules;
+};
+const uint8_t kStoryRules = 5;
+
+struct MsgDeathLink {
+    char name[kCoopNameMax];
+};
+
+struct MsgWorldSyncRequest {
+    char stage[8];
+    int8_t saveNo;
+    int8_t room;
+};
+
+struct MsgWorldFull {
+    char stage[8];
+    int8_t saveNo;
+    uint8_t region;
+    int8_t room;
+    uint8_t size;
+    uint8_t data[32];
+};
+
+struct MsgSkinChoices {
+    char name[22][32];
+    uint32_t hash[22];
+};
+
+struct MsgEnemyClaim {
+    uint32_t key;
+    int8_t room;
+};
+
+struct MsgEnemyHit {
+    uint32_t key;
+    int8_t room;
+    uint32_t atType;
+    uint8_t atp;
+    uint8_t spl;
+    uint8_t mtrl;
+    float from[3];
+    float at[3];
+
+    float atVec[3];
+    uint8_t hitMark;
+};
+
+struct MsgSessionSettings {
+    uint16_t flags;
+};
+
+const int kGrassCutsPerMsg = 12;
+
+const uint8_t kGrassKindGrass = 0;
+const uint8_t kGrassKindFlower = 1;
+struct MsgGrassCut {
+    int8_t room;
+    uint8_t count;
+    uint8_t kind;
+    uint8_t bits[kGrassCutsPerMsg];
+    float pos[kGrassCutsPerMsg][3];
+};
+
+struct MsgObjectPush {
+    uint32_t key;
+    int8_t room;
+    uint8_t dir;
+
+    int8_t gridX;
+    int8_t gridZ;
+};
+
+struct MsgObjectMove {
+    uint32_t key;
+    int8_t room;
+
+    uint8_t catchUp;
+    uint8_t pad[2];
+    float pos[3];
+    int16_t angle[3];
+
+    int16_t phase[8];
+    uint8_t phaseCount;
+
+    uint8_t blobLen;
+    uint8_t blob[192];
+
+    int16_t procName;
+    int16_t homeAngleY;
+    uint16_t setID;
+    uint32_t param;
+    float home[3];
+};
+
+struct MsgHorse {
+    float pos[3];
+    int16_t shapeAngleY;
+    int16_t shapeAngleX;
+    float speedF;
+    uint8_t procID;
+
+    uint8_t riding;
+
+    uint8_t owner;
+
+    uint8_t standing;
+
+    uint16_t anmIdx[2];
+    float anmRatio;
+    float anmFrame[2];
+};
+
+struct MsgActorSpawn {
+    uint32_t netId;
+    int16_t procName;
+    uint32_t param;
+    float pos[3];
+    int16_t angle[3];
+    int8_t room;
+
+    int16_t state;
+
+    uint8_t kind;
+};
+
+struct MsgActorState {
+    uint32_t netId;
+    float pos[3];
+    int16_t angle[3];
+    uint8_t flags;
+
+    int16_t state;
+
+    uint32_t param;
+
+    int16_t roll[4];
+};
+
+struct MsgActorGone {
+    uint32_t netId;
+};
+
+struct MsgBossActor {
+    uint8_t kind;
+    uint8_t index;
+
+    uint8_t inDemo;
+    uint8_t fightOver;
+    float pos[3];
+    int16_t angle[3];
+    int16_t shapeAngle[3];
+    int16_t health;
+    int32_t anmId;
+
+    float anmFrame;
+    float anmRate;
+    int16_t action;
+    int16_t mode;
+    int16_t timers[5];
+    int16_t extra[17];
+    float extraF;
+    float targetPos[3];
+};
+
+struct MsgBossHit {
+    uint8_t kind;
+    uint8_t index;
+    uint8_t collider;
+    int16_t attackerName;
+    uint32_t atType;
+    uint8_t atp;
+    uint8_t spl;
+    uint8_t mtrl;
+    uint8_t cutJump;
+
+    uint8_t cutCount;
+
+    uint8_t fastCut;
+};
+
+struct MsgBossStem {
+    uint8_t index;
+    float pos[18][3];
+    int16_t angle[18][3];
+};
+
+struct MsgBossReady {
+    int8_t room;
+    uint8_t inRoom;
+    uint8_t goAnyway;
+    char stage[8];
+};
+
+struct MsgEnemyTarget {
+    uint32_t key;
+    int8_t room;
+    uint8_t targetPlayer;
+};
+
+struct MsgRoomClaim {
+    char stage[8];
+    int8_t saveNo;
+    int8_t room;
+};
+
+struct MsgRoomOwner {
+    char stage[8];
+    int8_t saveNo;
+    int8_t room;
+    uint8_t owner;
+};
+
+struct MsgPvpState {
+    uint8_t enabled;
+    uint16_t damagePercent;
+};
+
+enum PvpHitKind : uint8_t {
+    kPvpHit = 0,
+    kPvpPull = 1,
+    kPvpPin = 2,
+};
+struct MsgPvpHit {
+    uint32_t atType;
+    uint8_t atp;
+    uint8_t spl;
+    uint8_t mtrl;
+    uint8_t to;
+    uint8_t kind;
+    uint8_t se;
+    uint8_t blocked;
+    uint8_t cut;
+    float from[3];
+};
+
+struct MsgColorEntry {
+    uint8_t set;
+    uint8_t r, g, b;
+};
+#pragma pack(pop)

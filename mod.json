@@ -1,0 +1,9 @@
+{
+  "id": "dev.remiafterdark.coop_mod",
+  "name": "Crests of Courage",
+  "version": "1.10.1-enemysync.1",
+  "author": "remiafterdark",
+  "description": "Online true co-op for Twilight Princess.",
+  "icon": "res/icon.png",
+  "banner": "res/banner.png"
+}
