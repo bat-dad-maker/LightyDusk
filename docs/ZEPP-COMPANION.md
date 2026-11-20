@@ -6,7 +6,7 @@ Version 0.2.0 maintains the map in the Amazon GTR 4 New and receives coordinates
 
 ```text
 Leitura de estado no runtime → HTTP autenticado em loopback
-    → Side Service do Zepp no mesmo Android → Bluetooth → mapa local no relógio
+    → Zepp Side Service on the same Android → Bluetooth → local map on the watch
 ```
 
 The target is deviceSource 9437441, 480×480 and API 1.0, according to Zeus' installed catalog. The native bridge is in `runtime/watch_map.c`; the server and activation are in `WatchMapServer.java`. Only the validated Switch 1.0.0 revision is accepted. Data extracted from the local dump is off the Git.

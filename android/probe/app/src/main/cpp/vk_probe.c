@@ -54,7 +54,7 @@ static bool has_ext(const VkExtensionProperties *e, uint32_t n, const char *name
     return false;
 }
 
-#define YN(x) ((x) ? "sim" : "NAO")
+#define YN(x) ((x) ? "yes" : "NO")
 
 // ------------------------------------------------------------------ formats the backend uses (vulkan/textures.c)
 typedef struct { VkFormat f; const char *name; } Fmt;
@@ -90,14 +90,14 @@ static void formats(Sb *b, Vk *v, VkPhysicalDevice pd) {
                   o & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? "C" : "-",
                   o & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT ? "B" : "-",
                   o & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? "D" : "-",
-                  o & VK_FORMAT_FEATURE_TRANSFER_DST_BIT ? "T" : "-", o ? "" : "   <- NAO SUPORTADO");
+                  o & VK_FORMAT_FEATURE_TRANSFER_DST_BIT ? "T" : "-", o ? "" : "   <- NOT SUPPORTED");
     }
-    sb_printf(b, "\nformatos de vertice:\n");
+    sb_printf(b, "\nvertex formats:\n");
     for (size_t i = 0; i < sizeof k_vertex_formats / sizeof *k_vertex_formats; i++) {
         VkFormatProperties p;
         v->vkGetPhysicalDeviceFormatProperties(pd, k_vertex_formats[i].f, &p);
         sb_printf(b, "  %-26s %s\n", k_vertex_formats[i].name,
-                  p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT ? "sim" : "NAO");
+                  p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT ? "yes" : "NO");
     }
 }
 
@@ -109,7 +109,7 @@ static void host_import(Sb *b, Vk *v, VkDevice dev, uint64_t align) {
     PFN_vkFreeMemory free_mem = (PFN_vkFreeMemory)v->vkGetDeviceProcAddr(dev, "vkFreeMemory");
     uint64_t base = gw_reserve(GW_SIZE, GW_ALIGN, GW_FLOOR, GW_VA_LIMIT);
     if (!props || !alloc || !free_mem || !base) {
-        sb_printf(b, "  import do heap: nao testado (%s)\n", base ? "funcoes ausentes" : "sem janela guest");
+        sb_printf(b, "  heap import: not tested (%s)\n", base ? "functions missing" : "no guest window");
         if (base) munmap((void *)(uintptr_t)base, GW_SIZE);
         return;
     }
@@ -117,7 +117,7 @@ static void host_import(Sb *b, Vk *v, VkDevice dev, uint64_t align) {
     uint64_t size = 64ull << 20;
     VkMemoryHostPointerPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult r = props(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, heap, &mp);
-    sb_printf(b, "  import do heap (64 MB em %p, alinhamento minimo %#llx): propriedades %s, tipos %#x\n", heap,
+    sb_printf(b, "  heap import (64 MB at %p, minimum alignment %#llx): properties %s, types %#x\n", heap,
               (unsigned long long)align, vk_result(r), mp.memoryTypeBits);
     if (r == VK_SUCCESS && mp.memoryTypeBits) {
         VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
@@ -127,7 +127,7 @@ static void host_import(Sb *b, Vk *v, VkDevice dev, uint64_t align) {
                                    .memoryTypeIndex = (uint32_t)__builtin_ctz(mp.memoryTypeBits)};
         VkDeviceMemory mem = VK_NULL_HANDLE;
         r = alloc(dev, &ai, NULL, &mem);
-        sb_printf(b, "  import do heap: vkAllocateMemory %s\n", vk_result(r));
+        sb_printf(b, "  heap import: vkAllocateMemory %s\n", vk_result(r));
         if (r == VK_SUCCESS) free_mem(dev, mem, NULL);
     }
     munmap((void *)(uintptr_t)base, GW_SIZE);
@@ -181,7 +181,7 @@ static void device(Sb *b, Vk *v, VkPhysicalDevice pd) {
     sb_printf(b, "  VK_EXT_custom_border_color        %s\n", YN(e_border));
     sb_printf(b, "  VK_EXT_vertex_attribute_divisor   %s (KHR: %s)\n", YN(e_divisor),
               YN(has_ext(ep, ne, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME)));
-    sb_printf(b, "  VK_EXT_external_memory_host       %s  <- memoria global dos shaders (exec.c)\n", YN(e_host));
+    sb_printf(b, "  VK_EXT_external_memory_host       %s  <- the shaders' global memory (exec.c)\n", YN(e_host));
     sb_printf(b, "  VK_EXT_device_fault               %s\n", YN(e_fault));
 
     // what device.c enables unconditionally: a missing one makes vkCreateDevice fail
@@ -236,17 +236,17 @@ static void device(Sb *b, Vk *v, VkPhysicalDevice pd) {
         {"shaderImageGatherExtended", h->shaderImageGatherExtended},
         {"bufferDeviceAddress (1.2)", f12.bufferDeviceAddress},
     };
-    sb_printf(b, "\nfeatures opcionais:\n");
+    sb_printf(b, "\noptional features:\n");
     for (size_t i = 0; i < sizeof opt / sizeof *opt; i++) sb_printf(b, "  %-40s %s\n", opt[i].name, YN(opt[i].v));
 
     // subgroups: the shader translator emits subgroupShuffle* (translate.c)
     VkSubgroupFeatureFlags so = p11.subgroupSupportedOperations;
-    sb_printf(b, "\nsubgroup: tamanho %u (min %u, max %u), estagios %#x, ops:%s%s%s%s%s%s%s%s\n", p11.subgroupSize,
+    sb_printf(b, "\nsubgroup: size %u (min %u, max %u), stages %#x, ops:%s%s%s%s%s%s%s%s\n", p11.subgroupSize,
               p13.minSubgroupSize, p13.maxSubgroupSize, p11.subgroupSupportedStages,
               so & VK_SUBGROUP_FEATURE_BASIC_BIT ? " basic" : "", so & VK_SUBGROUP_FEATURE_VOTE_BIT ? " vote" : "",
               so & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT ? " arithmetic" : "", so & VK_SUBGROUP_FEATURE_BALLOT_BIT ? " ballot" : "",
-              so & VK_SUBGROUP_FEATURE_SHUFFLE_BIT ? " shuffle" : " (SEM shuffle)",
-              so & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT ? " shuffle_relative" : " (SEM shuffle_relative)",
+              so & VK_SUBGROUP_FEATURE_SHUFFLE_BIT ? " shuffle" : " (NO shuffle)",
+              so & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT ? " shuffle_relative" : " (NO shuffle_relative)",
               so & VK_SUBGROUP_FEATURE_CLUSTERED_BIT ? " clustered" : "", so & VK_SUBGROUP_FEATURE_QUAD_BIT ? " quad" : "");
 
     VkPhysicalDeviceLimits *l = &p->limits;
@@ -262,7 +262,7 @@ static void device(Sb *b, Vk *v, VkPhysicalDevice pd) {
 
     VkPhysicalDeviceMemoryProperties mp;
     v->vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-    sb_printf(b, "\nmemoria: %u heaps, %u tipos\n", mp.memoryHeapCount, mp.memoryTypeCount);
+    sb_printf(b, "\nmemory: %u heaps, %u types\n", mp.memoryHeapCount, mp.memoryTypeCount);
     for (uint32_t i = 0; i < mp.memoryHeapCount; i++)
         sb_printf(b, "  heap %u: %.2f GB%s\n", i, (double)mp.memoryHeaps[i].size / (1ull << 30),
                   mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
@@ -338,14 +338,14 @@ static void device(Sb *b, Vk *v, VkPhysicalDevice pd) {
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VkDevice dev = VK_NULL_HANDLE;
     VkResult r = v->vkCreateDevice(pd, &di, NULL, &dev);
-    sb_printf(b, "\nvkCreateDevice como em device.c: %s\n", vk_result(r));
+    sb_printf(b, "\nvkCreateDevice as in device.c: %s\n", vk_result(r));
     if (r == VK_ERROR_FEATURE_NOT_PRESENT) {
         // The Android adjustment: 8-bit features only when the driver has them (no shader uses 8-bit uniform buffers)
         r12.shaderInt8 = f12.shaderInt8;
         r12.uniformAndStorageBuffer8BitAccess = f12.uniformAndStorageBuffer8BitAccess;
         r12.storageBuffer8BitAccess = f12.storageBuffer8BitAccess;
         r = v->vkCreateDevice(pd, &di, NULL, &dev);
-        sb_printf(b, "vkCreateDevice com features de 8 bits opcionais (ajuste Android): %s\n", vk_result(r));
+        sb_printf(b, "vkCreateDevice with the optional 8-bit features (Android adjustment): %s\n", vk_result(r));
     }
     if (r == VK_SUCCESS) {
         if (e_host) host_import(b, v, dev, hostp.minImportedHostPointerAlignment);
@@ -362,7 +362,7 @@ void vk_probe(Sb *b, void *lib) {
     Vk v = {0};
     v.vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
     if (!v.vkGetInstanceProcAddr) {
-        sb_printf(b, "ERRO: vkGetInstanceProcAddr ausente\n");
+        sb_printf(b, "ERROR: vkGetInstanceProcAddr missing\n");
         return;
     }
 #define LOAD_GLOBAL(name) v.name = (PFN_##name)v.vkGetInstanceProcAddr(VK_NULL_HANDLE, #name)
@@ -378,7 +378,7 @@ void vk_probe(Sb *b, void *lib) {
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
     VkResult r = v.vkCreateInstance ? v.vkCreateInstance(&ci, NULL, &v.inst) : VK_ERROR_INITIALIZATION_FAILED;
     if (r != VK_SUCCESS) {
-        sb_printf(b, "ERRO: vkCreateInstance: %s\n", vk_result(r));
+        sb_printf(b, "ERROR: vkCreateInstance: %s\n", vk_result(r));
         return;
     }
 #define LOAD(name) v.name = (PFN_##name)v.vkGetInstanceProcAddr(v.inst, #name)
@@ -398,7 +398,7 @@ void vk_probe(Sb *b, void *lib) {
     VkPhysicalDevice pds[4];
     if (n > 4) n = 4;
     v.vkEnumeratePhysicalDevices(v.inst, &n, pds);
-    if (!n) sb_printf(b, "ERRO: nenhuma GPU (com adrenotools: hooks fora do nativeLibraryDir?)\n");
+    if (!n) sb_printf(b, "ERROR: no GPU (with adrenotools: hooks outside nativeLibraryDir?)\n");
     for (uint32_t i = 0; i < n; i++) device(b, &v, pds[i]);
     v.vkDestroyInstance(v.inst, NULL);
 }

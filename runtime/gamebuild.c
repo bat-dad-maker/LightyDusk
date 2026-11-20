@@ -14,7 +14,7 @@
 #include "rt.h"
 
 #ifdef __ANDROID__
-// Android (docs/las/ANDROID-PORT.md, Fase 6): the generator runs on the app's Python (libpymain.so, its standard library
+// Android (docs/las/ANDROID-PORT.md, Phase 6): the generator runs on the app's Python (libpymain.so, its standard library
 // and the generator in LARECOMP_GEN_DIR, android/deps/build_gen_deps.sh) and zig compiles for aarch64-linux-musl: the
 // C library's headers only - the library links -nostdlib against libmain.so, and Android's linker resolves its libc
 // calls. -O1 as on the desktop (on the phone a build takes minutes; -O2 measured no faster in game).

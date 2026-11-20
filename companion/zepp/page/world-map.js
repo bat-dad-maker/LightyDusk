@@ -37,7 +37,7 @@ Page({
       })
       layer.addEventListener(hmUI.event.CLICK_UP, () => { this.drag = null })
     }
-    this.status = label(height - 83, 25, 17, 0xc9d9d9, 'Conectando ao celular…')
+    this.status = label(height - 83, 25, 17, 0xc9d9d9, 'Connecting to the phone...')
     hmUI.createWidget(hmUI.widget.BUTTON, { x: Math.round(width / 2) - 65, y: height - 55,
       w: 130, h: 32, radius: 12, text: 'Center Link', text_size: 18, color: 0xe6c36a,
       normal_color: 0x17383c, press_color: 0x28565b,
@@ -184,7 +184,7 @@ Page({
           (state.objectivesAvailable === false ? 'Link connected • quest unavailable' : 'Link connected') :
           state.status === 'interior' ? 'Interior • overworld map' : 'Waiting for Link in the game')
       }).catch(error => {
-        if (this.canUpdate() && generation === this.generation) this.status.setProperty(hmUI.prop.TEXT, error.message || 'Abra o Zepp e o Recomp.')
+        if (this.canUpdate() && generation === this.generation) this.status.setProperty(hmUI.prop.TEXT, error.message || 'Open Zepp and Recomp.')
       }).finally(() => { if (this.pending === id) this.pending = null })
   },
   onDestroy() {

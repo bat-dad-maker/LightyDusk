@@ -1,6 +1,6 @@
 #!/bin/bash
 # android/push_game.sh <game folder with exefs/ and romfs/>: the player's own game files onto the device over adb,
-# set up as the start screen's setup would (docs/las/ANDROID-PORT.md, Fase 2; until the app has a folder picker):
+# set up as the start screen's setup would (docs/las/ANDROID-PORT.md, Phase 2; until the app has a folder picker):
 # <data root>/extracted/{exefs,romfs} (skipped when there), romfs.bin built on the device (android/tools/romfs_tool.c,
 # no third copy of 6 GB through USB), and the game code from android/build_gamelib.sh (android/out).
 set -euo pipefail

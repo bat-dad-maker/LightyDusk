@@ -1,4 +1,4 @@
-# Size plan: LAS Recomp for Android
+# Port plan: LAS Recomp for Android
 
 Initial target: **Snapdragon (Adreno 6xx / 7xx) with the Vulkan Turnip** (Mesa) driver, loaded by the app. Other SoCs (Mali, Xclipse, Adreno with the Qualcomm driver) stay after Phase 3.
 
@@ -65,7 +65,7 @@ The game is PIC: Switch loads executables with ASLR, and `loader.c` already appl
   - in the apparatus, a test mode that forces an alternative base (by environment or extra Intent variable) to exercise two different bases;
   - measure the cost of `B + offset` with `simpleperf` (must be small: one add per materialized address).
 
-## Fases
+## Phases
 
 ### Phase 0: evidence of viability (before carrying anything)
 
@@ -108,7 +108,7 @@ What does that decide?
 - **Global memory of the shaders:**Neither driver has host import. Alternatives: `adrenotools_import_user_mem` (only on the Qualcomm driver via KGSL) or the fallback by copy of Phase 3.
 - **Not yet measured:**present mode and `preTransform`, because they need a surface. Stay for Phase One.
 
-### Fase 1: build
+### Phase 1: build
 
 - **Dependencies for Android arm64**(scripts with fixed versions and checksums, `tools/linux/build_deps.sh` style):
   - SDL3 (via `android-project`)
@@ -160,7 +160,7 @@ The Switch system source is replaced by the DejaVu Sans that the app brings: Rob
 
 The phase is not yet completed: confirm the sound on the device and pass the title screen (entry: physical control via SDL, or touch, Phase 4).
 
-### Fase 3: Vulkan no Adreno/Turnip
+### Phase 3: Vulkan on Adreno/Turnip
 
 Order defined by Phase 0 results:
 

@@ -1,4 +1,4 @@
-// BOTWRecompAndroid Android probe (docs/las/ANDROID-PORT.md, Fase 0): where the guest window can go in an app process, and what
+// BOTWRecompAndroid Android probe (docs/las/ANDROID-PORT.md, Phase 0): where the guest window can go in an app process, and what
 // the Vulkan drivers (system, Turnip through adrenotools) offer the backend. JNI entry points for MainActivity.
 #include <dlfcn.h>
 #include <errno.h>
@@ -50,7 +50,7 @@ static void memory_probe(Sb *b) {
     struct utsname u;
     uname(&u);
     long page = sysconf(_SC_PAGESIZE);
-    sb_printf(b, "== Memoria\n");
+    sb_printf(b, "== Memory\n");
     sb_printf(b, "kernel: %s %s %s\n", u.sysname, u.release, u.machine);
     sb_printf(b, "pagina: %ld bytes, RAM: %.1f GB\n", page, gb((uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)page));
 
@@ -58,24 +58,24 @@ static void memory_probe(Sb *b) {
     GwRange *maps = malloc(MAX_MAPS * sizeof *maps), holes[64];
     int n = maps ? gw_read_maps(maps, MAX_MAPS) : -1;
     if (n <= 0) {
-        sb_printf(b, "ERRO: nao consegui ler /proc/self/maps\n");
+        sb_printf(b, "ERROR: could not read /proc/self/maps\n");
         free(maps);
         return;
     }
     uint64_t top = maps[n - 1].hi;
-    sb_printf(b, "mapeamentos (adjacentes juntos): %d, menor %#llx, maior fim %#llx -> VA de %d bits\n", n,
+    sb_printf(b, "mappings (adjacent ones merged): %d, lowest %#llx, highest end %#llx -> %d-bit VA\n", n,
               (unsigned long long)maps[0].lo, (unsigned long long)top, 64 - __builtin_clzll(top - 1));
 
     // The desktop's fixed window: is it free in an app process?
-    sb_printf(b, "\njanela fixa do desktop %#llx-%#llx:\n", DESKTOP_LO, DESKTOP_LO + GW_SIZE);
+    sb_printf(b, "\nthe desktop's fixed window %#llx-%#llx:\n", DESKTOP_LO, DESKTOP_LO + GW_SIZE);
     maps_overlapping(b, DESKTOP_LO, DESKTOP_LO + GW_SIZE, 12);
     void *p = mmap((void *)(uintptr_t)DESKTOP_LO, GW_SIZE, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
     if (p == (void *)(uintptr_t)DESKTOP_LO) {
-        sb_printf(b, "  reserva fixa: OK (livre neste processo)\n");
+        sb_printf(b, "  fixed reservation: OK (free in this process)\n");
         munmap(p, GW_SIZE);
     } else {
-        sb_printf(b, "  reserva fixa: FALHOU (%s)\n", p == MAP_FAILED ? strerror(errno) : "endereco diferente");
+        sb_printf(b, "  fixed reservation: FAILED (%s)\n", p == MAP_FAILED ? strerror(errno) : "different address");
         if (p != MAP_FAILED) munmap(p, GW_SIZE);
     }
 
@@ -92,7 +92,7 @@ static void memory_probe(Sb *b) {
     uint64_t base = gw_reserve(GW_SIZE, GW_ALIGN, GW_FLOOR, GW_VA_LIMIT);
     uint64_t t1 = now_us();
     if (!base) {
-        sb_printf(b, "\nreserva dinamica: FALHOU (nenhum buraco alinhado a 4 GB)\n");
+        sb_printf(b, "\ndynamic reservation: FAILED (no 4 GB-aligned hole)\n");
         return;
     }
     sb_printf(b, "\nreserva dinamica: base %#llx (%llu us)\n", (unsigned long long)base, (unsigned long long)(t1 - t0));
@@ -103,7 +103,7 @@ static void memory_probe(Sb *b) {
         *q = probes[i] ^ 0x5a5a5a5a5a5a5a5aull;
         ok &= *q == (probes[i] ^ 0x5a5a5a5a5a5a5a5aull);
     }
-    sb_printf(b, "  escrita/leitura (inicio, heap, fim): %s\n", ok ? "OK" : "FALHOU");
+    sb_printf(b, "  write/read (start, heap, end): %s\n", ok ? "OK" : "FAILED");
     munmap((void *)(uintptr_t)base, GW_SIZE);
 }
 
@@ -129,11 +129,11 @@ JNIEXPORT jstring JNICALL Java_com_botwrecompandroid_probe_MainActivity_vulkanPr
     if (dir) {
         sb_printf(&b, "== Vulkan: driver customizado %s%s (adrenotools)\n", dir, name);
         lib = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, NULL, libdir, dir, name, NULL, NULL);
-        if (!lib) sb_printf(&b, "ERRO: adrenotools_open_libvulkan falhou (veja o logcat, tag AdrenoTools)\n");
+        if (!lib) sb_printf(&b, "ERROR: adrenotools_open_libvulkan failed (see logcat, tag AdrenoTools)\n");
     } else {
-        sb_printf(&b, "== Vulkan: driver do sistema\n");
+        sb_printf(&b, "== Vulkan: system driver\n");
         lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-        if (!lib) sb_printf(&b, "ERRO: dlopen libvulkan.so: %s\n", dlerror());
+        if (!lib) sb_printf(&b, "ERROR: dlopen libvulkan.so: %s\n", dlerror());
     }
     if (lib) vk_probe(&b, lib);  // (not dlclosed: drivers rarely survive being unloaded)
     (*env)->ReleaseStringUTFChars(env, jlibdir, libdir);

@@ -4,7 +4,7 @@
 #   SDL3 (shared, plus its Java glue), shaderc (one shared library, glslang and SPIRV-Tools inside), and the headers
 #   Vulkan-Headers, Vulkan Memory Allocator and volk (the Vulkan functions come from the driver adrenotools loads),
 #   and the DejaVu Sans font.
-# FFmpeg is not here yet (docs/las/ANDROID-PORT.md, Fase 2).
+# FFmpeg is not here yet (docs/las/ANDROID-PORT.md, Phase 2).
 # Runs in Git Bash on Windows (or any bash) with the Android SDK's NDK and CMake; each part is skipped when its output
 # exists (delete out/ to redo).
 set -euo pipefail

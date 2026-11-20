@@ -37,7 +37,7 @@
 #include "imgui_impl_sdl3.h"
 
 extern "C" {
-#ifndef LARECOMP_NO_FFMPEG  // (Android, for now: docs/las/ANDROID-PORT.md, Fase 2)
+#ifndef LARECOMP_NO_FFMPEG  // (Android, for now: docs/las/ANDROID-PORT.md, Phase 2)
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>

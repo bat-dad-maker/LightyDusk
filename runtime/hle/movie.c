@@ -1013,5 +1013,5 @@ HLE_FUNC("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11Dec
     self[1] = (uint64_t)(uintptr_t)d;
 }
 // BOTW's 2017 SDK: no mode / thread arguments (the constructor above doesn't use them). Its decoder's virtual methods
-// are assumed to be in the same slots as the 2019 SDK's: not checked yet (docs/BOTW-PORT.md, Fase 5).
+// are assumed to be in the same slots as the 2019 SDK's: not checked yet (docs/BOTW-PORT.md, Phase 5).
 HLE_FUNC("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE", movie_decoder_ctor_old) { movie_decoder_ctor(c); }

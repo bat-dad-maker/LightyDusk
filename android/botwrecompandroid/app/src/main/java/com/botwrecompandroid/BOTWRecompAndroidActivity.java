@@ -6,7 +6,7 @@
 // - LARECOMP_NATIVE_LIB_DIR: where adrenotools finds its hook libraries;
 // - the game code (botwgame.so + botwgame.so.id, built from the player's own game files: android/build_gamelib.sh) from
 //   <external files>/extracted to <internal files>/res, where runtime/gamelib.c looks for it next to "the executable".
-// - the game code's builder (docs/las/ANDROID-PORT.md, Fase 6): assets/gen (the generator, its Python's standard library,
+// - the game code's builder (docs/las/ANDROID-PORT.md, Phase 6): assets/gen (the generator, its Python's standard library,
 //   zig's headers) unpacked to <internal files>/gen once per app version, named in LARECOMP_GEN_DIR; its programs
 //   (libpymain.so, libzig.so) are in nativeLibraryDir;
 // - the system's pickers for the start screen (runtime/ui/launcher.mm): the game files folder (exefs/ and romfs/ are

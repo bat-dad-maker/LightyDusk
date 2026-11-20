@@ -40,13 +40,13 @@ The runtime was made for the recompiled code, but almost everything around it is
 | --- | --- | --- | --- |
 | Game code | `botwgame.so` compilado no celular | The original `main` / `sdk` / `subsdk`, rewritten in the load and executable mapped at their address | Large: the rescriptor (Python on PC today; on mobile phone, C or Python that the app already takes) |
 | `svc`, `x18`, TLS, contador | Viram C no lifter | Rewritten for ports and slots such as d2r-mobile | Medium |
-| Chamadas host → guest | `guest_call` by function table | A stub that loads the `Cpu` registers and jumps to the address | Pequeno |
+| Chamadas host → guest | `guest_call` by function table | A stub that loads the `Cpu` registers and jumps to the address | Small |
 | `tools/patches.py` (4-6 per version) | C in place of instruction | Trampolines in binary (deviation to a stub that makes the patch and back) | Medium |
 | `setjmp`/`longjmp` (`hle/setjmp.c`) | HLE, WHY C DOESN'T COME BACK IN THE MIDDLE OF A FUNCTION | Unnecessary: the original works | Some |
 | SIMD, flags, monitores exclusivos, FPCR | Emulados | Exact of the CPU itself | Some (and correct bugs that only emulation has) |
 | Restart to the Home screen | `rt_unwind_point` at the input of each function | There are no points in the code: stop threads in `svc` and by the way | Medium, at risk |
-| Core relay 0 | `svc` and `FN_ENTER` | Only in `svc` (that's where the Horizon changes thread too) | Pequeno |
-| `fnprof`, `[slow]`, crash report | Nomes `f_<endereço>` | Direct guest addresses; sample profiles (`simpleperf` on guest PC itself) are simpler | Pequeno |
+| Core relay 0 | `svc` and `FN_ENTER` | Only in `svc` (that's where the Horizon changes thread too) | Small |
+| `fnprof`, `[slow]`, crash report | `f_<address>` names | Direct guest addresses; sample profiles (`simpleperf` on guest PC itself) are simpler | Small |
 
 ## Riscos
 

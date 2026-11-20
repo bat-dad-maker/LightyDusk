@@ -121,7 +121,7 @@ val prepareBotwRecompAndroid by tasks.registering {
         touchSkin.copyTo(out.resolve("assets/res/sheikah-touch-atlas.png"), overwrite = true)
         touchActions.copyTo(out.resolve("assets/res/touch-actions.png"), overwrite = true)
         icon.copyTo(out.resolve("res/mipmap-xxxhdpi/ic_launcher.png"), overwrite = true)
-        // the game code's builder (docs/las/ANDROID-PORT.md, Fase 6; android/deps/build_gen_deps.sh): its programs and
+        // the game code's builder (docs/las/ANDROID-PORT.md, Phase 6; android/deps/build_gen_deps.sh): its programs and
         // libraries as native libraries (Android runs binaries only from nativeLibraryDir), the rest as assets/gen
         // (runtime/gamebuild.c; unpacked by BOTWRecompAndroidActivity)
         val g = deps.resolve("gen")

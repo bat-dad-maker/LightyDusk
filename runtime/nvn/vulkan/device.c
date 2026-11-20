@@ -757,7 +757,7 @@ static void create_device(void) {
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
 #ifdef __ANDROID__
     {   // Adreno has no uniformAndStorageBuffer8BitAccess, and no shader uses 8-bit uniform buffers
-        // (docs/las/ANDROID-PORT.md, Fase 0): the 8-bit features only when the driver has them
+        // (docs/las/ANDROID-PORT.md, Phase 0): the 8-bit features only when the driver has them
         f12.shaderInt8 = h12.shaderInt8;
         f12.uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess;
         f12.storageBuffer8BitAccess = h12.storageBuffer8BitAccess;
@@ -1071,7 +1071,7 @@ static void create_swapchain(void) {
     SDL_GetWindowSizeInPixels(window, &w, &h);
 #ifdef __ANDROID__
     // The surface reports the panel's own (portrait) orientation; the window is landscape: images of the window's
-    // size, turned by the compositor (pre-rotation in the app would spare it that: docs/las/ANDROID-PORT.md, Fase 3)
+    // size, turned by the compositor (pre-rotation in the app would spare it that: docs/las/ANDROID-PORT.md, Phase 3)
     VkExtent2D ext = {(uint32_t)w, (uint32_t)h};
     VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     LOG("[vk] swapchain: surface %ux%u transform %#x, window %dx%d, present mode %d, images %u-%u\n", caps.currentExtent.width,

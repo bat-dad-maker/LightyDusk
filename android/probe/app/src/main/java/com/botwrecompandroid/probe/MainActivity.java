@@ -1,4 +1,4 @@
-// BOTWRecompAndroid Android probe (docs/las/ANDROID-PORT.md, Fase 0). Runs once per launch, in this order: the guest window
+// BOTWRecompAndroid Android probe (docs/las/ANDROID-PORT.md, Phase 0). Runs once per launch, in this order: the guest window
 // placement (before any driver maps memory), the system Vulkan driver, then every custom driver found in
 // <external files>/drivers/ (a .so, or an adrenotools .zip). The report is shown, written to
 // <external files>/report-<time>.txt (and report-latest.txt) section by section, and logged under the tag LASProbe.
@@ -66,18 +66,18 @@ public class MainActivity extends Activity {
 
     private void run() {
         String libDir = getApplicationInfo().nativeLibraryDir;
-        section("== Aparelho\n" + Build.MANUFACTURER + " " + Build.MODEL + " (" + Build.DEVICE + "), Android "
+        section("== Device\n" + Build.MANUFACTURER + " " + Build.MODEL + " (" + Build.DEVICE + "), Android "
                 + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + "), SoC " + Build.SOC_MANUFACTURER + " "
                 + Build.SOC_MODEL + "\nnativeLibraryDir: " + libDir + "\n");
         section(memoryProbe());
         section(vulkanProbe(libDir, null, null));
         List<File[]> drivers = customDrivers();
         if (drivers.isEmpty())
-            section("== Drivers customizados\nnenhum em " + new File(getExternalFilesDir(null), "drivers")
+            section("== Custom drivers\nnone in " + new File(getExternalFilesDir(null), "drivers")
                     + " (copy a libvulkan_freedreno.so or the adrenotools .zip there)\n");
         for (File[] d : drivers)  // d[0] = folder (internal storage), d[1] = the driver library in it
             section(vulkanProbe(libDir, d[0].getAbsolutePath() + "/", d[1].getName()));
-        section("== Fim\n");
+        section("== End\n");
     }
 
     // Custom drivers from <external files>/drivers, copied to internal storage (dlopen refuses external storage).
@@ -96,10 +96,10 @@ public class MainActivity extends Activity {
             dir.mkdirs();
             try {
                 File lib = name.endsWith(".so") ? copy(new FileInputStream(f), new File(dir, name)) : unzipDriver(f, dir);
-                if (lib == null) section("== Driver " + name + "\nERRO: nenhum .so dentro do zip\n");
+                if (lib == null) section("== Driver " + name + "\nERROR: no .so inside the zip\n");
                 else out.add(new File[] {dir, lib});
             } catch (IOException e) {
-                section("== Driver " + name + "\nERRO: " + e + "\n");
+                section("== Driver " + name + "\nERROR: " + e + "\n");
             }
         }
         return out;

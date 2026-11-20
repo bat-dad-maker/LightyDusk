@@ -46,7 +46,7 @@ The *Breath of the Wild* engine was developed on Nintendo's proprietary framewor
 ## 2. Historical and Technical Survey of Mods by Platform
 
 ```
-                                  Evolução das Mods de Desempenho de BOTW
+                                  Evolution of BOTW performance mods
                                   
    [ Wii U / Cemu ]                [ Switch / Yuzu / Ryujinx ]            [ Android & Moderno ]
       (2017-2019)                         (2019-2023)                          (2023-2026)
@@ -218,7 +218,7 @@ Instead of being limited to fixed locks of 30 FPS or 60 FPS static (where 45 FPS
 
 ### 4. Inner Static Resolution and Selector in Menu (RRS)
 - Currently, BOTW draws fixed at 1600x900 docked (or 1280x720 handheld via `LARECOMP_HANDHELD=1`).
-- We can display an option in the Android settings (`Settings -> Resolução Interna`):
+- We can display an option in the Android settings (`Settings -> Internal resolution`):
   - **720p (Native Handheld):** Reduces G-buffer rendering area by 36% compared to 900p.
   - **540p (Performance Mode):** Allows you to fit the G-buffer perfectly into the Adreno GMEM, maximizing battery efficiency and keeping temperature low.
   - The FSR 1 scheduler already present in the `exec.c` runtime makes the buffer upscale clean of 540p/2020p for the native resolution of the mobile screen (3200x1440).

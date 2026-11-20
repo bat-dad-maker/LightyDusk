@@ -919,4 +919,4 @@ Upstream: https://github.com/mamcjr/BOTWRecompAndroid/releases/tag/v0.1.0-beta
 - Known gaps: setting the game up in the app compiles the game code on the phone, **not yet tested or timed with BOTW**; non-Adreno-8xx GPUs take slower paths; black thumbnails for saves made in the app; simplified audio mixer.
 - Android 11+ (arm64, Vulkan), about 30 GB free per game version.
 
-#### Créditos / Credits
+#### Credits
