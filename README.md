@@ -153,6 +153,10 @@ test program). If saves or loading behave oddly, turn it off and keep a backup o
 
 ## Installing (beta)
 
+> **This fork's APK** is built by GitHub Actions. Until a signing key is stored in the repository secrets
+> (`SIGNING_KEYSTORE_B64`, `SIGNING_KEYSTORE_PASSWORD`, `SIGNING_KEY_ALIAS`), each build is signed with a key made for
+> that build, so a newer build won't install over an older one: export your saves, uninstall, then install.
+
 1. Download the APK from [Releases](https://github.com/bat-dad-maker/LightyDusk/releases) (this fork) or from
    [upstream's Releases](https://github.com/mamcjr/BOTWRecompAndroid/releases) and install it (Android 11+,
    ARM64 and Vulkan). You need your own extracted game folder containing `exefs` and `romfs`.

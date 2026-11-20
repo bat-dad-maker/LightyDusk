@@ -72,13 +72,25 @@ jobs:
             android/deps/src
           key: deps-${{ env.NDK_VERSION }}-${{ hashFiles('android/deps/*.sh', 'android/deps/*.patch') }}
 
-      - name: Generate a signing key
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
         run: |
+          # A stable key from the repository secrets when they are set (APKs then update over each other); else a key
+          # generated for this run only (uninstall the previous build before installing one signed with another key).
           mkdir -p ~/.botwrecompandroid
-          keytool -genkeypair -v -keystore ~/.botwrecompandroid/release.jks -alias botwen -keyalg RSA -keysize 2048 \
-            -validity 10000 -storepass botwenbuild -keypass botwenbuild -dname "CN=BOTWRecompAndroid EN"
-          printf 'storeFile=%s\nstorePassword=botwenbuild\nkeyAlias=botwen\nkeyPassword=botwenbuild\n' \
-            "$HOME/.botwrecompandroid/release.jks" > ~/.botwrecompandroid/keystore.properties
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > ~/.botwrecompandroid/release.jks
+            PASS="$KEYSTORE_PASSWORD"; ALIAS="$KEY_ALIAS"
+          else
+            PASS=botwenbuild; ALIAS=botwen
+            keytool -genkeypair -v -keystore ~/.botwrecompandroid/release.jks -alias "$ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=BOTWRecompAndroid EN"
+          fi
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$HOME/.botwrecompandroid/release.jks" "$PASS" "$ALIAS" "$PASS" > ~/.botwrecompandroid/keystore.properties
 
       - name: Gradle assembleRelease
         working-directory: android/botwrecompandroid
