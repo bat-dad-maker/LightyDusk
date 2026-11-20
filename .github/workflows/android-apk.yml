@@ -45,8 +45,9 @@ jobs:
           echo "ANDROID_NDK=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_LINUX=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
 
-      - name: Cache native dependencies
-        uses: actions/cache@v4
+      - name: Restore native dependencies
+        id: deps-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             android/deps/out
@@ -61,6 +62,15 @@ jobs:
 
       - name: Build the on-device game code builder (Python, zig, unicorn, capstone, lz4)
         run: bash android/deps/build_gen_deps.sh
+
+      - name: Save native dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            android/deps/out
+            android/deps/src
+          key: deps-${{ env.NDK_VERSION }}-${{ hashFiles('android/deps/*.sh', 'android/deps/*.patch') }}
 
       - name: Generate a signing key
         run: |

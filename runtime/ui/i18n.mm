@@ -7,14 +7,6 @@
 #include <unordered_map>
 
 #include "imgui.h"
-#ifdef __ANDROID__
-#include <vector>
-// (ImGui's own TrueType reader, a private copy: a phone font it can't read leaves the whole atlas empty - HyperOS's
-// NotoSansCJK did, and the start screen crashed uploading it)
-#define STBTT_STATIC
-#define STB_TRUETYPE_IMPLEMENTATION
-#include "imstb_truetype.h"
-#endif
 
 extern "C" {
 #include "../settings.h"
@@ -48,77 +40,6 @@ std::string ui_upper(const char *s) {
 }
 
 void i18n_merge_fonts(ImFontAtlas *atlas, float size_px) {
-#ifdef __ANDROID__
-    // The shipped Baloo 2 has Latin only: Russian, Japanese, Korean and Chinese come from the phone's own fonts, merged
-    // into the font just added, with the glyphs the menu language's table uses (a few hundred, not whole scripts: the
-    // atlas stays small)
-    const Table *t = menu_table();
-    if (!t) return;
-    const char *code = t->code;
-    bool cjk = !strcmp(code, "ja") || !strcmp(code, "ko") || !strncmp(code, "zh", 2);
-    if (!cjk && strcmp(code, "ru")) return;
-    static ImVector<ImWchar> ranges;
-    if (ranges.empty()) {
-        ImFontGlyphRangesBuilder b;
-        for (size_t i = 0; i < t->n; i++) b.AddText(t->rows[i][1]);
-        b.AddText("0123456789 %.,:;!?()[]/-+x");
-        b.BuildRanges(&ranges);
-    }
-    // Candidates, the language's own first: Xiaomi's MiSans (HyperOS), then Google's NotoSansCJK collection (Japanese,
-    // Korean, Simplified, Traditional Chinese faces in that order: Android's fonts.xml); each checked with ImGui's reader
-    // (font_ok) - variable CFF2 fonts it can't read
-    int face = !strcmp(code, "ko") ? 1 : !strcmp(code, "zh-Hans") ? 2 : !strcmp(code, "zh-Hant") ? 3 : 0;
-    static const char *const own[] = {"/system/fonts/MiSansJapaneseVF.ttf", "/system/fonts/MiSansKoreanVF.ttf",
-                                      "/system/fonts/MiSansVF.ttf", "/system/fonts/MiSansTCVF.ttf"};
-    const char *cjk_fonts[] = {cjk ? own[face] : "", "/system/fonts/NotoSansCJK-Regular.ttc",
-                               "/system/fonts/NotoSansCJK-Medium.ttc", "/system/fonts/NotoSerifCJK-Regular.ttc",
-                               "/system/fonts/DroidSansFallbackFull.ttf", "/system/fonts/DroidSansFallback.ttf"};
-    static const char *const cyr_fonts[] = {"/system/fonts/RobotoStatic-Medium.ttf", "/system/fonts/Roboto-Medium.ttf",
-                                            "/system/fonts/RobotoStatic-Regular.ttf", "/system/fonts/Roboto-Regular.ttf",
-                                            "/system/fonts/NotoSans-Regular.ttf"};
-    const char *const *list = cjk ? cjk_fonts : cyr_fonts;
-    size_t n = cjk ? sizeof cjk_fonts / sizeof *cjk_fonts : sizeof cyr_fonts / sizeof *cyr_fonts;
-    // a letter of the language the font must have (あ, 한, 中, 中, Я)
-    int probe = !strcmp(code, "ja") ? 0x3042 : !strcmp(code, "ko") ? 0xD55C : cjk ? 0x4E2D : 0x042F;
-    static int chosen = -2;  // (the same for every size: checked once)
-    static const char *chosen_path;
-    if (chosen == -2) {
-        chosen = -1;
-        for (size_t i = 0; i < n && chosen < 0; i++) {
-            FILE *f = *list[i] ? fopen(list[i], "rb") : NULL;  // (a missing file is an assertion in ImGui)
-            if (!f) continue;
-            std::vector<unsigned char> data;
-            fseek(f, 0, SEEK_END);
-            long size = ftell(f);
-            fseek(f, 0, SEEK_SET);
-            if (size > 0) data.resize((size_t)size);
-            bool read = size > 0 && fread(data.data(), 1, data.size(), f) == data.size();
-            fclose(f);
-            int fno = strstr(list[i], ".ttc") ? face : 0, off = read ? stbtt_GetFontOffsetForIndex(data.data(), fno) : -1;
-            stbtt_fontinfo info;
-            if (off >= 0 && stbtt_InitFont(&info, data.data(), off) && stbtt_FindGlyphIndex(&info, probe) != 0) {
-                chosen = fno;
-                chosen_path = list[i];
-            } else {
-                fprintf(stderr, "[ui] menus in %s: %s can't be used\n", code, list[i]);
-            }
-        }
-    }
-    if (chosen >= 0) {
-        ImFontConfig cfg;
-        cfg.MergeMode = true;
-        cfg.FontNo = chosen;
-        const char *const path = chosen_path;
-        cfg.OversampleH = 1;  // (big CJK glyph sets: half the atlas of the default 2)
-        cfg.PixelSnapH = true;
-        // (Baloo 2 runs small for its size: the system fonts at ~60% of it match its letters' height)
-        atlas->AddFontFromFileTTF(path, size_px * 0.6f, &cfg, ranges.Data);
-        static bool logged;
-        if (!logged) logged = true, fprintf(stderr, "[ui] menus in %s: glyphs from %s\n", code, path);
-        return;
-    }
-    fprintf(stderr, "[ui] menus in %s: no system font with its letters\n", code);
-#else
+    // English-only menus: the shipped Latin font (Baloo 2) has every letter they use, so no system font is merged
     (void)atlas, (void)size_px;
-#endif
 }
