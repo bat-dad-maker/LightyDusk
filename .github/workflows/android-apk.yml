@@ -1,0 +1,99 @@
+# Builds the BOTWRecompAndroid EN release APK (arm64-v8a) on every push to main and on demand.
+# No game files are involved: the app builds the game code on the phone from the user's own dump.
+# The APK is signed with a key generated in the run (not a stable release key: uninstall before installing an APK
+# signed with a different key).
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      NDK_VERSION: 30.0.16248370
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" \
+            "ndk;${NDK_VERSION}" "cmake;3.30.4"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_LINUX=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Cache native dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            android/deps/out
+            android/deps/src
+          key: deps-${{ env.NDK_VERSION }}-${{ hashFiles('android/deps/*.sh', 'android/deps/*.patch') }}
+
+      - name: Build native dependencies (SDL3, shaderc, headers)
+        run: bash android/deps/build_deps.sh
+
+      - name: Build FFmpeg
+        run: bash android/deps/build_ffmpeg.sh
+
+      - name: Build the on-device game code builder (Python, zig, unicorn, capstone, lz4)
+        run: bash android/deps/build_gen_deps.sh
+
+      - name: Generate a signing key
+        run: |
+          mkdir -p ~/.botwrecompandroid
+          keytool -genkeypair -v -keystore ~/.botwrecompandroid/release.jks -alias botwen -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass botwenbuild -keypass botwenbuild -dname "CN=BOTWRecompAndroid EN"
+          printf 'storeFile=%s\nstorePassword=botwenbuild\nkeyAlias=botwen\nkeyPassword=botwenbuild\n' \
+            "$HOME/.botwrecompandroid/release.jks" > ~/.botwrecompandroid/keystore.properties
+
+      - name: Gradle assembleRelease
+        working-directory: android/botwrecompandroid
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Collect APK
+        id: apk
+        run: |
+          VERSION=$(grep -o 'versionName = "[^"]*"' android/botwrecompandroid/app/build.gradle.kts | cut -d'"' -f2)
+          mkdir -p out
+          cp android/botwrecompandroid/app/build/outputs/apk/release/*.apk "out/BOTWRecompAndroid-EN-${VERSION}.apk"
+          sha256sum out/*.apk | tee out/SHA256SUMS.txt
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BOTWRecompAndroid-EN-${{ steps.apk.outputs.version }}
+          path: out/*
+
+      - name: Publish to the release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.apk.outputs.version }}"
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --target "$GITHUB_SHA" \
+            --title "BOTWRecompAndroid EN ${{ steps.apk.outputs.version }}" --notes-file docs/CHANGELOG.md --prerelease
+          gh release upload "$TAG" out/*.apk out/SHA256SUMS.txt --clobber
