@@ -14,6 +14,7 @@
 #include "../ipc.h"
 #include "../paths.h"
 #include "../romfs_build.h"
+#include "fs_async.h"
 
 #define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
 #define FS_PATH_EXISTS MAKE_RESULT(2, 2)
@@ -543,6 +544,7 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
                               : romfs_read(st->fd, (uint8_t *)(uintptr_t)b->addr, size, off);
         bench_io_done(BP_FILE_NS, BP_FILE_BYTES, bench_read_t, n > 0 ? (uint64_t)n : 0);
         if (n < 0) LOG("[fs] storage read failed at %llx: %s\n", off, strerror(errno));
+        if (n > 0 && st->fd >= 0 && fs_async_on()) fs_async_readahead(st->fd, off, (uint64_t)n);  // (smooth loading)
         if (st->plain || R->dlc) break;
         {
             const char *path = romfs_file_at(off);
@@ -681,7 +683,7 @@ static Service *open_aoc_storage(void) {
 
 // ------------------------------------------------------------------ host-directory filesystem
 typedef struct { char root[1024]; bool save; } HostFs;  // save: a save data's (not the SD card's)
-typedef struct { int fd; char path[1100]; bool save; } HostFile;
+typedef struct { int fd; char path[1100]; bool save; SaveShadow *sh; } HostFile;  // sh: smooth loading's copy (fs_async.c)
 
 // A save being written: the game's changes to a save since its last Commit (0: none). The app in the background holds
 // the game at its next present only once that save is committed (nvn/objects.c nvn_background), so Android killing
@@ -690,7 +692,7 @@ static uint64_t save_dirty_ns;  // (__atomic_*)
 static void save_dirty(bool save) { if (save) __atomic_store_n(&save_dirty_ns, plat_now_ns() | 1, __ATOMIC_RELAXED); }
 bool fs_save_pending(void) {
     uint64_t t = __atomic_load_n(&save_dirty_ns, __ATOMIC_RELAXED);
-    return t && plat_now_ns() - t < 20000000000ull;
+    return (t && plat_now_ns() - t < 20000000000ull) || fs_async_pending();  // (smooth loading: its writes too)
 }
 typedef struct { DIR *d; char path[1024]; int mode; } HostDir;
 
@@ -711,8 +713,46 @@ static uint32_t errno_result(void) {
     return MAKE_RESULT(2, 4000);
 }
 
+// Smooth loading (fs_async.c): a save file open for writing works on its in-memory copy; written out on Flush,
+// Commit or close by the background thread
+static void file_shadow(HostFile *f, IpcReq *req, IpcResp *resp) {
+    switch (req->cmd) {
+    case 0: {  // Read(option, offset, size) -> B
+        int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
+        IpcBuf *b = out_buf(req, 0);
+        if ((uint64_t)size > b->size) size = (int64_t)b->size;
+        plat_write_prepare(b->addr, size);
+        int64_t n = off < 0 ? -1 : fs_shadow_read(f->sh, (void *)(uintptr_t)b->addr, (uint64_t)size, (uint64_t)off);
+        OUT(int64_t, 0) = n < 0 ? 0 : n;
+        resp_size(resp, 8);
+        break;
+    }
+    case 1: {  // Write(option, offset, size) <- A
+        int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
+        IpcBuf *a = in_buf(req, 0);
+        save_dirty(f->save);
+        if (off < 0 || size < 0 || !fs_shadow_write(f->sh, (const void *)(uintptr_t)a->addr, (uint64_t)size, (uint64_t)off))
+            resp->result = MAKE_RESULT(2, 4000);
+        break;
+    }
+    case 2: fs_shadow_flush(f->sh); break;
+    case 3: save_dirty(f->save); if (!fs_shadow_set_size(f->sh, (uint64_t)IN(int64_t, 0))) resp->result = MAKE_RESULT(2, 4000); break;
+    case 4: OUT(int64_t, 0) = (int64_t)fs_shadow_size(f->sh); resp_size(resp, 8); break;
+    default: LOG("[fs] IFile cmd %u (ok)\n", req->cmd);
+    }
+}
+
+static void file_shadow_close(Service *s) {
+    HostFile *f = s->state;
+    if (f->sh) fs_shadow_close(f->sh);
+    if (f->fd >= 0) close(f->fd);
+    free(f);
+    s->state = NULL;
+}
+
 static void file(Service *s, IpcReq *req, IpcResp *resp) {
     HostFile *f = s->state;
+    if (f->sh) { file_shadow(f, req, resp); return; }
     switch (req->cmd) {
     case 0: {  // Read(option, offset, size) -> B
         int64_t off = IN(int64_t, 8), size = IN(int64_t, 16);
@@ -820,6 +860,14 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     char p[2048], p2[2048];
     host_path(fs, in_path(req, 0), p, sizeof p);
     if (req->cmd <= 6 || req->cmd == 13) save_dirty(fs->save);  // (create, delete, rename, clean: the save changes)
+    if (fs->save && fs_async_on()) {  // (smooth loading: what is queued written first, in order with these)
+        if (req->cmd == 0) fs_async_wait(p);
+        else if (req->cmd == 1 || req->cmd == 3 || req->cmd == 4 || req->cmd == 13) fs_async_before_unlink(p);
+        else if (req->cmd == 5 || req->cmd == 6) {
+            host_path(fs, in_path(req, 1), p2, sizeof p2);
+            fs_async_before_rename(p, p2);
+        }
+    }
     switch (req->cmd) {
     case 0: {  // CreateFile(option, size)
         int fd = open(p, O_CREAT | O_EXCL | O_RDWR, 0644);
@@ -845,13 +893,22 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     }
     case 8: {  // OpenFile(mode)
         uint32_t mode = IN(uint32_t, 0);
+        SaveShadow *sh = NULL;
+        if (fs->save && fs_async_on()) {  // (smooth loading: an open copy is the newest content; else the queue first)
+            sh = fs_shadow_find(p);
+            if (!sh) fs_async_wait(p);
+        }
         int fd = open(p, (mode & 2) ? O_RDWR : O_RDONLY);
-        if (fd < 0) { resp->result = errno_result(); break; }
+        if (fd < 0 && !sh) { resp->result = errno_result(); break; }
+        if (!sh && fs->save && (mode & 2) && fs_async_on()) sh = fs_shadow_open(p, fd);
         HostFile *f = calloc(1, sizeof *f);
         f->fd = fd;
         f->save = fs->save;
+        f->sh = sh;
         strlcpy(f->path, p, sizeof f->path);
-        ipc_return_object(resp, service_new("IFile", file, f));
+        Service *fsv = service_new("IFile", file, f);
+        if (sh) fsv->on_close = file_shadow_close;
+        ipc_return_object(resp, fsv);
         break;
     }
     case 9: {  // OpenDirectory(mode)
@@ -864,7 +921,10 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         ipc_return_object(resp, service_new("IDirectory", directory, hd));
         break;
     }
-    case 10: if (fs->save) __atomic_store_n(&save_dirty_ns, 0, __ATOMIC_RELAXED); break;  // Commit
+    case 10:  // Commit
+        if (fs->save && fs_async_on()) fs_shadow_commit(fs->root);  // (smooth loading: open copies queued)
+        if (fs->save) __atomic_store_n(&save_dirty_ns, 0, __ATOMIC_RELAXED);
+        break;
     case 11: case 12: OUT(int64_t, 0) = 0x40000000; resp_size(resp, 8); break;
     case 13: rm_rf(p, true); break;
     case 14: memset(resp->data, 0, 0x20); resp_size(resp, 0x20); break;

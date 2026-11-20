@@ -48,6 +48,7 @@ typedef VkSpan CbwinSpan;
 #include "dyn_vi.h"
 #include "../renderer.h"
 #include "../../settings.h"
+#include "../../services/fs_async.h"
 #include "../../paths.h"
 
 // LARECOMP_AB (vk_ab, below): AB() costs no call while it is not set - it is asked per constant buffer and per pass
@@ -3078,7 +3079,7 @@ static bool prewarm_enabled(void) {
         e = (v && *v) ? (atoi(v) != 0) : -1;
         atomic_store_explicit(&pw_env, e, memory_order_relaxed);
     }
-    return e >= 0 ? e != 0 : __atomic_load_n(&g_settings.pipe_prewarm, __ATOMIC_RELAXED);
+    return e >= 0 ? e != 0 : (__atomic_load_n(&g_settings.pipe_prewarm, __ATOMIC_RELAXED) || fs_async_on());  // (smooth loading: on too)
 }
 #endif
 typedef struct {

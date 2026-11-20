@@ -2075,9 +2075,11 @@ void backend_present(NvnTexture *t) {
 void vk_exec_init(void);
 void vk_shaders_init(void);
 
+void fs_async_flush(void);  // (services/fs_async.c)
 // exit() from any thread: let the GPU finish, keep the pipeline cache, then end the process without the DLL
 // teardown (driver / validation-layer threads can stall it for minutes while the game's threads still run).
 static void quick_exit_handler(void) {
+    fs_async_flush();  // (smooth loading: queued save writes out first; no-op when off)
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
     if (g_vk.dev) {
@@ -2133,6 +2135,8 @@ const char *vk_gpu_name(void) { return g_vk.props.deviceName; }
 void nvn_background(bool on);
 static bool SDLCALL background_watch(void *user, SDL_Event *e) {
     (void)user;
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND || e->type == SDL_EVENT_DID_ENTER_BACKGROUND)
+        fs_async_flush();  // (smooth loading: queued save writes out before Android may kill the app; no-op when off)
     if (e->type == SDL_EVENT_DID_ENTER_BACKGROUND) nvn_background(true);
     else if (e->type == SDL_EVENT_WILL_ENTER_FOREGROUND) nvn_background(false);
     return true;

@@ -783,6 +783,11 @@ static void tab_display(void) {
     opt_toggle("Pipeline prewarming (experimental)", &g_settings.pipe_prewarm, false,
                "Records graphics pipelines used in the world and builds them on background workers while a save loads, so "
                "fewer draws wait or skip on first entry. Off by default. Applies the next time a save loads.");
+    opt_toggle("Smooth loading (experimental)", &g_settings.smooth_loading, false,
+               "Reads the game's files ahead on a background thread, writes saves on a background thread (a temporary "
+               "file, synced, then renamed over the save) so the game doesn't wait for storage, and turns on pipeline "
+               "prewarming. Untested on real devices: turn it off if saves or loading misbehave. Off by default. Applies "
+               "the next time the app starts.");
     opt_toggle("32-bit shader math", &g_settings.shader_int32, false,
                "Translates the game's shaders with 32-bit address math, the path used for drivers without 64-bit "
                "integers (Adreno 6xx / 7xx and Mali stock drivers). Try it if lighting, grass or text are missing or wrong "
