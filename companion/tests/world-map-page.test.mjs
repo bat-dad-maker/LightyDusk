@@ -5,7 +5,7 @@ import { runInNewContext } from 'node:vm'
 import { MapCamera } from '../zepp/shared/offline-map.js'
 import { validState } from '../zepp/shared/state.js'
 
-test('página integra telemetria, objetivo, zoom, pan e descarte após fechar', async () => {
+test('page integrates telemetry, goal, zoom, pan and discard after closing', async () => {
   let definition, spin, gesture, next, resolveLate
   const widgets = new Set(), timers = new Map()
   const make = (type, params) => {

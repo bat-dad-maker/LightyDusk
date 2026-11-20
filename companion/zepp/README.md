@@ -1,4 +1,4 @@
-# Recomp Mapa 0.2.1 — Amazfit GTR 4 New
+# Recomp Map 0.2.1 — Amazfit GTR 4 New
 
 External map stored on the clock, with Link position and direction, pins/stamps and mission indicators selected sent by paired mobile phone. The main page does not capture or transmit the image of the minimap.
 

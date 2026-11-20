@@ -74,7 +74,7 @@ public class MainActivity extends Activity {
         List<File[]> drivers = customDrivers();
         if (drivers.isEmpty())
             section("== Drivers customizados\nnenhum em " + new File(getExternalFilesDir(null), "drivers")
-                    + " (copie um libvulkan_freedreno.so ou o .zip do adrenotools para la)\n");
+                    + " (copy a libvulkan_freedreno.so or the adrenotools .zip there)\n");
         for (File[] d : drivers)  // d[0] = folder (internal storage), d[1] = the driver library in it
             section(vulkanProbe(libDir, d[0].getAbsolutePath() + "/", d[1].getName()));
         section("== Fim\n");

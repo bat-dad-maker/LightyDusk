@@ -1,5 +1,5 @@
 # The benchmark's scenes (runtime/hle/benchmark.c): adb push this somewhere in the app's files, then
-#   adb shell am start -n com.botwrecomp.android/com.botwrecompandroid.BOTWRecompAndroidActivity --es env LARECOMP_BENCHMARK=<its path on the device>
+#   adb shell am start -n com.botwrecompandroid.en/com.botwrecompandroid.BOTWRecompAndroidActivity --es env LARECOMP_BENCHMARK=<its path on the device>
 # The report goes to <its path>.out/. A save past the Great Plateau, in the main field, normal mode.
 # pos: X Y Z, a little above the ground is fine. time: 0..360 (180 noon). weather: 0 clear. yaw, pitch: the camera, degrees.
 format = 1

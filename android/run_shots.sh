@@ -9,7 +9,7 @@ SECS=$1 TIMES=$2; shift 2
 mkdir -p android/out/shots
 for cfg in "$@"; do
     tag=${cfg%%:*}; env=${cfg#*:}
-    adb shell am force-stop com.botwrecomp.android
+    adb shell am force-stop com.botwrecompandroid.en
     (for t in ${TIMES//,/ }; do sleep 1; done) >/dev/null
     all="${COMMON:+$COMMON,}$env"
     # (the save's A presses unless the config brings its own LARECOMP_INPUT: a second one, after it, replaced it)
@@ -26,4 +26,4 @@ for cfg in "$@"; do
     fps=$(grep -o "frame [0-9]* [0-9.]* fps" "android/out/boot-$tag.log" | tail -8 | awk '{s+=$3; n++} END {if (n) printf "%.1f", s/n}')
     echo "$tag: $fps fps"
 done
-adb shell am force-stop com.botwrecomp.android
+adb shell am force-stop com.botwrecompandroid.en

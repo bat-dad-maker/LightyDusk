@@ -4,7 +4,7 @@ import { saveAssetMap } from './storage.js'
 // Match the uncompressed RGB565 format emitted by the official asset compiler.
 // Bluetooth still carries the smaller palette frame; expand only on the watch.
 export function displayImage(source) {
-  if (!validImage(source)) throw new Error('Formato de imagem inválido.')
+  if (!validImage(source)) throw new Error('Invalid image format.')
   const data = new Uint8Array(64 + MAP_SIZE * MAP_SIZE * 2)
   data[0] = 46
   data[2] = 2
@@ -27,7 +27,7 @@ export function displayImage(source) {
 // Limit native widgets, merging equal horizontal runs across neighboring rows.
 // Unlike IMG this uses only documented API 1 drawing primitives and no file URI.
 export function previewRects(source) {
-  if (!validImage(source)) throw new Error('Formato de imagem inválido.')
+  if (!validImage(source)) throw new Error('Invalid image format.')
   for (const grid of [80, 60, 48, 40, 30, 24]) {
     const cell = MAP_SIZE / grid
     const rects = []
@@ -55,12 +55,12 @@ export function previewRects(source) {
     }
     if (rects.length <= 600) return rects
   }
-  throw new Error('Mapa fora do limite de desenho.')
+  throw new Error('Map is outside the drawing bounds.')
 }
 
 export function renderMap(ui, fs, state, source, x, y) {
   // Validate the frame before either the file decoder or direct renderer sees it.
-  if (!validImage(source)) throw new Error('Formato de imagem inválido.')
+  if (!validImage(source)) throw new Error('Invalid image format.')
   const path = `map-${state.slot}.png`
   let native = false
   if (!state.directOnly) try {
@@ -94,7 +94,7 @@ export function renderMap(ui, fs, state, source, x, y) {
     if (pool[i]) pool[i].setProperty(ui.prop.MORE, params)
     else {
       pool[i] = ui.createWidget(ui.widget.FILL_RECT, params)
-      if (!pool[i]) throw new Error('Não foi possível desenhar o minimapa.')
+      if (!pool[i]) throw new Error('Could not draw the minimap.')
     }
   }
   while (pool.length > rects.length) ui.deleteWidget(pool.pop())

@@ -5,10 +5,10 @@ import { runInNewContext } from 'node:vm'
 import { MapCamera } from '../zepp/shared/offline-map.js'
 import { validState } from '../zepp/shared/state.js'
 
-test('notificação suspende UI e timers, descarta respostas antigas e retoma sem acumular componentes', async () => {
+test('notification suspends UI and timers, discards old responses and resumes without hoarding components', async () => {
   let page, blocked = false, spin, gesture, timerId = 0, mutations = 0, created = 0, imageLoads = 0
   const timers = new Map(), requests = [], widgets = new Set()
-  const check = () => { assert.equal(blocked, false, 'UI acessada enquanto notificação cobre o app'); mutations++ }
+  const check = () => { assert.equal(blocked, false, 'UI accessed while notification covers the app'); mutations++ }
   const make = (type, params) => {
     check(); created++; if (type === 'IMG') imageLoads++
     const w = { type, params: { ...params }, events: {}, createWidget: make,
@@ -32,7 +32,7 @@ test('notificação suspende UI e timers, descarta respostas antigas e retoma se
   const ui = { widget: Object.fromEntries(['TEXT','FILL_RECT','GROUP','IMG','BUTTON','WIDGET_DELEGATE','CIRCLE'].map(k => [k,k])),
     prop: { MORE: 'more', TEXT: 'text', VISIBLE: 'visible' }, align: {},
     event: { CLICK_DOWN: 'down', MOVE: 'move', CLICK_UP: 'up' }, createWidget: make,
-    deleteWidget() { assert.fail('não deve destruir/recriar componentes durante atualização') } }
+    deleteWidget() { assert.fail('do not destroy/recreate components during upgrade') } }
   const messageBuilder = { request(data) {
     return new Promise((resolve, reject) => requests.push({ id: data.params.requestId, resolve, reject }))
   } }

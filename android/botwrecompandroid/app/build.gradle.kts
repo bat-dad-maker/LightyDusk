@@ -18,11 +18,11 @@ android {
     ndkVersion = "30.0.16248370"
 
     defaultConfig {
-        applicationId = "com.botwrecomp.android"
+        applicationId = "com.botwrecompandroid.en"
         minSdk = 30
         targetSdk = 36
-        versionCode = 47
-        versionName = "0.4.8-beta"
+        versionCode = 48
+        versionName = "0.4.8-en.1"
         ndk {
             abiFilters += "arm64-v8a"
         }

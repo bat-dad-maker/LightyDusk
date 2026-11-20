@@ -121,4 +121,3 @@ const char *settings_language_name(void);
 // "de", "it", "nl", "ru", "ja", "ko", "zh-Hans", "zh-Hant" (the game's languages), else "en". LARECOMP_HOST_LANG=<code>
 // (tests). Elsewhere "en".
 const char *settings_menu_language(void);
-bool settings_host_portuguese(void);  // (settings_menu_language is "pt")

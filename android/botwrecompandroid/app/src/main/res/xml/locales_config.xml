@@ -1,17 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The languages of the app's menus (runtime/ui/i18n_*.inc, res/values-*): Android 13+ lists them under the app's
-     own language in the phone's settings (runtime/settings.c settings_menu_language reads the app's language). -->
+<!-- The app's menus are English only (runtime/ui/i18n.mm, res/values). The game's own text language is a separate
+     in-app setting and is not affected by this list. -->
 <locale-config xmlns:android="http://schemas.android.com/apk/res/android">
     <locale android:name="en" />
-    <locale android:name="pt-BR" />
-    <locale android:name="es" />
-    <locale android:name="fr" />
-    <locale android:name="de" />
-    <locale android:name="it" />
-    <locale android:name="nl" />
-    <locale android:name="ru" />
-    <locale android:name="ja" />
-    <locale android:name="ko" />
-    <locale android:name="zh-Hans" />
-    <locale android:name="zh-Hant" />
 </locale-config>

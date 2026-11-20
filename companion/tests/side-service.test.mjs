@@ -25,7 +25,7 @@ function harness() {
   }
  }
 }
-test('não sobrepõe capturas e correlaciona a imagem ao pedido', async () => {
+test('does not overlap catches and correlates the image to the application', async () => {
  const h=harness()
  const first=h.request()
  await h.request('session-2')
@@ -38,20 +38,20 @@ test('não sobrepõe capturas e correlaciona a imagem ao pedido', async () => {
  assert.equal(h.service.busy,false)
  h.service.onDestroy()
 })
-test('403 não é repassado como imagem', async () => {
+test('403 is not passed on as image', async () => {
  const h=harness(); const pending=h.request()
  h.settle({status:403,body:'Forbidden'}); await pending
  assert.equal(h.responses[0].ok,false)
- assert.match(h.responses[0].message,/incorreto/)
+ assert.match(h.responses[0].message,/Incorrect/)
  assert.equal(h.responses[0].frame,undefined)
 })
-test('destruir o serviço descarta a captura que ainda estava em voo', async () => {
+test('Destroying the service discards the capture that was still in flight', async () => {
  const h=harness(); const pending=h.request()
  h.service.onDestroy(); h.settle({status:503,body:''}); await pending; await flush()
  assert.equal(h.responses.length,0)
 })
 
-test('modo de coordenadas responde sem quadro de imagem e rejeita estado inválido', async () => {
+test('coordinate mode responds without image frame and rejects invalid status', async () => {
  const h=harness();let pending=h.request('session-1','MAP_STATE')
  h.settle({status:200,body:JSON.stringify({version:1,status:'unavailable',player:null,markers:[]})});await pending
  assert.equal(h.responses[0].ok,true)

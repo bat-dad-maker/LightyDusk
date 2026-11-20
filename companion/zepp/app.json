@@ -7,7 +7,7 @@
     "icon": "icon.png",
     "version": { "code": 7, "name": "0.2.1" },
     "vender": "BOTWRecompAndroid",
-    "description": "Mapa local com posição e objetivos do Recomp"
+    "description": "Local map with position and objectives from Recomp"
   },
   "permissions": [],
   "runtime": { "apiVersion": { "compatible": "1.0.0", "target": "1.0.0", "minVersion": "1.0.0" } },
@@ -22,6 +22,6 @@
       "designWidth": 480
     }
   },
-  "i18n": { "pt-BR": { "appName": "Recomp Mapa" }, "en-US": { "appName": "Recomp Map" } },
+  "i18n": { "pt-BR": { "appName": "Recomp Map" }, "en-US": { "appName": "Recomp Map" } },
   "defaultLanguage": "pt-BR"
 }

@@ -5,7 +5,7 @@ export const FRAME_BYTES = 64 + 1024 + MAP_SIZE * MAP_SIZE
 export const FRAME_BASE64_LENGTH = Math.ceil(FRAME_BYTES / 3) * 4
 export function mapURL(token) {
   if (typeof token !== 'string' || !/^[a-f0-9]{32}$/.test(token.trim())) {
-    throw new Error('Configure o código de conexão no aplicativo Zepp.')
+    throw new Error('Set the connection code in the Zepp app.')
   }
   return `http://127.0.0.1:${PORT}/v1/map.json?token=${token.trim()}`
 }

@@ -13,7 +13,7 @@
 //   found in it; exefs/ is copied to its version's extracted/ - <external files>/extracted for 1.0.0, v160/ and v182/
 //   inside it for the others, runtime/paths.h - and romfs.bin built there straight from romfs/) and the Vulkan driver
 //   (a .zip copied to the drivers folder).
-// The data root (game files, saves, settings) is <external files>: /sdcard/Android/data/com.botwrecomp.android/files.
+// The data root (game files, saves, settings) is <external files>: /sdcard/Android/data/com.botwrecompandroid.en/files.
 // While in front it reports the battery and thermal state once a second for the performance overlay
 // (runtime/ui/perf_overlay.mm): apps can't read those in /sys.
 package com.botwrecompandroid;
@@ -120,7 +120,7 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
             setenv("LARECOMP_VK_DRIVER", driver != null ? driver.getAbsolutePath() : "");
             // testing: the runtime's LARECOMP_* switches from the launch intent, separated by commas (adb shell drops
             // the quotes around spaces), e.g. LARECOMP_VK_DRIVER= is the system driver:
-            // adb shell am start -n com.botwrecomp.android/com.botwrecompandroid.BOTWRecompAndroidActivity --es env LARECOMP_NO_LAUNCHER=1,LARECOMP_VK_DRIVER=
+            // adb shell am start -n com.botwrecompandroid.en/com.botwrecompandroid.BOTWRecompAndroidActivity --es env LARECOMP_NO_LAUNCHER=1,LARECOMP_VK_DRIVER=
             String env = getIntent() != null ? getIntent().getStringExtra("env") : null;
             // Opened again from the recent apps, Android hands back that test launch's intent: keep only which game
             // version it ran (a scripted input left in it ignored the touch screen - the menu looked frozen)

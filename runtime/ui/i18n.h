@@ -1,7 +1,6 @@
-// The menus' text in the phone's language (Android; settings_menu_language): each English string looked up in that
-// language's ui/i18n_<lang>.inc - Brazilian Portuguese and the game's other languages (Spanish, French, German,
-// Italian, Dutch, Russian, Japanese, Korean, Simplified and Traditional Chinese) -, anything not in it shown as written.
-// Elsewhere tr() is the string itself. Display text only: labels used as ImGui IDs stay the English ones.
+// The menus' text. This build ships English menus only, so tr() returns the English string as written; the call
+// sites are kept so a translation table could be added back later. Display text only: labels used as ImGui IDs stay
+// the English ones.
 #pragma once
 #include <string>
 

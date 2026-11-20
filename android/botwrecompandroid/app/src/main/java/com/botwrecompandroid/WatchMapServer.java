@@ -74,7 +74,7 @@ final class WatchMapServer {
             worker.setDaemon(true);
             worker.start();
         } catch (IOException e) {
-            Toast.makeText(activity, "Não foi possível abrir a conexão do relógio (porta 18880).", Toast.LENGTH_LONG).show();
+            Toast.makeText(activity, "Could not open the watch connection (port 18880).", Toast.LENGTH_LONG).show();
         }
     }
 
@@ -156,7 +156,7 @@ final class WatchMapServer {
             if (!resumed || listener != server || frame == null) throw new IOException("Paused");
             reply(client, 200, legacy ? "application/json" : "image/png", frame);
         } catch (Exception e) {
-            reply(client, 503, "text/plain", "Abra o jogo e deixe o minimapa visível.".getBytes(StandardCharsets.UTF_8));
+            reply(client, 503, "text/plain", "Open the game and keep the minimap visible.".getBytes(StandardCharsets.UTF_8));
         }
     }
 
@@ -221,32 +221,32 @@ final class WatchMapServer {
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(32, 12, 32, 8);
         CheckBox enabled = new CheckBox(activity);
-        enabled.setText("Compartilhar posição e marcadores com o relógio");
+        enabled.setText("Share position and markers with the watch");
         enabled.setChecked(prefs.getBoolean("enabled", false));
         panel.addView(enabled);
         TextView code = new TextView(activity);
-        code.setText("Código de conexão (cole nas configurações do app Recomp Mapa no Zepp):\n" + token);
+        code.setText("Connection code (paste it into the Recomp Map app settings in Zepp):\n" + token);
         code.setTextIsSelectable(true);
         panel.addView(code);
         CheckBox letterbox = new CheckBox(activity);
-        letterbox.setText("Jogo em proporção 16:9 (com barras laterais)");
+        letterbox.setText("Game in 16:9 aspect ratio (with side bars)");
         letterbox.setChecked(prefs.getBoolean("letterbox", true));
         panel.addView(letterbox);
         TextView label = new TextView(activity);
-        label.setText("Área do minimapa em %: esquerda, topo, direita, base.\nMantenha o minimapa visível; menus também aparecem na captura.");
+        label.setText("Minimap area in %: left, top, right, bottom.\nKeep the minimap visible; menus also show up in the capture.");
         panel.addView(label);
         EditText crop = new EditText(activity);
         crop.setSingleLine(true);
         crop.setText(String.format(Locale.US, "%.1f, %.1f, %.1f, %.1f", prefs.getFloat("left", .79f) * 100,
             prefs.getFloat("top", .70f) * 100, prefs.getFloat("right", .95f) * 100, prefs.getFloat("bottom", .98f) * 100));
         panel.addView(crop);
-        AlertDialog dialog = new AlertDialog.Builder(activity).setTitle("Mapa no relógio").setView(panel)
-            .setNegativeButton("Cancelar", null).setNeutralButton("Copiar código", null).setPositiveButton("Salvar", null).create();
+        AlertDialog dialog = new AlertDialog.Builder(activity).setTitle("Watch map").setView(panel)
+            .setNegativeButton("Cancel", null).setNeutralButton("Copy code", null).setPositiveButton("Save", null).create();
         dialog.setOnShowListener(ignored -> {
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
                 ClipboardManager clipboard = (ClipboardManager) activity.getSystemService(Context.CLIPBOARD_SERVICE);
                 clipboard.setPrimaryClip(ClipData.newPlainText("Recomp Map", token));
-                Toast.makeText(activity, "Código copiado", Toast.LENGTH_SHORT).show();
+                Toast.makeText(activity, "Code copied", Toast.LENGTH_SHORT).show();
             });
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
                 try {

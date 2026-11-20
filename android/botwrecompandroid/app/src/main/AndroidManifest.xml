@@ -22,7 +22,7 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
 
     <application
-        android:label="BOTWRecompAndroid"
+        android:label="BOTWRecompAndroid EN"
         android:icon="@mipmap/ic_launcher"
         android:appCategory="game"
         android:isGame="true"

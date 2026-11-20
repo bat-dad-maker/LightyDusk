@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { MapCamera, MAP } from '../zepp/shared/offline-map.js'
 import { stateURL, validState } from '../zepp/shared/state.js'
 
-test('seguir Link, arrastar, zoom e recentrar mantêm coordenadas consistentes', () => {
+test('follow Link, drag, zoom and recentrate keep consistent coordinates', () => {
   const camera=new MapCamera(),player={x:-859.4,z:1816}
   camera.center(player)
   assert.deepEqual(camera.project(player),{x:160,y:160})
@@ -18,7 +18,7 @@ test('seguir Link, arrastar, zoom e recentrar mantêm coordenadas consistentes',
   assert.deepEqual(camera.project(player),{x:160,y:160})
 })
 
-test('tiles cobrem a janela sem lacunas, exceder limites ou carregar tiles invisíveis', () => {
+test('tiles cover the window without gaps, exceed limits or load invisible tiles', () => {
   const camera=new MapCamera()
   for(const level of [1,2,3]) for(const x of [-5000,-859.4,0,5000]) for(const z of [-5000,1816,5000]) {
     camera.level=level;camera.x=x;camera.z=z;camera.clamp()
@@ -33,14 +33,14 @@ test('tiles cobrem a janela sem lacunas, exceder limites ou carregar tiles invis
   }
 })
 
-test('zoom geral enquadra o mapa inteiro e o zoom respeita os níveis disponíveis', () => {
+test('general zoom frame the entire map and zoom respect the available levels', () => {
   const camera=new MapCamera();camera.zoom(-10)
   assert.equal(camera.level,0);assert.equal(camera.x,0);assert.equal(camera.z,0)
   assert.equal(camera.tiles().length,4)
   camera.zoom(99);assert.equal(camera.level,MAP.levels.length-1)
 })
 
-test('telemetria aceita posição real e rejeita vetores inválidos e excesso de marcadores', () => {
+test('telemetry accepts real position and rejects invalid vectors and excess markers', () => {
   const s={version:1,status:'ready',session:'1-1',sequence:1,sampleAgeMs:0,map:'MainField',
     player:{x:-859.4,y:204,z:1816,headingDegrees:24},markers:[{id:0,type:1,x:100,z:200}]}
   assert.equal(validState(s),true)

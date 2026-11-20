@@ -1,16 +1,16 @@
 AppSettingsPage({
   build(props) {
     return Section({}, [
-      Text({ style: { fontSize: '20px', fontWeight: 'bold' } }, ['BOTWRecompAndroid • Mapa no relógio']),
-      Text({}, ['No Android, mantenha pressionado o ícone do BOTWRecompAndroid e abra “Mapa no relógio”. Ative o compartilhamento e copie o código abaixo.']),
+      Text({ style: { fontSize: '20px', fontWeight: 'bold' } }, ['BOTWRecompAndroid • Watch map']),
+      Text({}, ['On Android, long-press the BOTWRecompAndroid icon and open “Watch map”. Turn on sharing and copy the code below.']),
       TextInput({
-        label: 'Código de conexão',
-        placeholder: 'Cole o código de 32 caracteres',
+        label: 'Connection code',
+        placeholder: 'Paste the 32-character code',
         value: props.settingsStorage.getItem('connectionToken') || '',
         onChange: (value) => props.settingsStorage.setItem('connectionToken', value.trim().toLowerCase())
       }),
-      Text({}, ['Abra o jogo e o Recomp Mapa no relógio. Gire a coroa para ajustar o zoom, arraste para explorar e toque em Centrar Link para voltar a acompanhar o personagem.']),
-      Text({}, ['O mapa fica no relógio. O celular pareado envia somente a posição, direção e os marcadores pelo Zepp, sem servidor na internet.'])
+      Text({}, ['Open the game and Recomp Map on the watch. Turn the crown to zoom, drag to explore, and tap Center Link to follow the character again.']),
+      Text({}, ['The map is stored on the watch. The paired phone only sends position, heading and markers through Zepp, with no internet server.'])
     ])
   }
 })

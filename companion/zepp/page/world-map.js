@@ -39,7 +39,7 @@ Page({
     }
     this.status = label(height - 83, 25, 17, 0xc9d9d9, 'Conectando ao celular…')
     hmUI.createWidget(hmUI.widget.BUTTON, { x: Math.round(width / 2) - 65, y: height - 55,
-      w: 130, h: 32, radius: 12, text: 'Centrar Link', text_size: 18, color: 0xe6c36a,
+      w: 130, h: 32, radius: 12, text: 'Center Link', text_size: 18, color: 0xe6c36a,
       normal_color: 0x17383c, press_color: 0x28565b,
       click_func: () => { if (this.canUpdate()) { this.camera.center(this.player); this.draw() } } })
     hmUI.createWidget(hmUI.widget.WIDGET_DELEGATE, {
@@ -75,7 +75,7 @@ Page({
     const generation = this.generation
     this.timer = setInterval(() => {
       if (!this.canUpdate() || generation !== this.generation) return
-      if (this.received && Date.now() - this.received > 5000) this.status.setProperty(hmUI.prop.TEXT, 'Posição desatualizada')
+      if (this.received && Date.now() - this.received > 5000) this.status.setProperty(hmUI.prop.TEXT, 'Position out of date')
       this.poll()
     }, 1000)
   },
@@ -173,16 +173,16 @@ Page({
     this.messageBuilder.request({ method: 'MAP_STATE', params: { requestId: id } }, { timeout: 10000 })
       .then(result => {
         if (!this.canUpdate() || generation !== this.generation || this.pending !== id) return
-        if (!result.ok) throw new Error(result.message || 'Sem conexão com o Recomp.')
-        if (result.requestId !== id || !validState(result.state)) throw new Error('Estado inválido.')
+        if (!result.ok) throw new Error(result.message || 'No connection to Recomp.')
+        if (result.requestId !== id || !validState(result.state)) throw new Error('Invalid state.')
         const state = result.state
         if (state.status === 'ready' && this.state && this.state.session === state.session && state.sequence <= this.state.sequence) return
         this.state = state; this.player = state.player; this.received = Date.now()
         if (this.player && this.camera.follow) this.camera.center(this.player)
         this.draw()
         this.status.setProperty(hmUI.prop.TEXT, state.status === 'ready' ?
-          (state.objectivesAvailable === false ? 'Link conectado • missão indisponível' : 'Link conectado') :
-          state.status === 'interior' ? 'Interior • mapa externo' : 'Aguardando Link no jogo')
+          (state.objectivesAvailable === false ? 'Link connected • quest unavailable' : 'Link connected') :
+          state.status === 'interior' ? 'Interior • overworld map' : 'Waiting for Link in the game')
       }).catch(error => {
         if (this.canUpdate() && generation === this.generation) this.status.setProperty(hmUI.prop.TEXT, error.message || 'Abra o Zepp e o Recomp.')
       }).finally(() => { if (this.pending === id) this.pending = null })

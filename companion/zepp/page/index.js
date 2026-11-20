@@ -20,7 +20,7 @@ Page({
     hmUI.createWidget(hmUI.widget.FILL_RECT, { x: 0, y: 0, w: width, h: height, color: 0x061a20 })
     text(40, 36, 26, 0xe6c36a, 'RECOMP MAPA')
     this.status = text(height - 110, 48, 20, 0xc9d9d9, 'Conectando ao celular…')
-    this.age = text(height - 60, 30, 18, 0x80999f, 'Minimapa do jogo')
+    this.age = text(height - 60, 30, 18, 0x80999f, 'Game minimap')
     hmUI.createWidget(hmUI.widget.WIDGET_DELEGATE, {
       resume_call: () => { this.active = true; this.poll() },
       pause_call: () => { this.active = false }
@@ -29,7 +29,7 @@ Page({
       if (!this.active || this.closed) return
       if (this.lastSample) {
         const seconds = Math.max(0, Math.floor((Date.now() - this.lastSample) / 1000))
-        this.age.setProperty(hmUI.prop.TEXT, `pedido há ${seconds} s`)
+        this.age.setProperty(hmUI.prop.TEXT, `requested ${seconds} s ago`)
       }
       this.poll()
     }, INTERVAL_MS)
@@ -44,14 +44,14 @@ Page({
       .then((result) => {
         if (this.closed || !this.active || this.pending !== id) return
         if (!result.ok) throw new Error(result.message || 'Abra o Recomp no celular.')
-        if (result.requestId !== id || !validFrame(result.frame)) throw new Error('Imagem inválida ou atrasada.')
+        if (result.requestId !== id || !validFrame(result.frame)) throw new Error('Invalid or late image.')
         const decoded = Buffer.from(result.frame.data, 'base64')
-        if (!validImage(decoded)) throw new Error('Formato de imagem inválido.')
+        if (!validImage(decoded)) throw new Error('Invalid image format.')
         this.slot = 1 - this.slot
         const mode = renderMap(hmUI, hmFS, this, decoded,
           Math.round((this.width - MAP_SIZE) / 2), Math.round((this.height - MAP_SIZE) / 2) - 12)
         this.lastSample = started
-        this.status.setProperty(hmUI.prop.TEXT, mode === 'image' ? 'Minimapa conectado' : 'Minimapa • modo compatível')
+        this.status.setProperty(hmUI.prop.TEXT, mode === 'image' ? 'Minimap connected' : 'Minimap • compatibility mode')
       }).catch((error) => {
         if (!this.closed && this.active && this.pending === id) this.status.setProperty(hmUI.prop.TEXT, error.message || 'Abra o Zepp no celular.')
       }).finally(() => { if (this.pending === id) this.pending = null })

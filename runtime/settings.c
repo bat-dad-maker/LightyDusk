@@ -98,49 +98,9 @@ const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English"
                                                    "Chinese (Traditional)", "Portuguese (Brazil)",
                                                    "Spanish (Latin America)", "French (Canada)"};
 
-// The app's own menus (ui/i18n.mm): the game's Language when one is chosen - one setting for both, read once (the menus
-// change when the app starts again) - else the phone's first preferred language, which is the app's own when Android
-// 13+ has one set for it (res/xml/locales_config.xml)
-const char *settings_menu_language(void) {
-#ifdef __ANDROID__
-    static const char *lang;
-    if (!lang) {
-        char l[16] = "", country[16] = "";
-        const char *e = getenv("LARECOMP_HOST_LANG");
-        int chosen = g_settings.language;
-        if (!(e && *e) && chosen > LANG_AUTO && chosen < N_LANGUAGES) {
-            static const char *const menu[N_LANGUAGES] = {"en", "ja", "en", "es", "fr", "de", "it", "nl", "ru", "ko",
-                                                          "zh-Hans", "zh-Hant", "pt", "es", "fr"};  // (g_language_codes' order)
-            return lang = menu[chosen];
-        }
-        if (e && *e) {
-            snprintf(l, sizeof l, "%s", e);
-            char *dash = strchr(l, '-');
-            if (dash) snprintf(country, sizeof country, "%s", dash + 1), *dash = 0;
-        } else {  // (the phone's first preferred language, through SDL)
-            int n = 0;
-            SDL_Locale **loc = SDL_GetPreferredLocales(&n);
-            if (loc && n > 0 && loc[0]->language) {
-                snprintf(l, sizeof l, "%s", loc[0]->language);
-                if (loc[0]->country) snprintf(country, sizeof country, "%s", loc[0]->country);
-            }
-            SDL_free(loc);
-        }
-        static const char *const own[] = {"pt", "es", "fr", "de", "it", "nl", "ru", "ja", "ko"};
-        lang = "en";
-        for (size_t i = 0; i < sizeof own / sizeof *own; i++)
-            if (!strcmp(l, own[i])) lang = own[i];
-        if (!strcmp(l, "zh"))  // (Taiwan, Hong Kong, Macau: traditional characters)
-            lang = !strcmp(country, "TW") || !strcmp(country, "HK") || !strcmp(country, "MO") || !strcmp(country, "Hant")
-                       ? "zh-Hant" : "zh-Hans";
-    }
-    return lang;
-#else
-    return "en";
-#endif
-}
-
-bool settings_host_portuguese(void) { return !strcmp(settings_menu_language(), "pt"); }
+// The app's own menus (ui/i18n.mm) are English only in this build. The game's own text language
+// (g_settings.language) is separate and still follows the user's choice.
+const char *settings_menu_language(void) { return "en"; }
 
 // LANG_AUTO: the host's own language (LANG=es_ES.UTF-8 -> es), en-US when it is none of the game's. Linux only:
 // macOS / Windows apps get no locale variables from the system, so Auto is English there (pick one in settings).

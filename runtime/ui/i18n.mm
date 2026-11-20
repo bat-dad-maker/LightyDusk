@@ -20,74 +20,8 @@ extern "C" {
 #include "../settings.h"
 }
 
-#ifdef __ANDROID__
-typedef const char *const Pair[2];
-static const char *const kPt[][2] = {
-#include "i18n_pt.inc"
-};
-static const char *const kEs[][2] = {
-#include "i18n_es.inc"
-};
-static const char *const kFr[][2] = {
-#include "i18n_fr.inc"
-};
-static const char *const kDe[][2] = {
-#include "i18n_de.inc"
-};
-static const char *const kIt[][2] = {
-#include "i18n_it.inc"
-};
-static const char *const kNl[][2] = {
-#include "i18n_nl.inc"
-};
-static const char *const kRu[][2] = {
-#include "i18n_ru.inc"
-};
-static const char *const kJa[][2] = {
-#include "i18n_ja.inc"
-};
-static const char *const kKo[][2] = {
-#include "i18n_ko.inc"
-};
-static const char *const kZhHans[][2] = {
-#include "i18n_zh_hans.inc"
-};
-static const char *const kZhHant[][2] = {
-#include "i18n_zh_hant.inc"
-};
-
-// The menu language's table (settings_menu_language), NULL for English
-struct Table { const char *code; Pair *rows; size_t n; };
-#define TABLE(code, t) {code, t, sizeof t / sizeof *t}
-static const Table kTables[] = {TABLE("pt", kPt), TABLE("es", kEs), TABLE("fr", kFr), TABLE("de", kDe), TABLE("it", kIt),
-                                TABLE("nl", kNl), TABLE("ru", kRu), TABLE("ja", kJa), TABLE("ko", kKo),
-                                TABLE("zh-Hans", kZhHans), TABLE("zh-Hant", kZhHant)};
-static const Table *menu_table(void) {
-    static const Table *t = [] {
-        const char *code = settings_menu_language();
-        for (const Table &k : kTables)
-            if (!strcmp(k.code, code)) return &k;
-        return (const Table *)NULL;
-    }();
-    return t;
-}
-#endif
-
-const char *tr(const char *en) {
-#ifdef __ANDROID__
-    const Table *t = en && *en ? menu_table() : NULL;
-    if (!t) return en;
-    static const auto *map = [t] {  // (built once, thread-safe: the start screen's callbacks run on Java's threads)
-        auto *m = new std::unordered_map<std::string, const char *>();
-        for (size_t i = 0; i < t->n; i++) m->emplace(t->rows[i][0], t->rows[i][1]);
-        return m;
-    }();
-    auto it = map->find(en);
-    return it == map->end() ? en : it->second;
-#else
-    return en;
-#endif
-}
+// Menus are English only: tr() returns the string as written.
+const char *tr(const char *en) { return en; }
 
 std::string ui_upper(const char *s) {
     std::string t = s ? s : "";

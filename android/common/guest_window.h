@@ -1,4 +1,4 @@
-// Guest window placement on Android (docs/las/ANDROID-PORT.md, "Janela de memória dinâmica"): the game's memory goes in
+// Guest window placement on Android (docs/las/ANDROID-PORT.md, "Dynamic memory window"): the game's memory goes in
 // a free hole of the process's address space chosen at startup from /proc/self/maps, instead of the desktop's fixed
 // 0x70_0000_0000. Guest addresses stay host addresses; only where the window starts changes.
 #pragma once

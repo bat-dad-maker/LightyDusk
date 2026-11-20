@@ -21,7 +21,7 @@ function filesystem(result, size = FRAME_BYTES) {
   })
 }
 
-test('imagem completa é aceita com retorno zero, contagem de bytes ou sem retorno', () => {
+test('Full image is accepted with zero return, byte count or no return', () => {
   for (const result of [0, FRAME_BYTES, undefined]) {
     const fs = filesystem(result)
     assert.doesNotThrow(() => saveMap(fs, 'map-0.png', new Uint8Array(FRAME_BYTES)))
@@ -29,31 +29,31 @@ test('imagem completa é aceita com retorno zero, contagem de bytes ou sem retor
   }
 })
 
-test('retorno aparentemente bem-sucedido não encobre imagem truncada', () => {
+test('apparently successful return does not cover truncated image', () => {
   for (const result of [0, FRAME_BYTES]) {
     const fs = filesystem(result, FRAME_BYTES - 1)
-    assert.throws(() => saveMap(fs, 'map-0.png', new Uint8Array(FRAME_BYTES)), /Mapa incompleto/)
+    assert.throws(() => saveMap(fs, 'map-0.png', new Uint8Array(FRAME_BYTES)), /Map incomplete/)
     assert.equal(fs.closed, true)
   }
 })
 
-test('erro de disco preserva o código e fecha o arquivo', () => {
+test('disk error preserves code and closes file', () => {
   for (const code of [-1, -12, -13, -18]) {
     const fs = filesystem(code)
     assert.throws(() => saveMap(fs, 'map-0.png', new Uint8Array(FRAME_BYTES)),
-      code === -12 || code === -13 ? /Sem espaço/ : new RegExp(`\\(${code}\\)`))
+      code === -12 || code === -13 ? /No space/ : new RegExp(`\\(${code}\\)`))
     assert.equal(fs.closed, true)
   }
 })
 
-test('falhas ao abrir, gravar e consultar tamanho não viram sucesso', () => {
+test('failure to open, record and query size did not see success', () => {
   const bytes = new Uint8Array(FRAME_BYTES)
   const open = filesystem(0); open.open = () => -7
-  assert.throws(() => saveMap(open, 'map-0.png', bytes), /abrir mapa \(-7\)/)
+  assert.throws(() => saveMap(open, 'map-0.png', bytes), /open map \(-7\)/)
   assert.equal(open.writes, 0)
   const write = filesystem(0); write.write = () => { throw new Error('Native write failed') }
   assert.throws(() => saveMap(write, 'map-0.png', bytes), /Native write/)
   assert.equal(write.closed, true)
   const stat = filesystem(0); stat.stat = () => [null, -4]
-  assert.throws(() => saveMap(stat, 'map-0.png', bytes), /verificar mapa \(-4/)
+  assert.throws(() => saveMap(stat, 'map-0.png', bytes), /check map \(-4/)
 })
