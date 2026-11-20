@@ -202,7 +202,7 @@ Continuation of the above analysis, same date. Step 3 of the suggested sequence 
 
 Profile of the render thread on the Qualcomm driver (simpleperf, plateau): ~37 ms per frame, 22% on `memcpy` coming from `guest_copy`. Measurement of copies: ~120 MB per frame, ~90 MB of this in **vertices and indexes** copied to each frame. In Turnip they are read directly from the heap (`guest_direct`); the vertices cache (`vc_*`) existed, but requires page writing tracking, which Android did not have.
 
-- ** Screenplay on Android** (`runtime/platform/android.c`, only in copy mode without placed memory):
+- **Screenplay on Android** (`runtime/platform/android.c`, only in copy mode without placed memory):
   - `plat_written_pages` leaves the pages consulted read only. The first writing of the game generates SIGSEGV; the handler marks the page as written and releases it.
   - It also covers a writing that crosses the border between two pages.
   - `pread` s of `fs` release target pages (`plat_write_prepare`), because a kernel writing does not generate a missing one, it returns EFAULT.
@@ -212,7 +212,7 @@ Profile of the render thread on the Qualcomm driver (simpleperf, plateau): ~37 m
   - ~12,500 cache hits per frame, ~30 KB updated per frame and ~23 page fouls per frame.
   - UBO copies: ~15 MB per frame, equal to Turnip.
   - **Render thread: ~37 → ~18,5 ms.** Correct image.
-- ** Also:** each submission slot has its own command pool, restarted whole with `vkResetCommandPool`. Before, the implicit reset in `vkBeginCommandBuffer` returned and relocated driver memory.
+- **Also:** each submission slot has its own command pool, restarted whole with `vkResetCommandPool`. Before, the implicit reset in `vkBeginCommandBuffer` returned and relocated driver memory.
 - **Why the fps hardly went up (~15–17):** the frame is serial. The game waits for the fence of the frame it has just sent; the render thread translates (~18 ms); only then does the GPU work (~17–26 ms). All added up goes from 33 ms and rounds to 3–4 vsyncs.
   - The sending in pieces (`LARECOMP_VK_CHUNK_US`), which in Turnip overlaps translation and GPU, here doubles the busy time of the GPU (~38 ms) and does not change the period, probably because the clock of the GPU falls at intervals.
   - Next candidates: the driver's own cost per draw (`vkUpdateDescriptorSets` and `vkAllocateDescriptorSets` ~18%, `vkCmdBeginRendering` ~9%, `vkCmdDrawIndexed` ~10%) and understand the clock drop with shipping in pieces.

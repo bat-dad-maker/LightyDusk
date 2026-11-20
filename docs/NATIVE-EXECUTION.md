@@ -32,7 +32,7 @@ The runtime was made for the recompiled code, but almost everything around it is
 
 - **Memory:** the guest already lives at his addresses (window 0x100000000-0x420000000, `main` at 0x100000000) and the recompiled code reads direct pointers (`LD64(a)` is `*(u64 *)a`). The original code would see the same memory.
 - **Kernel and services:** `kernel.c` (threads, synchronization, core 0), IPC services, FS and romfs, audio, HID, DLC and saves receive `svc` and calls with a `Cpu *` - an assembly port mounts this struct with the registers and calls the same C.
-- ** NVN, Vulkan, shaders, pacifying, widescreen, upscalers, Android app, launcher:** nothing changes; the NVN entries that the game takes by `nvnBootstrapLoader` would become thunks in assembly for the same `NVN(...)`.
+- **NVN, Vulkan, shaders, pacifying, widescreen, upscalers, Android app, launcher:** nothing changes; the NVN entries that the game takes by `nvnBootstrapLoader` would become thunks in assembly for the same `NVN(...)`.
 
 ## What changes
 
@@ -80,7 +80,7 @@ In a branch, behind `LARECOMP_NATIVE=1`, in 1.0.0 (the simplest version) and the
 ## After P0: no compilation on mobile (2026-10-27)
 
 - **Configuration** "Native game code (experimental)" (Video, Android; `native_code` no ini, disconnected by default; `LARECOMP_NATIVE=0/1` passes over: with it the boot does not load `botwgame.so` and the configuration of the game files skips the compilation (the launcher no longer asks for "The game code needs building").
-- ** `tools/patches.py` corrections **turned stubs (`stub_fix`, `native_patch_gate`): the handler in C works on `Cpu` and chooses how to follow - the original instruction (copied on stub), skip it, the other address of the correction, or `ret`. The 12 (1.0.0: 2, 1.6.0: 2, 1.8.2: 4, 1.9.0: 4) confer the original word before switching.
+- **`tools/patches.py` corrections **turned stubs (`stub_fix`, `native_patch_gate`): the handler in C works on `Cpu` and chooses how to follow - the original instruction (copied on stub), skip it, the other address of the correction, or `ret`. The 12 (1.0.0: 2, 1.6.0: 2, 1.8.2: 4, 1.9.0: 4) confer the original word before switching.
 - **Restart** (`LARECOMP_REBOOT_AT=3600:game`): 45 threads stopped at 20 ms, the game disassembled and reassembled, native again to the title screen. Threads stop at `svc` and calls to runtime, as before.
 - **Crash report:** a failure within the game code copies the signal loggers to the `Cpu` (the report shows the game's and the caller chain) and names the pc for the modules' symbols (`main+offset`).
 - **Test:** 1.9.0 (title, world, restart) and 1.0.0 (title, world). A round of 1.0.0 fell after ~25 s in the world (`nvnBufferGetAddress` received from the game an object with 0x600000001 in place of the pointer); the same round again passed 2 min without falling: a race that the native time exposes. 1.6.0 and 1.8.2 were not tested.
@@ -88,7 +88,7 @@ In a branch, behind `LARECOMP_NATIVE=1`, in 1.0.0 (the simplest version) and the
 ## In play by user (2026-10-27, 1.9.0, Sync lag off)
 
 - 58-60 fps are largely stable, with CPU ~1 GHz and 35% of use; more falls than recompiled.
-- ** Correction, same day:** the tips in the cloud and fog in a blow ** are not native**. The user saw them in the recompiled also, with and without Sync lag, at 30 and 60 fps, without rounding texture coordinates (`LARECOMP_NO_VS_SNAP=1`) and in published versions 0.2.1 and 0.2.0 (recompiled with versionCode 19 and 20 for the test): an old defect that had just not been noticed. The curtains are also the old bug. What follows is the account as it was done:
+- **Correction, same day:** the tips in the cloud and fog in a blow ** are not native**. The user saw them in the recompiled also, with and without Sync lag, at 30 and 60 fps, without rounding texture coordinates (`LARECOMP_NO_VS_SNAP=1`) and in published versions 0.2.1 and 0.2.0 (recompiled with versionCode 19 and 20 for the test): an old defect that had just not been noticed. The curtains are also the old bug. What follows is the account as it was done:
 - **Native only defects** (in the recompiled, in the same session, none of this):
   - In a blow, the cloud of the Mountain of Death (and the mist of the horizon) stretches sideways at ends by a picture** (recording 19:30, ~1:11, next to the spark of the hit). Link blinks sometimes when he takes the first blow or takes the first blow.
   - The ground curtains ([botw-stretched-vertices]) often appear: in conversation with the old man just after the tower and far away on the Great Plateau. For this old bug the native mode is almost guaranteed playback.

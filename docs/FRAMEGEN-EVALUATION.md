@@ -24,7 +24,7 @@ Question: Is the LASRecompAndroid framegen for BOTW? Abstract: **serve as option
 
 ## Expected quality in BOTW style
 
-- ** Good:** Turn and camera displacement in open field, the most common case. Deeply reprojected handles this well, and the grass with alpha-test is in the depth buffer.
+- **Good:** Turn and camera displacement in open field, the most common case. Deeply reprojected handles this well, and the grass with alpha-test is in the depth buffer.
 - **Fraco:**
   - Particles, water, smoke, fog and glass are not deep and "grabbing" along with whatever's behind.
   - Borders of moving objects open holes (disocclusion), filled with the neighbor.

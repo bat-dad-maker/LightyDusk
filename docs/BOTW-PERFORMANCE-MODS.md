@@ -26,7 +26,7 @@ This document consolidates the technical analysis and the in-depth survey of all
 
 ## 1. Grounds for BOTW Engine and Original Gargals
 
-The *Breath of the Wild* engine was developed on Nintendo's proprietary framework ** `sead` ** using Nintendo's physics library **Havok** and the game subsystem ** `ksys` ** (*KingSystem*). It is designed exclusively for fixed hardware limitations of Wii U and Nintendo Switch (Tegra X1):
+The *Breath of the Wild* engine was developed on Nintendo's proprietary framework **`sead`** using Nintendo's physics library **Havok** and the game subsystem **`ksys`** (*KingSystem*). It is designed exclusively for fixed hardware limitations of Wii U and Nintendo Switch (Tegra X1):
 
 1. ** Frame-Based Simulation Logic (30 FPS Fixed):**
    - The simulation loop advances at discrete intervals based on the assumption that 1 frame equals exactly $\frac{1}{30}\text{s} \approx 33.33\text{ms}$.
@@ -72,7 +72,7 @@ The *Breath of the Wild* engine was developed on Nintendo's proprietary framewor
 
 #### 1. Game Speed Calculation (`patch_GameSpeed.asm`)
 Intercepts the main motor time count function (`0x031FA97C` in the Wii U v208 executable).
-- ** Tick measurement:** Reads the difference of barrier clocks (`timerTickSpeed = 62156250 Hz`).
+- **Tick measurement:** Reads the difference of barrier clocks (`timerTickSpeed = 62156250 Hz`).
 - **Mobile Media Circular Buffer:** Maintains a history of 4 to 32 frames to dampen instantaneous peaks (*frame packing spikes*).
 - ==References====External links==* Official website* Official website* Official website* Official website* Official website
 
@@ -82,13 +82,13 @@ Intercepts the main motor time count function (`0x031FA97C` in the Wii U v208 ex
 - **Balistic Arrows (`0x020E5510`, `0x020E3EB0`):** Replaces static constants of gravity and impulse by `averageFPS30Inv` and `averageFPS0.5` to preserve the trajectory and distance of the straight shot.
 - **Stamina Regeneration (`0x02D90D88`):** Loads the dynamic variable `averageFPS30` in place of fixed float `30.0f`.
 - **Ragdolls physics (`patch_Ragdolls.asm`):**In the original game, the `RagdollApplyForce` function applied forces multiplied by the frame delta. At high rates, a single blow threw enemies off the map. The patch locks the ragdoll timestep in the constant float `0.03333334f` ($1/30$).
-- ** Water Physics (`patch_WaterPhysics.asm`):** The quadratic scaling of the drag in the water made floating objects not slow down. The patch introduced a formula with linear damping factor (`0.45f`): $$\text{timestep}_{\text{final}}} = \left((\text{timestep}_{30} - 1.0) \times 0.45 + 1.0\right) \times \text{timescale}$
+- **Water Physics (`patch_WaterPhysics.asm`):** The quadratic scaling of the drag in the water made floating objects not slow down. The patch introduced a formula with linear damping factor (`0.45f`): $$\text{timestep}_{\text{final}}} = \left((\text{timestep}_{30} - 1.0) \times 0.45 + 1.0\right) \times \text{timescale}$
 - **Koroks chase (`patch_KorokChasing.asm`):**Hold the speed of Korok's brightness on the ground so they don't walk twice the speed.
-- ** Menu and Map navigation (`0x03415C1C`, `0x02F62B3C`):** Apply `averageFPS1Inv` to the map cursor speed and GUI.
+- **Menu and Map navigation (`0x03415C1C`, `0x02F62B3C`):** Apply `averageFPS1Inv` to the map cursor speed and GUI.
 
 #### 3. Synchronization and Fences Optimization (`patch_FenceMethod.asm` and `patch_VSync.asm`):
 - **SkipFence / PerformanceFence:** BOTW emits frequent speeds to check completion of GPU commands. The patch implemented the option to skip non-essential CPU feces, releasing thread time to the emulator.
-- ** SwapInterval Control:** Allows to force the interval swap of the video subsystem to 0 (without lock/unlock), 1 (60 FPS) or 2 (30 FPS).
+- **SwapInterval Control:** Allows to force the interval swap of the video subsystem to 0 (without lock/unlock), 1 (60 FPS) or 2 (30 FPS).
 
 ---
 
@@ -106,7 +106,7 @@ For the version **v1.6.0** (TitleID `01007EF00011E000`, Build ID `8E9978D50BDD20
 04000000 01614DA4 12000021   ; and w1, w1, #1 (Ignora clamp minimum of 2 vsyncs)
 ```
 - **How it works:** Forces the `sead::Framework` loop to submit the frame every 1 vsync (60 Hz) and fixes the step multiplier to 1.0.
-- ** Problem:** When the rate falls below 60 FPS (e.g. 40 FPS), the game suffers the proportional slow motion effect.
+- **Problem:** When the rate falls below 60 FPS (e.g. 40 FPS), the game suffers the proportional slow motion effect.
 
 #### 2. Dynamic FPS (BOTW-DFPS / TOTK-DFPS per somerando and ChuckLiddell)
 Created to remedy the limitation of the 60 static FPS:
@@ -167,7 +167,7 @@ In tests performed at **Xiaomi POCO F7 Ultra (Snapdragon 8 Elite / Adreno 830v1)
 - **Evolution of Performance at the Shrine of Resurrection:**
   - *Before optimizations:* **8.4 FPS**, 14,573 feedback copies and 8,767 passes every 2s.
   - * With `LDS` / `STS` support, UBOs directed invalidation (`guest_copy_invalidate`) and redundant snapshots elimination:* **40 to 47 FPS stable** (average frame time of $\approx 25\text{ms}$, reduction of $57\times$ in copies per frame).
-- ** GPU Current Gargal:**
+- **GPU Current Gargal:**
   - A GPU trabalha $\approx 23\text{ ms}$ na cena 3D interna.
   - The profile shows that the cost **is not filler of pixels (fillrate)**, but **number of passes and amount of draw calls**:
     - O G-buffer de 6 alvos executa sozinho **$\approx 3.250$ draw calls** ($\approx 7\text{ ms}$).
@@ -206,7 +206,7 @@ Instead of being limited to fixed locks of 30 FPS or 60 FPS static (where 45 FPS
 - Apply a patch via `tools/patches.py` reducing this constant to `12500.0f` or `15000.0f`:
   - Decreases the amount of G-buffer design calls by up to **30% to 40%** (from $\approx $3,250 to $\approx 2,000 Draws).
   - Reduces GPU time from $\approx 23\text{ms}$ to **$\approx 15\text{ms}$**.
-  - ** Immediate result:** Allows hardware to reach **60 constant FPS** in Sanctuary and Overworld.
+  - **Immediate result:** Allows hardware to reach **60 constant FPS** in Sanctuary and Overworld.
 
 ### 3. Post-Processing Pass Pruning and FXAA
 - The BOTW runs full screen passes for FXAA and depth blur.

@@ -10,10 +10,10 @@ Scene: 1.8.2, Great Plateau near the Temple of Time (test save), Video > Frame r
   - The tests from before tonight were in this mixed mode.
 - **The cell phone heats up (60–90 °C) in a few minutes and, loading, does not cool below ~50 °C.**
   - Two straight rounds differ more than most changes.
-  - Use ** `LARECOMP_AB=<quadros>:<chave>` **: switches a key to each N frames within the same round, and the `[pace]` log marks `ab 0/1`. Both sides are in the same heat.
+  - Use **`LARECOMP_AB=<frames>:<key>`**: switches a key to each N frames within the same round, and the `[pace]` log marks `ab 0/1`. Both sides are in the same heat.
   - Chaves: `split`, `ubo`, `sgsr`, `nobarrier`, `copy`, `chunk`.
-- ** `LARECOMP_GPUPROF_AT=<quadro>`:** GPU time per pass. Absolute values are inflated by timestamps, but proportions are worth it.
-- ** `simpleperf` ** works on the app (debuggable). Symbols: the `libmain.so` of `merged_native_libs` (-O2 -g).
+- **`LARECOMP_GPUPROF_AT=<frame>`:** GPU time per pass. Absolute values are inflated by timestamps, but proportions are worth it.
+- **`simpleperf` ** works on the app (debuggable). Symbols: the `libmain.so` of `merged_native_libs` (-O2 -g).
 
 ## What's changed and how much you've earned
 
@@ -25,21 +25,21 @@ Measurements in the same round (A/B):
 | SGSR 1 instead of FSR 1 (new standard on Android, 6a67bd8) | 35,9 fps, GPU 19,7 ms | **39,0 fps, GPU 18,3 ms** |
 | Constant buffers lidos no lugar (`LARECOMP_UBO_DIRECT=1`) | render 13,0 ms | render 12,4 ms (GPU igual) |
 
-- ** Feedback copies:** the ground decals (fs `f984e489`) read and write two G-buffer targets, with a barrier to each one or two draws. There were 32 pairs of full-screen copies per frame, ~14 ms of GPU. Now the pass only ends where there was a copy, and the draw reads the target itself. It's a loop feedback that the Vulkan leaves undefined without `VK_EXT_attachment_feedback_loop_layout`, so it's only on Turnip**, where it was given frame by frame. The other drivers keep the copies, or use `LARECOMP_FEEDBACK_INPLACE=1`.
-- ** Black traces on the grass (b9321e7):** were from FSR 1. The intermediate output A2B10G10R10 compressed (UBWC) returned blocks 16x4 of zeros to the RCAS in Turnip. Now this image is created without compression. Before, it was ~1 per frame.
+- **Feedback copies:** the ground decals (fs `f984e489`) read and write two G-buffer targets, with a barrier to each one or two draws. There were 32 pairs of full-screen copies per frame, ~14 ms of GPU. Now the pass only ends where there was a copy, and the draw reads the target itself. It's a loop feedback that the Vulkan leaves undefined without `VK_EXT_attachment_feedback_loop_layout`, so it's only on Turnip**, where it was given frame by frame. The other drivers keep the copies, or use `LARECOMP_FEEDBACK_INPLACE=1`.
+- **Black traces on the grass (b9321e7):** were from FSR 1. The intermediate output A2B10G10R10 compressed (UBWC) returned blocks 16x4 of zeros to the RCAS in Turnip. Now this image is created without compression. Before, it was ~1 per frame.
 
 ## No effect tests (the patterns stay)
 
-- ** 50 % resolution:** equal GPU (~18 ms). The cost is not per pixel.
-- ** Final output in 1080p instead of 1440p** (`LARECOMP_OUT_LINES=1080`): ≤ 1 ms.
+- **50 % resolution:** equal GPU (~18 ms). The cost is not per pixel.
+- **Final output in 1080p instead of 1440p** (`LARECOMP_OUT_LINES=1080`): ≤ 1 ms.
 - **Bilinear instead of SGSR:** within the noise.
-- ** `TU_DEBUG=sysmem`:** equals autotune. ** `TU_DEBUG=gmem`:** much worse (GPU ~30 ms).
-- ** 32-bit shader mathematics** (`LARECOMP_VK_INT32=1`): equal to emulated int64.
+- **`TU_DEBUG=sysmem`:** equals autotune. ** `TU_DEBUG=gmem`:** much worse (GPU ~30 ms).
+- **32-bit shader mathematics** (`LARECOMP_VK_INT32=1`): equal to emulated int64.
 - **`IR3_SHADER_DEBUG=nouboopt`:** igual.
-- ** Without the barrier at the beginning of each pass** (`nobarrier`): equal.
+- **Without the barrier at the beginning of each pass** (`nobarrier`): equal.
 - **Without splitting the long pass** (`split`): ~0.5 ms less GPU, but the frame gets longer because the GPU starts later.
 - **Submissions every 0.5 ms** (`chunk`): equal.
-- ** Shared window for the constant buffers of 64 KB:** worse. They are always the same address, with 16 bytes rewritten before each draw (+0x70). Each bind needs its own copy, ~14 MB per memcpy frame.
+- **Shared window for the constant buffers of 64 KB:** worse. They are always the same address, with 16 bytes rewritten before each draw (+0x70). Each bind needs its own copy, ~14 MB per memcpy frame.
 
 ## Where's the limit now?
 
@@ -77,14 +77,14 @@ Safe paths (memory of the game by copies of the CPU, copies instead of reading i
 
 1. ** Smaller output resolution on the widescreen:** the final composition and the upscale run at 3200x1440; a smaller output option (with less sharp HUD) would cut off part of ~5 ms. The decal passes are not worth it.
 2. **Measure the GPU clock** (Turnip `VK_KHR_performance_query` counters) to separate governor's work from frequency.
-3. **Chart generation (30 → 60)** for GPUs that do not reach 60: see `FRAMEGEN-EVALUATION.md`.
+3. **Frame generation (30 → 60)** for GPUs that do not reach 60: see `FRAMEGEN-EVALUATION.md`.
 
 ## 26/10: Automatic output, stopped GPU and the render thread
 
 Same cell phone, 1.8.2 on the Great Plateau, one player's settings (50%, FSR 1, Output: Screen, 3200x1440).
 
-- ** Automatic output (60ac287):** the final image in 1080 lines on larger screens; the scene keeps its size. GPU 22,8 → ~17.6 ms per frame. The step of presenting was bilinear (0.13 ms; the SGSR 1 there cost 1.9 ms without visible difference in 1.33x).
-- ** Time line of a frame (`LARECOMP_FRAME_TIMELINE`, 6a59793):**
+- **Automatic output (60ac287):** the final image in 1080 lines on larger screens; the scene keeps its size. GPU 22,8 → ~17.6 ms per frame. The step of presenting was bilinear (0.13 ms; the SGSR 1 there cost 1.9 ms without visible difference in 1.33x).
+- **Time line of a frame (`LARECOMP_FRAME_TIMELINE`, 6a59793):**
   - the game simulates ~16 ms;
   - wait ~4–6 ms the fence of the table that **just send**;
   - records and sends the list of the frame at ~2.6 ms, with the GPU stopped;
@@ -114,13 +114,13 @@ Same cell phone, 1.8.2 on the Great Plateau, one player's settings (50%, FSR 1, 
 
 ### More 26/10 tests (Optimizations List and SavageWindRecomp)
 
-- ** `-O3` + ThinLTO in libmain:** worst. 31.8 and 30.5 fps against 34.6 and 35.5 with `-O2`, in two rounds of each. Probably by the larger code in the instruction cache. That's `-O2`.
-- ** `SleepThread(0)` sleeping 50 μs after 32 yelds followed:**
+- **`-O3` + ThinLTO in libmain:** worst. 31.8 and 30.5 fps against 34.6 and 35.5 with `-O2`, in two rounds of each. Probably by the larger code in the instruction cache. That's `-O2`.
+- **`SleepThread(0)` sleeping 50 μs after 32 yelds followed:**
   - +1% of fps, within noise;
   - Process CPU 2.51 → 2.47 cores, no temperature difference;
   - the spin with `sched_yield` costs less than 3.3% of the profile suggested. He didn't.
 - **Texture consulted once per draw:**The duplicate part is ~0.5% of the yield thread, below which a measurement separates. He didn't.
-- ** Cheaper SGSL from SavageWindRecomp (9f94aba):** build-ins in conversions, only the prelude functions that the shadower uses and SPIR-V without names. With cold caches:
+- **Cheaper SGSL from SavageWindRecomp (9f94aba):** build-ins in conversions, only the prelude functions that the shadower uses and SPIR-V without names. With cold caches:
   - wait for shaders 17,3 → 11,2 s;
   - worst picture 6.2 → 3.8 s;
   - The same image.
