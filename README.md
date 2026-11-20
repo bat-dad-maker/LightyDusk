@@ -1,6 +1,20 @@
-# BOTWRecompAndroid
+# BOTWRecompAndroid EN
 
-
+> **This is BOTWRecompAndroid EN**, an English-only fork of
+> **[mamcjr/BOTWRecompAndroid](https://github.com/mamcjr/BOTWRecompAndroid)** (version 0.4.8-beta), all credit for the
+> port goes to **[mamcjr](https://github.com/mamcjr)** and to **[peiikai](https://github.com/peiikai)** for
+> [LAS Recomp](https://github.com/peiikai/LASRecomp). What this fork changes:
+>
+> - all documentation, notes, comments, scripts and user-facing strings are in English, and the app's menus are English
+>   only (the game's own text-language option is unchanged);
+> - it installs **beside** the original app: application ID `com.botwrecompandroid.en`, name "BOTWRecompAndroid EN",
+>   version `0.4.8-en.1`. Its data folder is `Android/data/com.botwrecompandroid.en/`, so set up your game files there
+>   again (or use them in place);
+> - an experimental **Smooth loading** option, off by default ([below](#smooth-loading-experimental));
+> - a GitHub Actions workflow that builds the APK ([.github/workflows/android-apk.yml](.github/workflows/android-apk.yml)).
+>
+> See [docs/CHANGELOG.md](docs/CHANGELOG.md). Report problems with this fork's changes here, not upstream. As upstream,
+> **no game files are included**: you need your own dump.
 
 [![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/754-the-legend-of-zelda-breath-of-the-wild/)
 
@@ -15,7 +29,7 @@ It is built on the engine of **[LAS Recomp](https://github.com/peiikai/LASRecomp
 > **Beta.** Tested primarily on one phone (POCO F7 Ultra, Adreno 830, Mesa Turnip driver). Performance and compatibility
 > vary by device; expect bugs, especially on GPUs that have not been tested on physical hardware. See the
 > [0.4.8-beta release notes](https://github.com/mamcjr/BOTWRecompAndroid/releases/tag/v0.4.8-beta) and the
-> [development notes](docs/BOTW-PORT.md) (in Portuguese).
+> [development notes](docs/BOTW-PORT.md) (machine-translated from Portuguese).
 
 ## Supported platform
 
@@ -118,9 +132,29 @@ icons read from your game files. The game's menus keep the classic buttons.
 
 ![Rune fan](docs/images/touch-controls-overhaul-runes.jpg)
 
+## Smooth loading (experimental)
+
+**Settings > Video > Smooth loading (experimental)**, off by default. It takes effect the next time the app starts.
+With it off, file reads and save writes take exactly the upstream code paths. With it on:
+
+- **Read-ahead:** after each read of the game data (`romfs.bin`), a background thread asks the kernel to load the next
+  4 MiB into the page cache (`posix_fadvise(POSIX_FADV_WILLNEED)`), with at most 16 requests waiting (extra ones are
+  dropped), so later reads are served from memory. The folder-backed virtual image is not read ahead.
+- **Background saves:** a save file opened for writing is held in memory while it is open (up to 64 MiB; larger files
+  use the normal path). The game's writes go to that copy, so the game thread doesn't wait for storage. On Flush,
+  Commit or close, a copy of the content is handed to a background thread that writes `<file>.smooth-tmp`, calls
+  `fsync`, renames it over the save (atomic replace) and syncs the folder. Pending saves are written out when the app
+  goes to the background or exits, and before the game deletes or renames save files.
+- **Pipeline prewarming** (the existing "Pipeline prewarming" option) is turned on as well.
+
+**This option is untested on real hardware.** It was built and checked on a desktop only (the save path with a small
+test program). If saves or loading behave oddly, turn it off and keep a backup of your saves (export them in
+**Settings > Saves**). `LARECOMP_SMOOTH_LOADING=0/1` overrides the setting for tests.
+
 ## Installing (beta)
 
-1. Download the APK from [Releases](https://github.com/mamcjr/BOTWRecompAndroid/releases) and install it (Android 11+,
+1. Download the APK from [Releases](https://github.com/bat-dad-maker/LightyDusk/releases) (this fork) or from
+   [upstream's Releases](https://github.com/mamcjr/BOTWRecompAndroid/releases) and install it (Android 11+,
    ARM64 and Vulkan). You need your own extracted game folder containing `exefs` and `romfs`.
 2. In **Game Files**, choose **Game code**: **Native (experimental)** skips the on-phone code build; **Recompiled**
    builds it once. Under **Game files**, choose **Copy them** or **Use them in place**, then select the extracted folder.
@@ -149,6 +183,8 @@ android/run_boot.sh 120                               # start the game, log to a
 
 ## Support the project
 
+*(This section is upstream's: support goes to mamcjr, the author of BOTWRecompAndroid.)*
+
 BOTWRecompAndroid is a free, independent project. If you enjoy it and would like to support its development, you can
 sponsor me on GitHub, Ko-fi, Buy Me a Coffee or via **Pix**. Your support helps me dedicate time to fixing bugs, improving performance and compatibility, and
 working on future releases. Sponsorship is entirely optional: it does not unlock features or guarantee specific fixes.
@@ -167,10 +203,12 @@ Current goal: buy a **POCO X7 Pro ($455)**, a test device equipped with a MediaT
 
 ## Credits
 
+- [mamcjr](https://github.com/mamcjr) for [BOTWRecompAndroid](https://github.com/mamcjr/BOTWRecompAndroid), the port
+  this English fork is based on, and for LASRecompAndroid.
 - [peiikai](https://github.com/peiikai) for [LAS Recomp](https://github.com/peiikai/LASRecomp), the recompiler and
   runtime this project starts from (MIT, see [LICENSE](LICENSE)). The original README is kept in [docs/las/](docs/las/).
 - [LASRecompAndroid](https://github.com/mamcjr/LASRecompAndroid), its Android port: the app, the phone-side game code
-  build, touch controls, mods, driver compatibility and the Portuguese menus.
+  build, touch controls, mods, driver compatibility and the original translated menus.
 - [Revivedx](https://github.com/Revivedx) for [SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp) (MIT),
   the reference for 1.8.2: frame pacing, internal resolution, the SDK 20 kernel fixes, setjmp.
 - [Nycolazs](https://github.com/Nycolazs) for LASRecomp-Android-Plus (MIT): Vulkan driver compatibility.
@@ -219,3 +257,9 @@ Current goal: buy a **POCO X7 Pro ($455)**, a test device equipped with a MediaT
 
 *The Legend of Zelda* and *Breath of the Wild* are trademarks of Nintendo. This project is not affiliated with or
 endorsed by Nintendo.
+
+## License
+
+The source is MIT ([LICENSE](LICENSE)), except the frame generation code under `runtime/nvn/vulkan/lsfg/`, which is
+GPL-3.0-or-later; an APK that includes it is distributed under the GPL-3.0-or-later. See [NOTICE.md](NOTICE.md). This
+fork keeps both files and their terms unchanged.

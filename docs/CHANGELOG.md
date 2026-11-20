@@ -18,16 +18,18 @@ English-only fork of [mamcjr/BOTWRecompAndroid](https://github.com/mamcjr/BOTWRe
 
 ### Smooth loading (experimental)
 
-Settings > Saves & files > "Smooth loading (experimental)". Off by default; when off, file reads and saves follow
-exactly the upstream code path. When on:
+Settings > Video > "Smooth loading (experimental)". Off by default, and read when the app starts; when off, file
+reads and save writes take exactly the upstream code paths. When on:
 
-- game-file reads from `romfs.bin` / the romfs folder ask the kernel to read ahead on a background thread
-  (`posix_fadvise(WILLNEED)` / `readahead`) on a bounded window past each read, so the next reads hit the page cache;
-- save-data writes are copied and committed on a background thread (write to a temporary file, `fsync`, atomic
-  rename), so the game thread does not wait for storage. Pending saves are flushed when the app is paused or closed.
+- after each read of the game data (`romfs.bin`), a background thread asks the kernel to read the next 4 MiB ahead
+  into the page cache (`posix_fadvise` WILLNEED), with at most 16 requests waiting;
+- a save file open for writing is kept in memory (up to 64 MiB) and the game writes to that copy; on Flush, Commit or
+  close, a copy is written by a background thread to a temporary file, synced, and renamed over the save (atomic
+  replace). Pending saves are written out when the app goes to the background or exits;
+- the existing pipeline prewarming is turned on too.
 
-This was written without a device to test on. If you see save problems, turn it off. Changing it takes effect the next
-time the app starts.
+Written and tested on a desktop only (a small test of the save path); **untested on real Android hardware**. If you see
+save or loading problems, turn it off.
 
 ---
 
