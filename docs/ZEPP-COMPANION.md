@@ -1,14 +1,14 @@
 # Companion ZeppOS
 
-A implementação atual está em [companion/zepp](../companion/zepp/README.md).
+The current implementation is in [companion/zepp](../companion/zepp/README.md).
 
-A versão 0.2.0 mantém o mapa no Amazfit GTR 4 New e recebe coordenadas, direção de Link, pinos/carimbos e indicadores da missão selecionada. A coroa controla quatro níveis de zoom; o toque move o mapa e o botão **Centrar Link** retoma o acompanhamento.
+Version 0.2.0 maintains the map in the Amazon GTR 4 New and receives coordinates, Link direction, pins/stamps and indicators of the selected mission. The crown controls four zoom levels; the touch moves the map and the button **Center Link** resumes the accompaniment.
 
 ```text
 Leitura de estado no runtime → HTTP autenticado em loopback
     → Side Service do Zepp no mesmo Android → Bluetooth → mapa local no relógio
 ```
 
-O alvo é deviceSource 9437441, 480×480 e API 1.0, conforme o catálogo instalado do Zeus. A ponte nativa está em `runtime/watch_map.c`; o servidor e a ativação ficam em `WatchMapServer.java`. Somente a revisão Switch 1.0.0 validada é aceita. Dados extraídos do dump local ficam fora do Git.
+The target is deviceSource 9437441, 480×480 and API 1.0, according to Zeus' installed catalog. The native bridge is in `runtime/watch_map.c`; the server and activation are in `WatchMapServer.java`. Only the validated Switch 1.0.0 revision is accepted. Data extracted from the local dump is off the Git.
 
-O README contém instruções de exportação, instalação, controles, protocolo, verificações realizadas e limites. O protótipo anterior de captura de minimapa fica disponível como diagnóstico legado.
+The README contains export instructions, installation, controls, protocol, checks performed and limits. The previous prototype of minimap capture is available as a legacy diagnosis.

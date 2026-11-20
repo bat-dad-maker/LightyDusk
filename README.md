@@ -1,6 +1,6 @@
 # BOTWRecompAndroid
 
-**English** | [Português](README.pt-BR.md)
+
 
 [![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/754-the-legend-of-zelda-breath-of-the-wild/)
 

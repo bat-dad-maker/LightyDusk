@@ -1,4 +1,4 @@
-// Running the game's own ARM64 code on the phone's CPU (LARECOMP_NATIVE=1, a prototype: docs/EXECUCAO-NATIVA.md).
+// Running the game's own ARM64 code on the phone's CPU (LARECOMP_NATIVE=1, a prototype: docs/NATIVE-EXECUTION.md).
 //
 // The modules are loaded and relocated at their guest addresses as always (loader.c); guest addresses are host
 // addresses, so the game's code can run there as it is. Only what can't run outside the Switch is rewritten, in place:

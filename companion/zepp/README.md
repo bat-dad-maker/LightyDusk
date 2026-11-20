@@ -1,28 +1,28 @@
 # Recomp Mapa 0.2.1 — Amazfit GTR 4 New
 
-Mapa externo armazenado no relógio, com posição e direção de Link, pinos/carimbos e indicadores da missão selecionada enviados pelo celular pareado. A página principal não captura nem transmite a imagem do minimapa.
+External map stored on the clock, with Link position and direction, pins/stamps and mission indicators selected sent by paired mobile phone. The main page does not capture or transmit the image of the minimap.
 
-## Correção de interrupções em 0.2.1
+## Correction of interruptions at 0.2.1.
 
-O usuário relatou travamento e reinício do relógio ao receber uma notificação com 0.2.0. A causa do reinício no firmware ainda não foi confirmada por logs. A revisão corrige riscos encontrados no código: cancela timers e libera controles na pausa, descarta respostas e callbacks da geração anterior, aguarda 300 ms antes de retomar e não intercepta gestos verticais do sistema. A transição preserva a posição e o zoom do mapa.
+The user reported locking and restarting the clock upon receiving a notification with 0.2.0. The cause of reboot in firmware has not yet been confirmed by logs. The review fixes risks found in the code: cancels timers and releases pause controls, discards responses and callbacks from the previous generation, waits 300 ms before resuming and does not intercept vertical gestures of the system. The transition preserves the position and zoom of the map.
 
-O desenho reutiliza no máximo 16 componentes de imagem e os componentes dos marcadores, sem destruir/recriar componentes a cada amostra. Não redefine a imagem quando só sua posição muda, nem recarrega os tiles de um mapa parado. Isso limita o pico de imagens durante pan/zoom e reduz alocações nas interrupções.
+The design reuses no more than 16 image components and the components of the markers, without destroying/recreating components to each sample. Do not redefine the image when only its position changes, nor reloads the tiles from a still map. This limits peak images during pan/zoom and reduces allocations in interruptions.
 
-24 testes passaram, incluindo 150 ciclos simulados de interrupção/retomada, respostas antigas de sucesso/erro, cancelamento de desenho, ausência de acesso à UI durante pausa/transição e limite dos componentes. Esses testes usam mocks da API; a correção ainda precisa ser validada recebendo uma notificação no GTR 4 New. Atualize somente o Mini Program pelo QR 0.2.1; o APK não mudou. Ciclo de vida e gestos seguem a documentação oficial de [delegate](https://docs.zepp.com/docs/1.0/watchface/api/hmUI/createWidget/) e [gestos](https://docs.zepp.com/docs/1.0/reference/device-app-api/hmApp/gestureEvent/registerGestureEvent/).
+24 tests have passed, including 150 simulated cycles of interruption/resumption, old success/error responses, cancellation of design, absence of access to the IU during pause/transition, and limit of components. These tests use API mocks; the correction still needs to be validated by receiving a notification in GTR 4 New. Update only Mini Program by QR 0.2.1; APK has not changed. Lifecycle and gestures follow the official documentation of [delegate](https://docs.zepp.com/docs/1.0/watchface/api/hmUI/createWidget/) and [gestos](https://docs.zepp.com/docs/1.0/reference/device-app-api/hmApp/gestureEvent/registerGestureEvent/).
 
-## Instalação
+## Installation
 
 1. Instale o APK atualizado de `android/botwrecompandroid/app/build/outputs/apk/debug/app-debug.apk`.
-2. No Android, mantenha pressionado o ícone do Recomp → **Mapa no relógio**. Ative o compartilhamento, salve e copie o código.
-3. No modo desenvolvedor do Zepp, adicione o Mini Program pelo QR da prévia 0.2.0. Use o alvo **Amazfit GTR 4 new** (9437441), API 1.0 e tela 480×480. A versão do sistema exibida no relógio não corresponde ao API_LEVEL do catálogo.
-4. Nas configurações do Mini Program no Zepp, cole o código de 32 caracteres. O código anterior continua válido após atualizar o APK.
-5. Abra o jogo e o Recomp Mapa no relógio, com Bluetooth conectado.
+2. On Android, press the Recomp icon → **Map on the clock**. Enable sharing, save, and copy the code.
+3. In Zepp developer mode, add Mini Program by QR of previous 0.2.0. Use the target **Amazfit GTR 4 new**(9437441), API 1.0 and screen 480×480. The system version displayed on the watch does not match the API_LEVEL of the catalog.
+4. In the Mini Program settings in Zepp, paste the 32-character code. The previous code remains valid after updating the APK.
+5. Open the game and Recomp Map on the clock, with Bluetooth connected.
 
-A coroa muda entre quatro níveis de zoom. Arraste para explorar; **Centrar Link** retoma o acompanhamento. A seta azul indica Link, pontos laranja representam pinos/carimbos e círculos amarelos representam objetivos da missão. Nesta versão, os pinos e carimbos conservam posição e tipo no protocolo, mas usam um símbolo visual comum.
+The crown changes between four zoom levels. Drag to explore; **Center Link** resumes follow-up. The blue arrow indicates Link, orange dots represent pins/carimbos and yellow circles represent mission objectives. In this version, the pins and stamps retain position and type in the protocol, but use a common visual symbol.
 
 ## Preparar mapa e pacote
 
-O mapa vem exclusivamente do dump local do usuário. Os tiles extraídos são ignorados pelo Git; não publicar nem versionar o pacote que os contém. O visualizador usa níveis de 256, 512, 1024 e 2048 pixels, divididos em 340 tiles de 128×128.
+The map comes exclusively from the local user dump. Extracted tiles are ignored by Git; do not publish or version the package containing them. The viewer uses levels of 256, 512, 1024 and 2048 pixels, divided into 340 tiles of 128×128.
 
 ```powershell
 python tools/export_watch_map.py --romfs Dump/01007EF00011E000/romfs --output companion/zepp/assets/gtr-4-new/map
@@ -34,26 +34,26 @@ node tools/zeus.cjs login
 npm run preview -- --target "Amazfit GTR 4 new"
 ```
 
-O exportador requer Pillow e NumPy. O wrapper Zeus 1.9.3 ajusta a resolução de módulo privado e salva a matriz do QR em `dist/preview-qr.json`. Os scripts excluem os produtos intermediários do pacote; a compilação local final tem aproximadamente 3,9 MB. Gerar a prévia envia o pacote, incluindo o mapa, ao serviço Zepp e depende de autorização do usuário. A prévia tem prazo de validade indicado pelo Zeus. O `.zab` é o pacote do relógio, não um APK. O appId 1202601 é de desenvolvimento.
+The exporter requires Pillow and NumPy. The Zeus 1.9.3 wrapper adjusts the private module resolution and saves the QR matrix to `dist/preview-qr.json`. The scripts exclude intermediate products from the package; the final local compilation has approximately 3.9 MB. Generate the preview sends the package, including the map, to the Zepp service and depends on user authorization. The previous expiry date is indicated by Zeus. `.zab` is the watch package, not an APK. The appId 1202601 is development.
 
 ## Ponte e limites
 
-O serviço opcional escuta apenas em `127.0.0.1:18880`, exige código e funciona com o Recomp em primeiro plano. `/v1/state.json` devolve JSON com sessão, sequência, mapa, posição, direção, marcadores e objetivos. O Side Service no Zepp busca esse estado e o envia por Bluetooth. Há um pedido em voo, intervalo nominal de um segundo e pausa quando a página fica inativa. A taxa real depende do Zepp e do relógio. Após cinco segundos sem resposta, a posição é identificada como desatualizada.
+The optional service only listens to `127.0.0.1:18880`, requires code and works with Recomp in the foreground. `/v1/state.json` returns JSON with session, sequence, map, position, direction, markers and objectives. The Side Service on Zepp searches for this state and sends it over Bluetooth. There is a request in flight, nominal interval of a second and pause when the page becomes inactive. The real rate depends on Zepp and the clock. After five seconds without response, the position is identified as outdated.
 
-A leitura nativa suporta especificamente a revisão Switch 1.0.0, build `2094f152836683a3632c6153fd84ab80`. Verifica instruções dessa revisão, limites de ponteiros e gerações de sessão. Usa `pread` somente para leitura de `/proc/self/mem`; não chama funções do jogo na thread de rede. Posição e seleção podem mudar entre leituras, portanto isso não é um snapshot atômico do motor. Seleção/etapa são conferidas novamente antes da resposta. Revisões desconhecidas e carregamentos retornam indisponibilidade.
+Native reading specifically supports Switch 1.0.0, built `2094f152836683a3632c6153fd84ab80` revision. Checks instructions for this review, pointer limits and session generations. Uses `pread` only for `/proc/self/mem` reading; does not call game functions in network thread. Position and selection can change between readings, so this is not an atomic motor snapshot. Selection/step are checked again before response. Unknown reviews and uploads return unavailability.
 
-Objetivos vêm dos indicadores da etapa da missão selecionada, filtrados pelas flags de conclusão, em vez de usar arrays de guias que podem guardar posições antigas. As coordenadas são as posições definidas pelo indicador da missão; seguir um NPC em movimento ainda não foi validado. Interiores/santuários não usam o mapa externo para projetar Link.
+Objectives come from the indicators of the selected mission stage, filtered by the completion flags, instead of using arrays of guides that can store old positions. The coordinates are the positions defined by the mission indicator; following a moving NPC has not yet been validated. Interiors/sanctuaries do not use the external map to design Link.
 
-Os endpoints de captura `/v1/map.json` e `/v1/map.png` e a página antiga permanecem como diagnóstico legado; não são usados pela página principal. Os campos de recorte no Android só afetam esse diagnóstico.
+The capture endpoints `/v1/map.json` and `/v1/map.png` and the old page remain legacy diagnostic; they are not used by the main page. Clipping fields on Android only affect this diagnosis.
 
-## Validação
+## Validation
 
-- Posição real confirmada por leitura antes/depois de caminhar no celular (deslocamento aproximado de 60 m).
-- Endpoint Android instalado retornou Link e dois marcadores colocados pelo usuário.
-- Missão selecionada `FirstTower` corresponde a **Follow the Sheikah Slate**, confirmada pelo usuário; indicador da torre em aproximadamente x=-560, z=1695.
-- APK final instalado: após carregar o save, `/v1/state.json` retornou `objectivesAvailable:true` e o objetivo em x=-560.035, z=1694.863. Os dois marcadores de teste anteriores não reapareceram nesse save.
-- 23 testes Node passaram, incluindo protocolo, validação, cobertura dos tiles, pan, zoom, recentralização, objetivo e descarte ao fechar a página.
-- Prévia 0.2.0 enviada à Zepp com autorização explícita do usuário em 20/10/2026. QR válido até 27/10/2026, em `dist/preview-qr-0.2.0.png`; pacote final com 340 tiles, API 1.0, cerca de 3,9 MB e sem produtos intermediários.
-- O espelhamento antigo 0.1.4 foi confirmado no relógio pelo usuário. A exibição do mapa local 0.2.0, os gestos e a latência ainda precisam ser conferidos no GTR 4 New.
+- Real position confirmed by reading before/after walking on the cell phone (approx. 60 m).
+- Installed Android Endpoint returned Link and two bookmarks placed by the user.
+- Selected mission `FirstTower` corresponds to **Follow the Sheikah Slate**, confirmed by the user; tower indicator in approximately x=-560, z=1695.
+- Final APK installed: after loading the save, `/v1/state.json` returned `objectivesAvailable:true` and the target in x=-560.035, z=1694.863. The two previous test markers did not reappear in this save.
+- 23 Node tests have passed, including protocol, validation, coverage of the tiles, pan, zoom, recentralization, goal and discard when closing the page.
+- Prior 0.2.0 sent to Zepp with explicit user authorization on 20/10/2026. QR valid until 27/10/2026, in `dist/preview-qr-0.2.0.png`; final package with 340 tiles, API 1.0, about 3.9 MB and no intermediate products.
+- The old mirror 0.1.4 was confirmed on the clock by the user. The local map display 0.2.0, gestures and latency still need to be checked in GTR 4 New.
 
-Licença e código legado de comunicação em `shared/legacy`. Referência de comunicação: [exemplo oficial API 1.0](https://github.com/zepp-health/zeppos-samples/tree/main/application/1.0/fetch-api).
+License and legacy code of communication in `shared/legacy`. Communication reference: [exemplo oficial API 1.0](https://github.com/zepp-health/zeppos-samples/tree/main/application/1.0/fetch-api).

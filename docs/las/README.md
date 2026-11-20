@@ -2,7 +2,7 @@
 
 # LAS Recomp for Android
 
-**English** | [Português](README.pt-BR.md)
+
 
 An Android port of **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by peiikai: a static recompilation of
 *The Legend of Zelda: Link's Awakening* (Nintendo Switch, 2019). As in the original project, this is **not

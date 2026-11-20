@@ -1,367 +1,248 @@
-# Plano de porte: LAS Recomp para Android
+# Size plan: LAS Recomp for Android
 
-Alvo inicial: **Snapdragon (Adreno 6xx / 7xx) com o driver Vulkan Turnip** (Mesa), carregado pelo app.
-Outros SoCs (Mali, Xclipse, Adreno com o driver da Qualcomm) ficam para depois da Fase 3.
+Initial target: **Snapdragon (Adreno 6xx / 7xx) with the Vulkan Turnip** (Mesa) driver, loaded by the app. Other SoCs (Mali, Xclipse, Adreno with the Qualcomm driver) stay after Phase 3.
 
-## Ponto de partida
+## Point of departure
 
-O que já existe e ajuda:
+What already exists and helps:
 
-- **O Switch é AArch64, e o Android também.** O código gerado usa o caminho `--simd asm` (FP/SIMD do jogo como inline
-  asm nativo). É o mesmo caminho do macOS Apple Silicon, que já está provado. O macOS também reserva o `x18`, como o
-  Android (ShadowCallStack), então o código gerado já não deve usá-lo.
-- **O backend Vulkan** (`runtime/nvn/vulkan/`) e o tradutor de shaders Maxwell → GLSL → SPIR-V já existem.
-  `docs/linux.md` cita o Turnip entre os drivers suportados no Linux.
-- **A camada `runtime/platform/linux.c`** já suporta aarch64. Ela é a base do `platform/android.c`.
-- **SDL3 e Dear ImGui** têm suporte oficial a Android.
+- **The Switch is AArch64, and Android as well.** The code generated uses the path `--simd asm` (FP/SIMD of the game as native inline asm). It's the same way as macOS Apple Silicon, which has already been proven. macOS also reserves `x18`, such as Android (ShadowCallStack), so the generated code should no longer use it.
+- **The Vulkan backend** (`runtime/nvn/vulkan/`) and Maxwell shader translator → GLSL → SPIR-V already exist. `docs/linux.md` cites Turnip among Linux supported drivers.
+- ** The `runtime/platform/linux.c` layer** already supports aarch64. She's the base of `platform/android.c`.
+- **SDL3 and Dear ImGui** have official Android support.
 
-O que bloqueia ou é diferente no Android:
+What blocks or is different on Android:
 
-| # | Problema | Onde | Gravidade |
+| # | Problem | Where | Gravidade |
 |---|---|---|---|
-| 1 | Janela de memória fixa `0x70_0000_0000`–`0x73_2000_0000` (guest = host). Num processo forkado do zygote, com VA de 39 bits, essa faixa fica onde ART e bibliotecas já estão mapeadas. Se houver colisão, não dá para fazer re-exec. | `rt.h`, `main.c` | **Alta** |
-| 2 | O código gerado é compilado no aparelho (Python `gen.py` + Zig). No Android não há Python, e o SELinux bloqueia `exec()` de binários na pasta de dados do app (targetSdk ≥ 29). | `gamebuild.c` | Alta |
-| 3 | O gerador de seeds é um helper em PyInstaller (oead, evfl, keystone) e não roda no Android. | `rando_tab.mm` | Média (o MVP pode ser só vanilla) |
-| 4 | O `lasgame.so` resolve os símbolos do runtime no executável (`-rdynamic`). No Android, o runtime é `libmain.so`, carregado num namespace do linker e fora do escopo global. | `Makefile`, `gamelib.c` | Média (resolve no link) |
-| 5 | Diferenças do Vulkan móvel: `VK_EXT_external_memory_host`, texturas BC, `shaderInt64`, `dualSrcBlend`, `MAILBOX` | `vulkan/device.c`, `exec.c`, `textures.c` | Média, a medir |
-| 6 | Bionic: sem `execinfo.h`/`backtrace()` antes da API 33, `/proc/self/exe` aponta para `app_process64`, e o ART usa `SIGSEGV` (sigchain) | `platform/linux.c` | Baixa |
-| 7 | Ciclo de vida: pause/resume, surface destruída e recriada, áudio em segundo plano. Hoje nada disso é tratado. | `main.c`, `vulkan/device.c`, `audio.c` | Média |
-| 8 | Entrada por toque: hoje só há teclado e controle | `hle/input.c`, `ui/` | Média |
-| 9 | Arquivos: seletor de pasta vira SAF (`content://`, sem caminho POSIX). O `curl` da checagem de update não existe. | `launcher.mm` | Baixa |
+| 1 | Fixed memory window `0x70_0000_0000` – `0x73_2000_0000` (guest = host). In a forked process of zygote, with 39-bit VA, this track is where ART and libraries are already mapped. If there's a collision, you can't re-exec. | `rt.h`, `main.c` | **Alta** |
+| 2 | The code generated is compiled on the device (Python `gen.py` + Zig). On Android there is no Python, and SELinux blocks `exec()` of binaries in the app's data folder (targetSdk ≥ 29). | `gamebuild.c` | Alta |
+| 3 | The seed generator is a helper in PyInstaller (oead, evfl, keystone) and does not run on Android. | `rando_tab.mm` | Average (MVP may be vanilla only) |
+| 4 | `lasgame.so` solves runtime symbols in the executable (`-rdynamic`). On Android, runtime is `libmain.so`, loaded into a linker namespace and out of the global scope. | `Makefile`, `gamelib.c` | Average (resolve on link) |
+| 5 | Differences from mobile Vulkan: `VK_EXT_external_memory_host`, BC textures, `shaderInt64`, `dualSrcBlend`, `MAILBOX` | `vulkan/device.c`, `exec.c`, `textures.c` | Medium, measuring |
+| 6 | Bionic: without `execinfo.h` / `backtrace()` before API 33, `/proc/self/exe` points to `app_process64`, and the ART uses `SIGSEGV` (sigchain) | `platform/linux.c` | Baixa |
+| 7 | Lifecycle: pause/resume, destroyed and recreated surface, background audio. None of this is dealt with today. | `main.c`, `vulkan/device.c`, `audio.c` | Medium |
+| 8 | Touch input: Today there is only keyboard and control | `hle/input.c`, `ui/` | Medium |
+| 9 | Files: folder selector turns SAF (`content://`, no POSIX path). `curl` update check does not exist. | `launcher.mm` | Baixa |
 
-## Decisões de arquitetura (propostas)
+## Architecture decisions (proposals)
 
-- **App:** projeto Gradle a partir do `android-project` do SDL3 (`SDLActivity`), runtime em `libmain.so` (NDK, clang),
-  ABI só `arm64-v8a`, `minSdk 30`, orientação paisagem. Linkar com `-Wl,-z,max-page-size=16384` (páginas de 16 KB,
-  Android 15+). `PLAT_PAGE` já é 16K.
-- **Driver:** [libadrenotools](https://github.com/bylaws/libadrenotools) carrega um `libvulkan_freedreno.so`
-  (Turnip) a partir da pasta do app, como fazem Skyline, Yuzu e derivados. Fallback: driver do sistema (Qualcomm).
-  O usuário pode trocar a versão do Turnip, porque isso vai ser necessário.
-- **Código do jogo (MVP):** gerado e compilado **no PC** (`make gen` com `--simd asm` + NDK clang → `lasgame.so`) e
-  copiado para o aparelho (adb ou import). Nada do jogo vai no APK. Gerar no próprio aparelho fica para a Fase 6.
-- **`lasgame.so`:** linkado com `DT_NEEDED libmain.so` (o linker do Android resolve os símbolos do runtime pelas
-  dependências da própria lib) e carregado com `dlopen` da pasta interna do app. `dlopen` de app data é permitido,
-  só `exec()` é bloqueado.
-- **Randomizer (MVP):** importar pastas de seed geradas no desktop. Gerar seeds no aparelho fica para a Fase 7.
-- **Plataforma:** `runtime/platform/android.c`, partindo do `linux.c`. `PLATFORM=android` no Makefile para os
-  objetos e o CMake do Gradle chamando a mesma lista de fontes (ou um `Android.mk`/CMake próprio, ver Fase 1).
-- **Escopo:** este fork é só para Android. As outras plataformas não mudam de comportamento: toda mudança em código
-  compartilhado fica atrás de `__ANDROID__` ou de uma flag que só o build Android passa, e o desktop compila
-  exatamente como antes. Isso também reduz o diff em arquivos compartilhados e facilita trazer updates do upstream
-  (peiikai/LASRecomp).
+- **App:**Gradle project from the `android-project` of SDL3 (`SDLActivity`), runtime in `libmain.so` (NDK, clang), ABI only `arm64-v8a`, `minSdk 30`, landscape orientation. Link with `-Wl,-z,max-page-size=16384` (pages 16 KB, Android 15+). `PLAT_PAGE` is already 16K.
+- **Driver:** [libadrenotools](https://github.com/bylaws/libadrenotools) loads a `libvulkan_freedreno.so` (Turnip) from the app folder, as Skyline, Yuzu and derivatives do. Fallback: system driver (Qualcomm). The user can change the version of Turnip, because this will be necessary.
+- ** Game code (MVP):** generated and compiled ** on PC** (`make gen` with `--simd asm` + NDK clang → `lasgame.so`) and copied to the device (adb or import). Nothing from the game goes on APK. Generating on your own device stays for Phase 6.
+- ** `lasgame.so`:** Linked with `DT_NEEDED libmain.so` (the Android linker resolves the symbols of runtime by the dependencies of the lib itself) and loaded with `dlopen` from the internal folder of the app. `dlopen` of date app is allowed, only `exec()` is blocked.
+- **Randomizer (MVP):**import seed folders generated on desktop. Generating seeds on the device is set for Phase 7.
+- **Platform:** `runtime/platform/android.c`, starting from `linux.c`. `PLATFORM=android` in Makefile for Gradle objects and CMake calling the same list of fonts (or a `Android.mk` /CMake itself, see Phase 1).
+- ** Scope:** This fork is for Android only. The other platforms do not change behavior: every change in shared code is behind `__ANDROID__` or a flag that only Android build passes, and the desktop compiles exactly as before. This also reduces diff in shared files and facilitates bringing upstream updates (peiikai/LASRecomp).
 
-## Janela de memória dinâmica (só Android)
+## Dynamic memory window (Android only)
 
-**Estado (2026-10-15): implementada.**
-- Validações do gerador:
-  - sem a flag, a saída é idêntica à anterior (716 arquivos);
-  - com `--dyn-base`, nenhum endereço absoluto restante (só 6 máscaras de bitfield `BFM`, que estão corretas);
-  - o C gerado compila com o NDK e acessa `lasgame_gb` por `ADRP`+`LDR`, sem GOT.
-- Runtime: a base é escolhida pelo `plat_reserve_guest` do Android. O que o boot do jogo usa (deslocamento das
-  tabelas no `dispatch_init`, aviso da base pelo `gamelib.c`) só será testado na Fase 2.
+**State (2026-10-15): implemented.**
+- Generator validations:
+  - without the flag, the output is identical to the previous (716 files);
+  - with `--dyn-base`, no remaining absolute address (only 6 bitfield `BFM` masks, which are correct);
+  - the generated C compiles with the NDK and accesses `lasgame_gb` by `ADRP` + `LDR`, without GOT.
+- Runtime: The base is chosen by the `plat_reserve_guest` of Android. What the game boot uses (displacement of tables in `dispatch_init`, base warning by `gamelib.c`) will only be tested in Phase 2.
 
-No desktop, a janela guest continua fixa em `0x70_0000_0000`. No Android, a base é escolhida em tempo de execução.
+On the desktop, the guest window remains fixed on `0x70_0000_0000`. On Android, the base is chosen in runtime.
 
-O jogo é PIC: o Switch carrega os executáveis com ASLR, e o `loader.c` já aplica as relocações do NSO para qualquer
-base. Quem fixa os endereços é o recompilador, ao gravá-los como constantes no C gerado. O modelo "guest = host"
-continua: loads e stores não mudam, só onde a janela começa.
+The game is PIC: Switch loads executables with ASLR, and `loader.c` already applies the NSO relocations to any base. The one who fixes the addresses is the compiler, when recording them as constants in the generated C. The "guest = host" model continues: loads and stores do not change, only where the window begins.
 
-- **Escolha da base** (`platform/android.c`): ler `/proc/self/maps`, achar um buraco de `GUEST_HI - GUEST_LO`
-  (12,5 GB) **abaixo de 2^39** e acima de 4 GB (o jogo foi feito para um espaço de 39 bits; o ART usa os 4 GB
-  baixos), reservar com `MAP_FIXED_NOREPLACE` e gravar em `g_guest_lo`. Alinhar a base a 4 GB, para os offsets do
-  ADRP continuarem triviais.
-- **`gen.py --dyn-base`** (só o build Android passa). Sem a flag, a saída é idêntica à de hoje. Com ela:
-  - `ADR`/`ADRP` e loads literais (`lifter.py`) emitem `B + offset`, com `const uint64_t B = g_main_base;` (ou
-    `g_sdk_base`) uma vez por função;
-  - endereço de retorno e `c->pc` nas chamadas (`gen.py:345-350`, `437-441`) viram `B + offset`;
-  - os `switch` de jump table e `L_dispatch` (`gen.py:448-462`) passam a usar `switch (alvo - B)` com cases em offset;
+- **Choose from base** (`platform/android.c`): read `/proc/self/maps`, find a `GUEST_HI - GUEST_LO` hole (12.5 GB) **below 2^39**and above 4 GB (the game was made for a 39-bit space; the ART uses the 4 GB bass), book with `MAP_FIXED_NOREPLACE` and burn to `g_guest_lo`. Align base to 4 GB, so ADRP offsets remain trivial.
+- ** `gen.py --dyn-base` ** (only Android build passes). Without the flag, the exit is identical to today's. With her:
+  - `ADR` / `ADRP` and literal loadings (`lifter.py`) emit `B + offset`, with `const uint64_t B = g_main_base;` (or `g_sdk_base`) once per function;
+  - return address and `c->pc` on calls (`gen.py:345-350`, `437-441`) saw `B + offset`;
+  - `switch` of jump table and `L_dispatch` (`gen.py:448-462`) start using `switch (alvo - B)` with offset cases;
   - `rando_word()`, `rt_udf`, `rt_svc` e `FN_ENTER` recebem `B + offset`;
-  - a tabela de funções (`gen.py:619`) guarda offsets, e `dispatch.c` soma a base ao montar a busca;
-  - `patches.py`: as chaves continuam no endereço canônico `0x70…`, e o gerador converte para offset com
-    `a - 0x7000000000` (sem reescrever as ~60 entradas).
-- **Runtime:** em `rt.h` e `kernel.h`, `#ifdef __ANDROID__` define `GUEST_LO` como variável (`g_guest_lo`) e
-  `MAIN_BASE`, `SDK_BASE`, `HLE_BASE`, `TLS_BASE`, `HLE_HEAP`, `ALIAS_BASE`, `HEAP_BASE` e `GUEST_HI` como
-  `GUEST_LO + offset`. No desktop continuam `#define` constantes.
-  - Os dois inicializadores estáticos (`dispatch.c:93` `hle_next`, `kernel.c:114` `tls_next`) passam a ser
-    inicializados em tempo de execução.
-  - Os ~15 literais soltos (`LIVE_SAVE 0x7001CBB220`, `qol.c`, `chamber.c`, `warp_tab.mm`, `save_editor.mm`,
-    `fnprof.c`, `cmdbuf.c`, `gamebuild.c`, …) viram `MAIN_BASE + offset` ou checagens `GUEST_LO..GUEST_HI`. No
-    desktop isso compila para a mesma constante.
-  - A memória global dos shaders já usa uma variável (`maxwell_gmem_base = HEAP_BASE` em `vulkan/exec.c:1204`).
-    Os shaders não têm o endereço embutido.
-- **Verificação:**
-  - um script que falha se o C gerado com `--dyn-base` contiver algum literal na faixa `0x70_0000_0000`–
-    `0x73_2000_0000`;
-  - no aparelho, um modo de teste que força uma base alternativa (por variável de ambiente ou extra da Intent), para
-    exercitar duas bases diferentes;
-  - medir o custo de `B + offset` com o `simpleperf` (deve ser pequeno: um add por endereço materializado).
+  - the function table (`gen.py:619`) saves offsets, and `dispatch.c` sums up the base when mounting the search;
+  - `patches.py`: Keys remain in the canonical address `0x70…`, and the generator converts to offset with `a - 0x7000000000` (without rewriting ~60 entries).
+- **Runtime:** in `rt.h` and `kernel.h`, `#ifdef __ANDROID__` defines `GUEST_LO` as variable (`g_guest_lo`) and `MAIN_BASE`, `SDK_BASE`, `HLE_BASE`, `TLS_BASE`, `HLE_HEAP`, `ALIAS_BASE`, `HEAP_BASE` and `GUEST_HI` as `GUEST_LO + offset`. On the desktop they remain constant `#define`.
+  - The two static initializers (`dispatch.c:93` `hle_next`, `kernel.c:114` `tls_next`) are started in runtime.
+  - The ~15 loose literals (`LIVE_SAVE 0x7001CBB220`, `qol.c`, `chamber.c`, `warp_tab.mm`, `save_editor.mm`, `fnprof.c`, `cmdbuf.c`, `gamebuild.c`,...) have seen `MAIN_BASE + offset` or `GUEST_LO..GUEST_HI` checks. On the desktop this compiles for the same constant.
+  - The global shader memory already uses a variable (`maxwell_gmem_base = HEAP_BASE` in `vulkan/exec.c:1204`). Shaders don't have an embedded address.
+- **Verification:**
+  - a script that fails if the C generated with `--dyn-base` contains some literal in the range `0x70_0000_0000` – `0x73_2000_0000`;
+  - in the apparatus, a test mode that forces an alternative base (by environment or extra Intent variable) to exercise two different bases;
+  - measure the cost of `B + offset` with `simpleperf` (must be small: one add per materialized address).
 
 ## Fases
 
-### Fase 0: provas de viabilidade (antes de portar qualquer coisa)
+### Phase 0: evidence of viability (before carrying anything)
 
-Objetivo: responder às perguntas que podem mudar o plano. Um APK mínimo com SDL3, sem código do jogo:
+Objective: To answer questions that can change the plan. A minimum APK with SDL3, no game code:
 
-1. **Janela de memória.** Logar `/proc/self/maps` dentro do app várias vezes (ASLR) e o tamanho do VA (inferido do
-   endereço mais alto em maps). Rodar o algoritmo de escolha de base da seção "Janela de memória dinâmica" e
-   confirmar que sempre encontra um buraco de 12,5 GB abaixo de 2^39. Aparelho de teste: POCO F7 Ultra
-   (Snapdragon 8 Elite, Adreno 830).
-2. **Turnip via adrenotools.** Carregar o Turnip, criar uma instância Vulkan 1.3 e logar extensões e features
-   relevantes: `textureCompressionBC`, `shaderInt64`, `dualSrcBlend`, `depthClamp`, `wideLines`, `fillModeNonSolid`,
-   `VK_EXT_external_memory_host`, `VK_EXT_custom_border_color`, `VK_EXT_vertex_attribute_divisor`, os present modes e
-   as features 1.1/1.2/1.3 que `device.c` exige (`shaderInt8`, `scalarBlockLayout`, `storageBuffer8/16BitAccess`,
-   `shaderDemoteToHelperInvocation`, `maintenance4`, …). Repetir com o driver da Qualcomm, para comparar.
-3. **Opcional, mas barato:** rodar o build **Linux aarch64** já existente (`make ARCH=aarch64`) num Ubuntu em proot
-   no Termux, com Termux:X11 e Turnip, no mesmo celular. Isso valida o código gerado e o backend Vulkan no Adreno
-   antes de escrever qualquer código Android (o Linux aarch64 hoje está "não testado em hardware real").
+1. ** Memory window.** Log `/proc/self/maps` inside the app several times (ASLR) and the size of the VA (inferred from the highest address in maps). Rotate the base choice algorithm of the "Dynamic Memory Window" section and confirm that you always find a hole of 12.5 GB below 2^39. Test apparatus: POCO F7 Ultra (Snapdragon 8 Elite, Adreno 830).
+2. **Turnip via adrenotools.** Load Turnip, create an instance Vulkan 1.3 and log relevant extensions and features: `textureCompressionBC`, `shaderInt64`, `dualSrcBlend`, `depthClamp`, `wideLines`, `fillModeNonSolid`, `VK_EXT_external_memory_host`, `VK_EXT_custom_border_color`, `VK_EXT_vertex_attribute_divisor`, the present modes and features 1.1/1.2/1.3 that `device.c` requires (`shaderInt8`, `scalarBlockLayout`, `storageBuffer8/16BitAccess`, `shaderDemoteToHelperInvocation`, `maintenance4`,...). Repeat with Qualcomm driver to compare.
+3. **Optional but cheap:** run the built **Linux aarch64** already existing (`make ARCH=aarch64`) in a proot Ubuntu in Termux, with Termux:X11 and Turnip on the same mobile phone. This validates the generated code and the Vulkan backend in Adreno before writing any Android code (Linux aarch64 today is "not tested on real hardware").
 
-Saída: uma tabela de capacidades por aparelho e a decisão sobre a janela de memória.
+Output: a table of capabilities per device and the decision on the memory window.
 
-#### Resultados (2026-10-15, POCO F7 Ultra: SM8750, Adreno 830, Android 16, kernel 6.6, páginas de 4 KB, 16 GB)
+#### Results (2026-10-15, POCO F7 Ultra: SM8750, Adreno 830, Android 16, kernel 6.6, pages of 4 KB, 16 GB)
 
-A sonda está em `android/probe/` (relatório em `/sdcard/Android/data/com.lasrecomp.probe/files/report-latest.txt`).
+The probe is in `android/probe/` (report on `/sdcard/Android/data/com.lasrecomp.probe/files/report-latest.txt`).
 
-**Memória.** Os resultados abaixo se repetiram em 5 execuções.
-- VA de 39 bits. Os espaços livres de 12,5 GB ou mais entre 4 GB e 2^39 são três: `0x1_0000_0000`–`0x62_8dcb_8000`
-  (390 GB), `0x62_8dcc_5000`–`0x75_0000_0000` (74 GB) e `0x79_36f1_7000`–`0x7f_c560_5000` (26 GB).
-- A base dinâmica cai em `0x1_0000_0000`, em cerca de 3 a 5 ms, e a leitura e escrita no início, no heap e no fim
-  funcionam.
-- A janela fixa do desktop também estava livre. Mas o layout vem do zygote e só muda quando o aparelho reinicia, então
-  isso não garante nada. **Decisão: base dinâmica**, como planejado.
+**Memory.** The results below were repeated in 5 executions.
+- 39-bit VA. Free spaces of 12.5 GB or more between 4 GB and 2^39 are three: `0x1_0000_0000` – `0x62_8dcb_8000` (390 GB), `0x62_8dcc_5000` – `0x75_0000_0000` (74 GB) and `0x79_36f1_7000` – `0x7f_c560_5000` (26 GB).
+- The dynamic base falls in `0x1_0000_0000`, about 3 to 5 ms, and reading and writing at the beginning, in the heap and in the end work.
+- The fixed desktop window was also free. But the layout comes from the zygote and it only changes when the device restarts, so that doesn't guarantee anything. **Decision: dynamic base**, as planned.
 
 **Vulkan.**
 
 | | Qualcomm (sistema) | Turnip Gen8 V37 (adrenotools) |
 |---|---|---|
 | Driver | Vulkan 1.3.284, build 02/06/26 | Mesa 26.3.0-devel, Vulkan 1.4.363 |
-| `vkCreateDevice` igual ao `device.c` | **falha**: falta `uniformAndStorageBuffer8BitAccess` | **falha**: mesmo motivo |
-| Com as features de 8 bits opcionais | OK | OK |
-| `VK_EXT_external_memory_host` | não | não |
-| `VK_EXT_device_fault` | sim | não |
+| `vkCreateDevice` equals `device.c` | **falha**: falta `uniformAndStorageBuffer8BitAccess` | **Failure**: same reason |
+| With the optional 8-bit features | OK | OK |
+| `VK_EXT_external_memory_host` | no | no |
+| `VK_EXT_device_fault` | sim | no |
 | BC1–BC7, ASTC | nativos | nativos |
 | `shaderInt64`, `dualSrcBlend`, `depthClamp`, `wideLines`, geometry/tessellation | sim | sim |
-| `shaderFloat64` | não | não |
-| Subgroup | 64, só fragment e compute | 64–128, todos os estágios |
-| Formatos de vértice de 3 componentes, `D24_UNORM_S8_UINT` | sim | sim |
+| `shaderFloat64` | no | no |
+| Subgroup | 64, only fragment and compute | 64–128, all stages |
+| 3-component vertex formats, `D24_UNORM_S8_UINT` | sim | sim |
 
-O que isso decide:
-- **8 bits:** nenhum shader usa 8 bits em uniform buffers (a única referência é a ativação em `device.c`). No
-  Android, `shaderInt8`, `uniformAndStorageBuffer8BitAccess` e `storageBuffer8BitAccess` passam a ser pedidas só
-  quando o driver tem.
-- **Texturas BC:** são nativas nos dois drivers. O decodificador de BC na CPU sai do caminho crítico; fica só para
-  GPUs futuras sem BC.
-- **Subgroups:** o `SHFL` em vertex shader já é traduzido como valor local, sem subgroup (`translate.c`), então o
-  limite do driver da Qualcomm não afeta.
-- **Memória global dos shaders:** nenhum dos dois drivers tem host import. Alternativas: `adrenotools_import_user_mem`
-  (só no driver da Qualcomm, via KGSL) ou o fallback por cópia da Fase 3.
-- **Ainda não medido:** present modes e `preTransform`, porque precisam de uma surface. Fica para a Fase 1.
+What does that decide?
+- **8 bits:** no shader uses 8 bits in uniform buffers (the only reference is `device.c` activation). On Android, `shaderInt8`, `uniformAndStorageBuffer8BitAccess` and `storageBuffer8BitAccess` are requested only when the driver has it.
+- ** BC:** are native to both drivers. The BC decoder in the CPU exits the critical path; it is only for future GPUs without BC.
+- **Subgroups:** `SHFL` in vertex shadow is already translated as local value, without subgroup (`translate.c`), so the limit of Qualcomm driver does not affect.
+- **Global memory of the shaders:**Neither driver has host import. Alternatives: `adrenotools_import_user_mem` (only on the Qualcomm driver via KGSL) or the fallback by copy of Phase 3.
+- **Not yet measured:**present mode and `preTransform`, because they need a surface. Stay for Phase One.
 
 ### Fase 1: build
 
-- **Dependências para Android arm64** (scripts com versões e checksums fixos, no estilo de
-  `tools/linux/build_deps.sh`):
+- **Dependencies for Android arm64**(scripts with fixed versions and checksums, `tools/linux/build_deps.sh` style):
   - SDL3 (via `android-project`)
-  - shaderc (as fontes vêm no NDK, em `sources/third_party/shaderc`)
-  - Vulkan Memory Allocator (só headers)
-  - FFmpeg LGPL só com os codecs dos vídeos, como no desktop; alternativa: implementar `hle/movie.c` com
-    `AMediaCodec` do NDK
+  - shaderc (sources come in NDK, `sources/third_party/shaderc`)
+  - Vulkan Memory Allocator (headers only)
+  - FFmpeg LGPL only with video codecs, as on desktop; alternative: implement `hle/movie.c` with NDK `AMediaCodec`
   - libadrenotools
 - **`runtime/platform/android.c`:**
-  - `plat_reserve_guest` com a base dinâmica (`android/common/guest_window.c`, validado na Fase 0), sem re-exec
-  - `plat_exec` e `plat_spawn` limitados ou ausentes
+  - `plat_reserve_guest` with dynamic base (`android/common/guest_window.c`, validated in Phase 0), no re-exec
+  - `plat_exec` and `plat_spawn` limited or absent
   - backtrace via `_Unwind_Backtrace`
-  - crash handler instalado de forma compatível com o sigchain do ART
+  - crash handler installed in a way compatible with the ART sigchain
   - `plat_exe_path` → `nativeLibraryDir`
-- **Logs:** `LOG`/`FATAL` → logcat (`__android_log_print`), ou um redirecionamento de `stderr` para o logcat no início.
-- **Caminhos** (`paths.c`): data root = `SDL_GetAndroidExternalStoragePath()` (`/sdcard/Android/data/<pkg>/files`,
-  acessível pelo adb e pelo gerenciador de arquivos). `lasgame.so` fica obrigatoriamente no armazenamento **interno**
-  (`SDL_GetAndroidInternalStoragePath()`), porque o externo é montado `noexec`.
-- **Projeto Gradle** em `android/` (o CMake compila `runtime/`, `third_party/imgui` e o backend Vulkan com
-  `UIFLAGS=-x c++`, como no Linux) e o alvo `make android-gamelib`, que compila `generated/` com o NDK e linka
-  contra `libmain.so`.
+- **Logs:** `LOG` / `FATAL` → logcat (`__android_log_print`), or a redirection of `stderr` to logcat at the beginning.
+- ** Paths** (`paths.c`): date root = `SDL_GetAndroidExternalStoragePath()` (`/sdcard/Android/data/<pkg>/files`, accessible by adb and file manager). `lasgame.so` is mandatory in the internal storage** (`SDL_GetAndroidInternalStoragePath()`) because the external is mounted `noexec`.
+- **Gradle project** on `android/` (the CMake compiles `runtime/`, `third_party/imgui` and the Vulkan backend with `UIFLAGS=-x c++`, as on Linux) and the `make android-gamelib` target, which compiles `generated/` with NDK and links against `libmain.so`.
 
-Pronto quando: o APK instala, abre a tela inicial em ImGui com Vulkan (Turnip) e loga no logcat.
+Ready when: APK installs, opens the ImGui start screen with Vulkan (Turnip) and log into logcat.
 
-**Estado (2026-10-15): concluída.** Validada no POCO F7 Ultra com o driver da Qualcomm e com o Turnip Gen8 V37 via
-adrenotools: tela inicial em tela cheia e paisagem, logs no logcat (tag `LASRecomp`), janela do guest em
-`0x1_0000_0000`.
-- Dependências: `android/deps/build_deps.sh` (SDL3 3.4.16, shaderc 2026.3, Vulkan-Headers 1.4.350.1, VMA 3.3.0, volk).
-- App: `android/lasrecomp/` (Gradle + CMake). O runtime vira `libmain.so`, carregado pelo `LASRecompActivity`.
-  Drivers customizados vão em `Android/data/com.lasrecomp.android/files/drivers/` (o primeiro `.so` ou `.zip`).
-- Runtime: tudo atrás de `__ANDROID__` (`platform/android.c`, `rt.h`, `vulkan/android_driver.c`, volk, surface via
-  `ANativeWindow`, features de 8 bits opcionais, swapchain sem pré-rotação, tela cheia sempre) ou `LARECOMP_NO_FFMPEG`.
-- Pendências:
-  - FFmpeg: o `movie.c` está fora do build, e o fundo da tela inicial também (Fase 2);
-  - pré-rotação do swapchain (Fase 3);
+** State (2026-10-15): completed.** Validated in POCO F7 Ultra with Qualcomm driver and Turnip Gen8 V37 via adrenotools: full screen and landscape start screen, logcat logs (tag `LASRecomp`), guest window in `0x1_0000_0000`.
+- Dependencies: `android/deps/build_deps.sh` (SDL3 3.4.16, shaderc 2026.3, Vulkan-Headers 1.4.350.1, VMA 3.3.0, volk).
+- App: `android/lasrecomp/` (Gradle + CMake). The runtime turns `libmain.so`, loaded by `LASRecompActivity`. Custom drivers go in `Android/data/com.lasrecomp.android/files/drivers/` (the first `.so` or `.zip`).
+- Runtime: all behind `__ANDROID__` (`platform/android.c`, `rt.h`, `vulkan/android_driver.c`, volk, `ANativeWindow` surface, optional 8-bit features, swapchain without pre-rotation, full screen always) or `LARECOMP_NO_FFMPEG`.
+- Pendencies:
+  - FFmpeg: `movie.c` is outside the build, and the background of the home screen is also (Phase 2);
+  - swapchain pre-rotation (Phase 3);
   - seletor de pasta via SAF e toque (Fases 4 e 5);
-  - revisar os ~860 avisos de compilação.
+  - review ~860 build notices.
 
-### Fase 2: chegar ao primeiro frame do jogo
+### Phase 2: get to the first frame of the game
 
-- Copiar `extracted/` e `lasgame.so` pelo adb (temporário). O runtime copia o `lasgame.so` do armazenamento externo
-  para o interno antes do `dlopen`.
-- Entrar direto no jogo (o equivalente a `--play` / `LARECOMP_NO_LAUNCHER`, via extra da Intent ou um arquivo de flag).
-- Depurar o boot: kernel, threads, `nnMain`, serviços. Ferramentas: `LARECOMP_FNPROF`, `rt_fatal_trace`, logcat e
-  `simpleperf` para performance.
+- Copy `extracted/` and `lasgame.so` by adb (temporary). Runtime copies `lasgame.so` from external storage to internal storage before `dlopen`.
+- Enter the game directly (the equivalent of `--play` / `LARECOMP_NO_LAUNCHER`, extra Intent via or a flag file).
+- Debug boot: kernel, threads, `nnMain`, services. Tools: `LARECOMP_FNPROF`, `rt_fatal_trace`, logcat and `simpleperf` for performance.
 
-Pronto quando: a intro e a tela de título aparecem com som.
+Ready when: the intro and title screen appear with sound.
 
-**Estado (2026-10-15): o jogo inicializa.** No POCO F7 Ultra com Turnip:
-- módulos em `0x1_0000_0000` (`--dyn-base`), kernel, threads e serviços no ar, save montado;
-- os vídeos de abertura tocam pelo FFmpeg (`android/deps/build_ffmpeg.sh`, via WSL), com a saída de áudio aberta;
-- **a cerca de 12 fps**, com ~1,7 s de espera da GPU a cada 2 s e ~190 MB de upload de texturas a cada 2 s
-  (Fase 3).
+** State (2026-10-15): the game kicks off.** In the Ultra POCO F7 with Turnip:
+- modules in `0x1_0000_0000` (`--dyn-base`), kernel, threads and air services, save mounted;
+- the opening videos play by FFmpeg (`android/deps/build_ffmpeg.sh`, via WSL), with the audio output open;
+- ** About 12 fps**, with ~1.7 s of waiting of the GPU every 2 s and ~190 MB of uploading textures every 2 s (Phase 3).
 
-Fluxo de desenvolvimento (sem setup no aparelho ainda):
+Development flow (no setup on the device yet):
 1. `android/build_gamelib.sh <exefs>` gera e compila a `lasgame.so`.
-2. `android/push_game.sh <pasta com exefs/ e romfs/>` copia os arquivos e gera o `romfs.bin` no aparelho.
-3. Para entrar direto no jogo:
-   `adb shell am start -n com.lasrecomp.android/com.lasrecomp.LASRecompActivity --es env "LARECOMP_NO_LAUNCHER=1"`.
+2. `android/push_game.sh <pasta com exefs/ e romfs/>` copies the files and generates `romfs.bin` on the device.
+3. To get right into the game: `adb shell am start -n com.lasrecomp.android/com.lasrecomp.LASRecompActivity --es env "LARECOMP_NO_LAUNCHER=1"`.
 
-A fonte do sistema do Switch é substituída pela DejaVu Sans que o app traz: a Roboto não tem o U+25A1, e o código de
-texto do jogo não trata glifo nulo.
+The Switch system source is replaced by the DejaVu Sans that the app brings: Roboto does not have U+25A1, and the text code of the game does not treat null glyph.
 
-Falta para concluir a fase: confirmar o som no aparelho e passar da tela de título (entrada: controle físico via
-SDL, ou toque, da Fase 4).
+The phase is not yet completed: confirm the sound on the device and pass the title screen (entry: physical control via SDL, or touch, Phase 4).
 
 ### Fase 3: Vulkan no Adreno/Turnip
 
-Ordem definida pelos resultados da Fase 0:
+Order defined by Phase 0 results:
 
-- **Features de 8 bits opcionais** no `vkCreateDevice` (pré-requisito, já validado na sonda).
-- **Sem `VK_EXT_external_memory_host`** (nos dois drivers): hoje `exec.c` desliga a memória global dos shaders
-  (`LDG`/`STG` leem zero). Primeiro medir **quais** shaders do jogo usam memória global; pode ser pouca coisa. Depois,
-  um fallback por cópia (um buffer GPU espelhando as faixas do heap usadas, com escrita de volta após compute), ou
-  `adrenotools_import_user_mem` no driver da Qualcomm.
-- **Texturas BC:** nativas no Adreno 830 (nos dois drivers). Decodificar na CPU só se aparecer uma GPU sem BC.
-- **Features opcionais:** no Adreno 830 só falta `shaderFloat64`. O tradutor não deve gerar `double`.
-- **Present:** `MAILBOX` geralmente não existe no Android. Usar `FIFO` como padrão e respeitar `preTransform`
-  (rotação da surface).
-- **Performance:** resolução interna padrão menor (o código de escala dinâmica e FSR1 já existe), cache de pipelines
-  em disco, `vkQueueSubmit` agrupado e cuidado com load/store ops (GPU tiler: evitar `LOAD` e `STORE` desnecessários
-  em attachments). Medir com o Snapdragon Profiler.
-- **Regras gerais:** o desktop não muda de comportamento (Windows e Linux usam o mesmo backend). Toda mudança em
-  `vulkan/` fica atrás de `__ANDROID__`, ou condicionada a uma capacidade que o desktop sempre tem, o que dá o mesmo
-  resultado lá.
+- ** Optional 8-bit features** in `vkCreateDevice` (prerequisite, already validated in the probe).
+- **Without `VK_EXT_external_memory_host` **(in both drivers): Today `exec.c` shuts off the global memory of the shaders (`LDG` / `STG` read zero). First measure **which game shaders use global memory; it may be little. Then a fallback per copy (a GPU buffer mirroring the used heap tracks, written back after compute), or `adrenotools_import_user_mem` on the Qualcomm driver.
+- ** BC:** native to Adreno 830 (in both drivers). Decoding on CPU only if a GPU without BC appears.
+- **Optional features:** in Adreno 830 only missing `shaderFloat64`. The translator should not generate `double`.
+- **Present:** `MAILBOX` usually does not exist on Android. Use `FIFO` as default and respect `preTransform` (surface rotation).
+- **Performance:**Internal lower standard resolution (the dynamic scaling code and FSR1 already exists),disk pipelines cache, `vkQueueSubmit` grouped and load/store ops care (GPU tilter: avoid unnecessary `LOAD` and `STORE` in attachments). Measure with Snapdragon Profiler.
+- **General rules:**The desktop does not change behavior (Windows and Linux use the same backend). Every change in `vulkan/` is behind `__ANDROID__`, or conditioned to a capacity that the desktop always has, which gives the same result there.
 
-Pronto quando: overworld, uma casa e uma dungeon renderizam corretamente a 30 ou 60 fps num Snapdragon 8 Gen 2/3.
+Ready when: overworld, a house and a Dungeon render correctly at 30 or 60 fps in a Snapdragon 8 Gen 2/3.
 
-**Estado (2026-10-15): o jogo roda a 30 fps estáveis no mundo aberto**, e a 60 em áreas leves (POCO F7 Ultra, Turnip
-Gen8 V37, resolução 50%). O que mudou desde os ~12 fps da Fase 2:
-- **Memória global:** com o Turnip, o heap do guest é memória da GPU mapeada no próprio endereço
-  (`VK_EXT_map_memory_placed`, `vk_heap_place`), sem cópias. No driver da Qualcomm, cópias pela CPU (`gcopy`). Os
-  dispatches de compute leem o heap por uma janela do descriptor (limite de 2 GB do Adreno) em vez de copiar faixas.
-- **Shaders:** a janela do `BRX` só rotula o próprio switch (SSAO de ~20 ms para menos de 1 ms). As pilhas
-  SSY/PBK/PCNT agora são resolvidas na tradução (`maxwell_static_stacks`): a GPU no mundo aberto caiu de ~18,5 para
-  ~14 ms por frame.
-- **CPU:** o runtime passou de `-O0` para `-O2` (o build Debug do Gradle não tinha otimização). Despacho de funções
-  sem stack frame e com cache maior (de 13% para 5% da thread do jogo). Hash do fragment shader e da chave de pipeline
-  memoizados. Laço da UI sem espera ativa.
-- **Sincronização:** as fences do jogo cobrem o trabalho dele, e não o present, que espera o compositor. O `SyncWait`
-  caiu de ~10 para ~1,4 ms por frame.
-- **Android:** cache de pipelines salvo durante o jogo, superfície recriada ao voltar do segundo plano, overlay de
-  desempenho, IME desligado com controle conectado.
-- **Diagnóstico:** `LARECOMP_GPUPROF_AT`, `LARECOMP_VK_PROF`, `LARECOMP_LOG_PACE`, `LARECOMP_LOG_SYNCSEQ`,
-  `LARECOMP_LOG_COUNTER`, `LARECOMP_SHADER_STATS`, `LARECOMP_SHADER_SUBST` e `LARECOMP_SAVE_MSL`, além do simpleperf.
+**State (2026-10-15): The game runs at 30 fps stable in the open world**, and at 60 in light areas (POCO F7 Ultra, Turnip Gen8 V37, resolution 50%). What has changed since the ~12 fps of Phase 2:
+- **Global memory:**With Turnip, the guest's heap is GPU memory mapped at its own address (`VK_EXT_map_memory_placed`, `vk_heap_place`), without copies. In the Qualcomm driver, copies by CPU (`gcopy`). Compute dyspatches read the heap through a decryptor window (adreno 2 GB limit) instead of copying tracks.
+- **Shaders:** the `BRX` window only labels the switch itself (SSAO of ~20 ms for less than 1 ms). SSY/PBK/PCNT batteries are now solved in translation (`maxwell_static_stacks`): the open world GPU has dropped from ~18.5 to ~14 ms per frame.
+- **CPU:**Runtime went from `-O0` to `-O2` (Gradle's build Debug had no optimization). Function dispatch without stack frame and with larger cache (from 13% to 5% of the game thread). Hash of the fragment shader and the memoized pipeline key. UI loop without active waiting.
+- **Synchronization:**The fences of the game cover his work, and not present it, which awaits the composer. The `SyncWait` dropped from ~10 to ~1.4 ms per frame.
+- **Android:**Cache of pipelines saved during the game, surface recreated when returning from the background, performance overlay, IME off with connected control.
+- **Diagnosis:** `LARECOMP_GPUPROF_AT`, `LARECOMP_VK_PROF`, `LARECOMP_LOG_PACE`, `LARECOMP_LOG_SYNCSEQ`, `LARECOMP_LOG_COUNTER`, `LARECOMP_SHADER_STATS`, `LARECOMP_SHADER_SUBST` and `LARECOMP_SAVE_MSL`, in addition to simpleperf.
 
-Para 60 fps no mundo aberto, faltam:
-- **GPU:** ~14 ms por frame, enquanto o jogo só escolhe o modo 60 abaixo do limite dele. Próximo passo: trocar a
-  máquina de estados dos shaders com desvios por `if`/laços (os vertex shaders pesados rodam com 48 registradores e
-  só 4 waves).
-- **CPU:** ~18 ms por frame na thread do jogo no modo 30, sendo ~10 de código do jogo e ~8 de gravação Vulkan e
-  driver. Opção: gravar os comandos numa thread própria.
+For 60 fps in the open world, we're missing:
+- ** GPU:** ~14 ms per frame, while the game only chooses mode 60 below its limit. Next step: swap the Shader State Machine with deviations by `if` /Lassoes (the heavy vertex shaders run with 48 registers and only 4 waves).
+- **CPU:**~18 ms per frame in the game thread in mode 30, being game code ~10 and recording ~8 Vulkan and driver. Option: Save commands to own thread.
 
-Problemas conhecidos: trocar a resolução com o jogo rodando pode fechar o app; sem pré-rotação do swapchain; heap
-acima de 2 GB contra o limite de descriptor fora dos dispatches de compute.
+Known problems: switching the resolution with the running game can close the app; without swapchain pre-rotation; heap above 2 GB against the decryptor limit outside the computer dyspatches.
 
-### Fase 4: Android de verdade (ciclo de vida e entrada)
+### Phase 4: Real Android (life cycle and input)
 
 - **Ciclo de vida:**
-  - `SDL_EVENT_WILL_ENTER_BACKGROUND`: pausar threads guest, pausar áudio, esperar a GPU ociosa
-  - `SDL_EVENT_DID_ENTER_FOREGROUND`: recriar a surface e o swapchain (hoje são criados uma vez, em `device.c`)
-  - Não perder o save se o sistema matar o app em background.
-- **Toque:** um controle virtual (overlay ImGui ou desenhado pelo presenter) que alimenta o mesmo caminho de
-  `hle/input.c` e `bindings.c` que o controle físico usa, com layout configurável e opacidade. Os botões na tela
-  seguem os ícones de botão que já existem.
-- **Controles físicos:** já funcionam via SDL3. Verificar que o botão Voltar abre o menu (o equivalente ao F1) em vez
-  de fechar o app.
-- **ImGui:** escala por DPI, alvos de toque maiores e teclado virtual (`osk.mm` já existe).
-- **Tela:** imersivo (sem barras), notch/cutout, aspecto largo (o widescreen do projeto encaixa bem nas telas
-  20:9 de celular).
+  - `SDL_EVENT_WILL_ENTER_BACKGROUND`: pause guest threads, pause audio, wait for idle GPU
+  - `SDL_EVENT_DID_ENTER_FOREGROUND`: recreate the surface and swapchain (today they are created once in `device.c`)
+  - Don't lose the save if the system kills the app in background.
+- **Touch:** a virtual control (overlay ImGui or designed by the presenter) that feeds the same path as `hle/input.c` and `bindings.c` that physical control uses, with configurable layout and opacity. The buttons on the screen follow the button icons that already exist.
+- ** Physical controls:** already work via SDL3. Check that the Back button opens the menu (the equivalent of F1) instead of closing the app.
+- **ImGui:** scale by DPI, larger touch targets and virtual keyboard (`osk.mm` already exists).
+- ** Screen:** immersive (without bars), notch/cutout, wide aspect (the project widescreen fits well on screens 20:9 mobile).
 
-### Fase 5: instalação pelo usuário (sem adb)
+### Phase 5: User installation (without adb)
 
-- **Escolher a pasta do jogo:** `ACTION_OPEN_DOCUMENT_TREE` (SAF) via JNI e cópia para o data root. O launcher já
-  copia os arquivos para `extracted/`; só a origem muda (`content://`).
-- Importar `lasgame.so` gerado no PC (MVP) e pastas de seed.
-- Importar fontes (`SDL_ShowOpenFileDialog` funciona no Android e devolve URIs).
-- Checagem de update: trocar o `curl` por HTTP via JNI (`HttpURLConnection`), ou desligar no Android.
+- **Choose game folder:** `ACTION_OPEN_DOCUMENT_TREE` (SAF) via JNI and copy to date root. The launcher already copies the files to `extracted/`; only the source changes (`content://`).
+- Import `lasgame.so` generated on PC (MVP) and seed folders.
+- Import fonts (`SDL_ShowOpenFileDialog` works on Android and returns URIs).
+- Update check: swap `curl` with HTTP via JNI (`HttpURLConnection`), or hang up on Android.
 
-### Fase 6: gerar o código do jogo no próprio aparelho
+### Phase 6: Generate the game code on the device itself
 
-Só depois do jogo rodar bem. Opções:
+Only after the game goes well. Options:
 
-| Opção | Gerador | Compilador | Comentário |
+| Option | Gerador | Compilador | Comment |
 |---|---|---|---|
-| A | Python embutido (Chaquopy ou CPython do NDK) + capstone, unicorn e lz4 compilados para Android | Zig empacotado como `jniLibs/arm64-v8a/libzig.so` (o `nativeLibraryDir` permite `exec`) | Menos reescrita, APK grande |
-| B | Reescrever as partes do `gen.py` que precisam rodar no aparelho em C (capstone e unicorn têm API C) | Igual à A | Mais trabalho, mais robusto |
-| C | Continuar gerando no PC | (nenhum) | Zero esforço, pior para o usuário |
+| A | Inbuilt Python (Chaquopy or CPython from NDK) + capstone, unicorn and lz4 compiled for Android | Zig packaged as `jniLibs/arm64-v8a/libzig.so` (`nativeLibraryDir` allows `exec`) | Less rewritten, large APK |
+| B | Rewrite parts of `gen.py` that need to run on the C device (capstone and unicorn have API C) | Same as A | More work, more robust |
+| C | Continuar gerando no PC | (nenhum) | Zero effort, worse for the user |
 
-Considerar o tempo de compilação e o aquecimento do aparelho: compilar em background com progresso, com `-O1` como hoje.
+Consider the build time and the heating of the device: compile in background with progress, with `-O1` as today.
 
-### Fase 7: randomizer no aparelho
+### Phase 7: Randomizer on device
 
-O gerador de seeds depende de oead e evfl (C++/pybind11) e keystone. As opções espelham a Fase 6: Python embutido com
-essas libs compiladas para Android, ou continuar importando seeds geradas no desktop (o seed ID já reproduz uma seed
-exatamente igual).
+The seed generator depends on oead and evfl (C++/pybind11) and keystone. The options mirror Phase 6: Python built in with these libs compiled for Android, or continue importing seeds generated on the desktop (the seed ID already plays a seed exactly the same).
 
-### Fase 8: distribuição
+### Phase 8: Distribution
 
-- APK pelo GitHub Releases (sideload). A Play Store é improvável, por política de conteúdo de terceiros.
-- Nada do jogo no APK. Revisar a tabela de licenças do README (adrenotools é BSD-2, Turnip é MIT, e a parte GPL
-  entra só se a Fase 6/7 empacotar unicorn, oead e keystone).
-- Página `docs/android.md` no estilo de `docs/linux.md`: aparelhos testados, versão do Turnip, como reportar bugs.
+- APK by GitHub Releases (sideload). The Play Store is unlikely by third party content policy.
+- Nothing from the game at APK. Review the README license table (adrenotools is BSD-2, Turnip is MIT, and the GPL part enters only if Phase 6/7 packages unicorn, oead and keystone).
+- `docs/android.md` page in the `docs/linux.md` style: tested devices, Turnip version, how to report bugs.
 
 ## Riscos principais
 
-1. **Base dinâmica:** um literal absoluto esquecido no gerador ou no runtime causa bugs sutis. O script de
-   verificação e o teste com duas bases existem para pegar isso.
-2. **Adreno 830 (8 Elite) no Turnip:** o Turnip Gen8 carrega e cria o device, mas ainda é um build experimental
-   (Mesa main com patches). Manter o driver da Qualcomm como alternativa.
-3. **Memória global de shader sem host import (confirmado nos dois drivers):** pode quebrar efeitos de compute até
-   existir o fallback.
-4. **RAM:** o heap do guest pode chegar a 3,25 GB (`HEAP_MAX`), mais texturas e o processo. Aparelhos com 8 GB ou
-   mais são o alvo realista. Observar o low memory killer.
-5. **Térmico e performance:** o código gerado com `-O1` é bom no Apple M1; num Snapdragon 8 Gen 2+ deve bastar, mas
-   aparelhos intermediários podem exigir resolução interna baixa.
-6. **Turnip × versão do Mesa:** comportamento varia por versão. Fixar uma versão testada e deixar o usuário trocar.
+1. ** Dynamic base:** an absolute literal forgotten in the generator or runtime causes subtle bugs. The check script and the two-base test exist to catch this.
+2. **Adreno 830 (8 Elite) on Turnip:**Turnip Gen8 loads and creates the device, but is still an experimental build (Mesa main with patches). Keep the Qualcomm driver as an alternative.
+3. **Global shadow memory without host import (confirmed on both drivers):**can break computer effects until fallback exists.
+4. **RAM:** the guest heat can reach 3.25 GB (`HEAP_MAX`), more textures and the process. Apparatus with 8 GB or more are the realistic target. Watch the low memory killer.
+5. **Termic and performance:**The code generated with `-O1` is good on Apple M1; a Snapdragon 8 Gen 2+ should suffice, but intermediate devices may require low internal resolution.
+6. **Turnip × Table version:** behaviour varies by version. Fix a tested version and let the user switch.
 
-## Próximos passos
+## Next steps
 
-Feito (2026-10-16): a release do APK com tudo no celular (Fases 5 e 6), publicada como v0.1.0 e v0.1.1 no GitHub:
-o app escolhe a pasta do jogo pelo seletor do Android (SAF), copia `exefs/` e `romfs/`, gera o `romfs.bin` e compila
-o código do jogo no próprio aparelho (`runtime/gamebuild.c`, ~20 min no Snapdragon 8 Elite); o driver Turnip também é
-escolhido pelo app. Os botões de toque somem sempre que há um controle conectado (item 1 da lista anterior).
+Made (2026-10-16): APK release with everything on the phone (Phases 5 and 6), published as v0.1.0 and v0.1.1 on GitHub: the app chooses the game folder by the Android selector (SAF), copies `exefs/` and `romfs/`, generates `romfs.bin` and compiles the game code on the device itself (`runtime/gamebuild.c`, ~20 min on Snapdragon 8 Elite); the Turnip driver is also chosen by the app. Touch buttons disappear whenever there is a connected control (item 1 from the previous list).
 
-Depois, nesta ordem:
+Then in this order:
 
-1. **60 fps sustentados (feito, 2026-10-16, v0.2.0):** no mapa aberto, 98% do tempo a 60 e nenhum quadro acima de
-   18 ms (antes ~55-70%). O que mudou: uma thread de renderização traduz as listas de comandos enquanto o jogo faz o
-   quadro seguinte, e entrega à GPU em partes nos fins de pass (`runtime/nvn/vulkan/async.c`; LARECOMP_VK_ASYNC=0
-   desliga); o núcleo 0 do Switch emulado (as threads desse núcleo se revezam, como no console: o sistema de tarefas
-   do jogo tinha uma condição de corrida que uma thread principal mais rápida expunha - `runtime/kernel.c`); o pacer
-   distingue os quadros de 2 passos do próprio jogo de um quadro de 60 que atrasou; ADPF mirando 60 fps nas duas
-   threads; três correções de sincronização no kernel (condvar, árbitro, timeout). Fixar a thread principal nos
-   núcleos mais rápidos (LARECOMP_PIN) ficou desligado: expunha a mesma condição de corrida.
-2. **Geração de quadros (adiada):** o lsfg-vk mudou de licença (MIT na v1, GPLv3 na v2, agora CC BY-NC-ND 4.0, que
-   proíbe obras derivadas) por causa de forks gerados por IA; só a v1 continua MIT, e usá-la iria contra o pedido
-   explícito do autor. Decisão (2026-10-16): primeiro os 60 fps sustentados; depois, se ainda fizer sentido, geração
-   de quadros própria com o AMD FidelityFX FSR 3 (MIT), sem Lossless.dll (o jogo não dá vetores de movimento: a
-   qualidade é a dúvida).
-3. **Além do Turnip (iluminação feita, 2026-10-16, v0.3.0):** no driver da própria Qualcomm o jogo agora roda com a
-   iluminação, a 30 fps. Sem `VK_EXT_map_memory_placed`, a memória global dos shaders passa por uma arena na GPU
-   (`exec.c`, gres_*): as regiões que um shader escreve ficam residentes, as escritas da CPU são detectadas por
-   comparação e copiadas pela GPU, os resultados da GPU voltam bloco a bloco; uma margem de 4 KB antes de cada região
-   (o contador de luzes fica antes da lista); e os shaders registram os acessos fora das tabelas, que viram regiões
-   aprendidas. O compilador da Qualcomm trava com o structurizer: desligado nesse driver. Falta: desempenho nesse modo
-   (~640 MB de cópias a cada 2 s) e testar Mali / Xclipse (devem usar o mesmo caminho).
+1. **60 fps sustained (made, 2026-10-16, v0.2.0):** on the open map, 98% of the time at 60 and no frame above 18 ms (before ~55-70%). What has changed: a rendering thread translates the command lists while the game does the following table, and delivers to the GPU parts in the pass ends (`runtime/nvn/vulkan/async.c`; LARECOMP_VK_ASYNC=0 shuts down); the core 0 of the Emulated Switch (the threads of this core take turns, as in the console: the game's task system had a running condition that a faster main thread exposed - `runtime/kernel.c`; the pacer distinguishes the frames from 2 steps of the game itself from a 60 frame that delayed; ADPF targeting 60 fps in both threads; three synchronisation fixes in kernel (condvar, referee, timeout). Fixing the main thread in the fastest cores (LARECOMP_PIN) was turned off: it exposed the same running condition.
+2. **Manufacturing (advertised):** the lsfg-vk changed license (MIT on v1, GPLv3 on v2, now CC BY-NC-ND 4.0, which prohibits derivative works) because of forks generated by AI; only the v1 continues MIT, and using it would go against the explicit request of the author. Decision (2026-10-16): first the 60 fps sustained; then, if it still makes sense, generation of frames itself with AMD FidelityFX FSR 3 (MIT), without Lossless.dll (the game does not give motion vectors: quality is doubt).
+3. **In addition to Turnip's own driver (lighting made, 2026-10-16, v0.3.0):** on Qualcomm's driver the game now runs with lighting, at 30 fps. Without `VK_EXT_map_memory_placed`, the global memory of the shaders passes through an arena in the GPU (`exec.c`, gres_*): the regions that a shadower writes stay resident, the CPU writings are detected by comparison and copied by the GPU, the GPU results come back block by block; a margin of 4 KB before each region (the light counter is before the list); and the shaders record the accesses outside the tables, which have seen regions learned. The Qualcomm compiler locks with the structurizer: off on this driver. Missing: performance in this mode (~640 MB of copies every 2 s) and testing Mali/Xclipse (should use the same path).
