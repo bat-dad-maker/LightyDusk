@@ -7,6 +7,7 @@ name: Android APK
 on:
   push:
     branches: [main]
+    paths-ignore: ['.github/workflows/publish-signed.yml']
   workflow_dispatch:
 
 permissions:
@@ -22,6 +23,7 @@ jobs:
     timeout-minutes: 300
     env:
       NDK_VERSION: 30.0.16248370
+      HAS_STABLE_KEY: ${{ secrets.SIGNING_KEYSTORE_B64 != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,7 +113,9 @@ jobs:
           path: out/*
 
       - name: Publish to the release
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        # Only when the stable key is in the repository secrets. Otherwise the release keeps the APK signed with the
+        # owner's stable key (published by publish-signed.yml), and this build stays a workflow artifact.
+        if: env.HAS_STABLE_KEY == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

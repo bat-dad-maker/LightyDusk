@@ -1,0 +1,31 @@
+# Publishes an APK re-signed with the owner's stable release key (signed outside CI; the key never enters the repo).
+# Push the APK and SHA256SUMS.txt to the root of the `signed-release` branch, with a TAG file naming the release tag.
+# This uploads them to that release (replacing assets of the same name) and deletes the branch.
+name: Publish signed APK
+
+on:
+  push:
+    branches: [signed-release]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - name: Verify checksum
+        run: sha256sum -c SHA256SUMS.txt
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(cat TAG)
+          gh release upload "$TAG" *.apk SHA256SUMS.txt --clobber -R "$GITHUB_REPOSITORY"
+      - name: Delete the branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/signed-release"
